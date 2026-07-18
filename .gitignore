@@ -19,3 +19,4 @@ Cargo.lock.bak
 
 # time-stamped handoff notes (kept on disk, not part of the public release)
 docs/handoff/
+.playwright-mcp/

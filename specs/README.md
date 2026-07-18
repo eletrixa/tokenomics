@@ -30,6 +30,11 @@ adapters implementing the same `ProviderAdapter` trait.
 
 ## Future spec candidates (from the 2026-07-15 discovery/premortem pass)
 
+- **Ledger `verified` pill (spec 018 candidate, Robert 2026-07-18)** — the ledger now carries an
+  optional `verified = <date>` field (agent confirmed the row against the provider billing UI);
+  render it as a small header-line pill/glyph so verified dates are visually distinct from
+  human-entered ones, with an age ceiling (verified long ago ≠ verified).
+
 - **Multi-instance guard** — nothing stops two collectors racing on one store (heartbeat pid is
   written, never checked for liveness/identity flapping).
 - **Systemd watchdog** — `Restart=on-failure` misses alive-but-hung; heartbeat data exists for
