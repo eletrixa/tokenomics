@@ -1,0 +1,30 @@
+{
+  "sessionId": "synthetic-session-b",
+  "projectHash": "synthetic-hash-b",
+  "startTime": "2026-07-09T09:00:00.000Z",
+  "lastUpdated": "2026-07-09T09:05:00.000Z",
+  "messages": [
+    {
+      "id": "turn-user-1",
+      "timestamp": "2026-07-09T09:00:00.000Z",
+      "type": "user",
+      "content": [{"text": "synthetic prompt, no tokens on a user turn"}]
+    },
+    {
+      "id": "turn-gemini-1",
+      "timestamp": "2026-07-09T09:00:00.000Z",
+      "type": "gemini",
+      "content": "synthetic reply one",
+      "tokens": {"input": 2000, "output": 0, "cached": 0, "thoughts": 0, "tool": 0, "total": 2000},
+      "model": "gemini-3.5-flash"
+    },
+    {
+      "id": "turn-gemini-2",
+      "timestamp": "2026-07-09T09:05:00.000Z",
+      "type": "gemini",
+      "content": "synthetic reply two",
+      "tokens": {"input": 3000, "output": 500, "cached": 0, "thoughts": 0, "tool": 0, "total": 3500},
+      "model": "gemini-3.5-flash"
+    }
+  ]
+}

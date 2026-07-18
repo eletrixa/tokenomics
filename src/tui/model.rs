@@ -27,7 +27,7 @@
 use jiff::Timestamp;
 use ratatui::style::Color;
 
-use crate::domain::{Account, Limit, LimitKind, Provenance, Severity, UsageSnapshot};
+use crate::domain::{Account, Limit, LimitKind, Provenance, Provider, Severity, UsageSnapshot};
 use crate::format::{
     format_ago, format_ago_ms, format_cost, format_dollars, format_pct, format_reset,
     format_tokens, provenance_label, provenance_short, reset_expired, severity_label, RESET_DONE,
@@ -760,7 +760,13 @@ pub fn build_account_view(
     // that is the "stall flag hasn't tripped" condition from spec 015 §C.
     let overlay_silent_since_ms =
         overlay_ms.filter(|&ms| now.as_millisecond().saturating_sub(ms) > OVERLAY_STALL_MS);
-    let weekly_hint = if !account.limits_overlay {
+    // Gemini has no limits/quota surface at all (spec 020 §C) — `limits_overlay` is accepted but
+    // IGNORED, so neither "enable overlay" (nothing to enable) nor "waiting for overlay" (nothing
+    // will ever arrive) is honest, however the flag is set. Every other provider keeps the
+    // overlay-state hint below.
+    let weekly_hint = if account.provider == Provider::Gemini {
+        "n/a (no limits surface)".to_string()
+    } else if !account.limits_overlay {
         "n/a (enable overlay)".to_string()
     } else if token_status == Some(TokenStatus::Stale) {
         "n/a (token stale — open Claude)".to_string()
@@ -995,7 +1001,7 @@ pub fn error_view(account: &Account, use_color: bool, message: &str) -> AccountV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Provider, Window};
+    use crate::domain::Window;
     use crate::ledger::SubStatus;
     use std::path::PathBuf;
 
@@ -1328,6 +1334,166 @@ mod tests {
             "no usage row — always idle this wave"
         );
         assert_eq!(usage.cost_notional, None, "never a fabricated cost");
+    }
+
+    // ── spec 020 §D (AC5): a gemini account renders its tokens (no cost line) with BOTH gauges
+    // honestly `n/a` — no derived anything, no invented limit. Same provider-agnostic rendering
+    // path as the zai test above proves the generic path already covers this shape correctly.
+
+    #[test]
+    fn gemini_account_renders_tokens_with_both_gauges_na_and_no_cost_line() {
+        let gemini_account = Account {
+            id: "gemini-personal".to_string(),
+            label: "Gemini Personal".to_string(),
+            provider: Provider::Gemini,
+            config_dir: Some(PathBuf::from("/home/example/.gemini")),
+            api_key_env: None,
+            color: None,
+            active: true,
+            limits_overlay: false, // spec 020 §A: no limits surface exists to opt into
+        };
+        let snapshot = UsageSnapshot {
+            account_id: "gemini-personal".to_string(),
+            provider: Provider::Gemini,
+            collected_at: "2026-07-19T10:00:00Z".parse().unwrap(),
+            input: 2_400,
+            output: 150,
+            cache_read: 600,
+            cache_creation: 0,
+            total_tokens: 3_550,
+            cost_notional: None, // no public subscription pricing basis (spec 020 §B)
+            window: None,        // the 5h lookback is a scan bound, not a window claim
+        };
+        let now: Timestamp = "2026-07-19T10:49:00Z".parse().unwrap();
+        // Spec 020 §D: the spec-017 ledger clause + spec-018 verified pill are provider-agnostic —
+        // a matching gemini-personal ledger row must render its clause and pill exactly like any
+        // account, even though Gemini has no ledger row until Robert actually buys AI Pro/Ultra.
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.id = "gemini-personal".to_string();
+        sub.purchased = Some(jiff::civil::date(2026, 7, 1));
+        sub.renews = Some(jiff::civil::date(2026, 8, 1));
+        sub.verified = Some(jiff::civil::date(2026, 7, 19));
+        let data = AccountData {
+            snapshot: Some(&snapshot),
+            limits: &[], // no limits code exists for Gemini (spec 020 §C) — never invented here
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: std::slice::from_ref(&sub),
+            today: jiff::civil::date(2026, 7, 19),
+        };
+        let row = build_account_view(&gemini_account, data, now, true);
+
+        assert_eq!(row.title, "Gemini Personal [gemini]");
+        assert!(
+            row.sub
+                .full
+                .as_deref()
+                .is_some_and(|s| s.contains("renews")),
+            "the ledger clause renders unchanged for a gemini id: {:?}",
+            row.sub.full
+        );
+        assert!(
+            row.sub.full.as_deref().is_some_and(|s| s.contains('✓')),
+            "the verified pill renders unchanged for a gemini id: {:?}",
+            row.sub.full
+        );
+        assert!(
+            row.session.is_none(),
+            "no session limit exists for Gemini — the gauge must be honestly absent, never derived"
+        );
+        assert!(
+            row.weekly.is_none(),
+            "no weekly limit exists for Gemini — the gauge must be honestly absent"
+        );
+        assert_eq!(
+            row.weekly_hint, "n/a (no limits surface)",
+            "gemini has no limits surface at all — never nudge enabling a flag that does nothing"
+        );
+
+        let usage = account_usage(Some(&snapshot), &[], None);
+        assert_eq!(
+            usage.total_tokens,
+            Some(3_550),
+            "tokens must show — the usage lane is real"
+        );
+        assert_eq!(usage.cost_notional, None, "never a fabricated cost");
+        assert_eq!(
+            usage.provenance, None,
+            "no session limit ⇒ no provenance badge for this account"
+        );
+    }
+
+    // A gemini account that DOES set `limits_overlay = true` must still show the honest
+    // no-limits-surface hint, never "waiting for overlay" forever (nothing will ever arrive —
+    // the flag is accepted but ignored, spec 020 §A/§C).
+    #[test]
+    fn a_gemini_account_opted_into_the_ignored_overlay_still_shows_no_limits_surface() {
+        let gemini_account = Account {
+            id: "gemini-personal".to_string(),
+            label: "Gemini Personal".to_string(),
+            provider: Provider::Gemini,
+            config_dir: Some(PathBuf::from("/home/example/.gemini")),
+            api_key_env: None,
+            color: None,
+            active: true,
+            limits_overlay: true, // opted in even though gemini has nothing to opt into
+        };
+        let now: Timestamp = "2026-07-19T10:49:00Z".parse().unwrap();
+        let data = AccountData {
+            snapshot: None,
+            limits: &[],
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::date(2026, 7, 19),
+        };
+        let row = build_account_view(&gemini_account, data, now, true);
+        assert_eq!(
+            row.weekly_hint, "n/a (no limits surface)",
+            "the ignored flag must never produce a 'waiting for overlay' that waits forever"
+        );
+    }
+
+    // ── spec 020 §D (AC4): a gemini account's `cost_notional = None` must never poison the fleet
+    // cost line when another account in the fleet DOES have a real notional cost.
+    #[test]
+    fn fleet_cost_line_is_not_poisoned_by_a_gemini_accounts_none_cost() {
+        let now: Timestamp = "2026-07-19T12:00:00Z".parse().unwrap();
+        let gemini_usage = AccountUsage {
+            total_tokens: Some(3_550),
+            cost_notional: None, // spec 020 §B: no public subscription pricing basis
+            tokens_per_minute: None,
+            provenance: None,
+            overlay_ms: None,
+            collected_at_ms: Some(now.as_millisecond()),
+        };
+        let claude_usage = AccountUsage {
+            total_tokens: Some(1_000_000),
+            cost_notional: Some(12.34),
+            tokens_per_minute: None,
+            provenance: Some(Provenance::Authoritative),
+            overlay_ms: None,
+            collected_at_ms: Some(now.as_millisecond()),
+        };
+        let fleet = build_fleet_view(
+            &[gemini_usage, claude_usage],
+            now,
+            true,
+            20,
+            LedgerProvenance::Off,
+            0,
+        )
+        .expect("fleet");
+        assert_eq!(
+            fleet.cost_notional, "$12.34 (notional)",
+            "the claude account's real cost must survive a mixed-in None, never dropped to \"—\""
+        );
+        assert_eq!(
+            fleet.tokens, "1.00M",
+            "the representative-usage reduction is unaffected by the None cost"
+        );
     }
 
     #[test]

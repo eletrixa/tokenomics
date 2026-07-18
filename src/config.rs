@@ -14,8 +14,8 @@
 //! Design constraints:
 //! - `validate` performs no I/O so the whole rule set is table-testable.
 //! - The account list is the single source of truth; each account owns its `CLAUDE_CONFIG_DIR` /
-//!   `CODEX_HOME` (claude/codex) or `api_key_env` (zai) — `validate` enforces which per provider
-//!   (spec 019 §A).
+//!   `CODEX_HOME` / `GEMINI_CLI_HOME` (claude/codex/gemini) or `api_key_env` (zai) — `validate`
+//!   enforces which per provider (spec 019 §A, spec 020 §A).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -234,13 +234,14 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
     findings
 }
 
-/// Per-provider account-field validation (spec 019 §A): `claude`/`codex` require `config_dir` and
-/// reject `api_key_env`; `zai` requires `api_key_env` (a non-empty env-var NAME) and leaves
-/// `config_dir` optional (accepted but unused this wave). Pure — no I/O, no env-var reads.
+/// Per-provider account-field validation (spec 019 §A, spec 020 §A): `claude`/`codex`/`gemini`
+/// require `config_dir` and reject `api_key_env`; `zai` requires `api_key_env` (a non-empty
+/// env-var NAME) and leaves `config_dir` optional (accepted but unused this wave). Pure — no I/O,
+/// no env-var reads.
 fn validate_provider_fields(account: &Account) -> Vec<Finding> {
     let mut findings = Vec::new();
     match account.provider {
-        Provider::Claude | Provider::Codex => {
+        Provider::Claude | Provider::Codex | Provider::Gemini => {
             if account.config_dir.is_none() {
                 findings.push(Finding::error(format!(
                     "account '{}': config_dir is required for provider '{}'",
@@ -271,14 +272,19 @@ fn validate_provider_fields(account: &Account) -> Vec<Finding> {
 }
 
 /// Filesystem checks kept separate so [`validate`] stays pure: each account whose provider
-/// requires a `config_dir` (claude/codex — see [`validate_provider_fields`]) must have one that
-/// exists. A zai account's `config_dir` is accepted but unused this wave (spec 019 §A), so it is
-/// never existence-checked here even when provided — a placeholder value for a future GLM lane
+/// requires a `config_dir` (claude/codex/gemini — see [`validate_provider_fields`]) must have one
+/// that exists. A zai account's `config_dir` is accepted but unused this wave (spec 019 §A), so it
+/// is never existence-checked here even when provided — a placeholder value for a future GLM lane
 /// must not hard-fail environment validation for a field nothing reads.
 pub fn validate_environment(cfg: &Config) -> Vec<Finding> {
     cfg.accounts
         .iter()
-        .filter(|a| matches!(a.provider, Provider::Claude | Provider::Codex))
+        .filter(|a| {
+            matches!(
+                a.provider,
+                Provider::Claude | Provider::Codex | Provider::Gemini
+            )
+        })
         .filter_map(|a| a.config_dir.as_ref().map(|dir| (a, dir)))
         .filter(|(_, dir)| !dir.is_dir())
         .map(|(a, dir)| {
@@ -612,5 +618,104 @@ api_key_env = \"SOME_KEY\"
         let codex_toml = ONE.replace("claude", "codex");
         let codex_cfg = Config::parse(&codex_toml).expect("parses");
         assert!(validate(&codex_cfg).is_empty());
+    }
+
+    // ── spec 020 §A (AC1): "gemini" round-trips; config_dir required, api_key_env rejected,
+    // limits_overlay accepted-but-ignored ──────────────────────────────────────────────────────
+
+    const GEMINI: &str = "\
+[[account]]
+id = \"gemini-personal\"
+label = \"Gemini Personal\"
+provider = \"gemini\"
+config_dir = \"/home/example/.gemini\"
+";
+
+    #[test]
+    fn gemini_round_trips_provider_id() {
+        assert_eq!(Provider::parse("gemini"), Some(Provider::Gemini));
+        assert_eq!(Provider::Gemini.as_str(), "gemini");
+    }
+
+    #[test]
+    fn gemini_account_parses_with_config_dir_and_validates_clean() {
+        let cfg = Config::parse(GEMINI).expect("parses");
+        assert_eq!(cfg.accounts[0].provider, Provider::Gemini);
+        assert_eq!(
+            cfg.accounts[0].config_dir.as_deref(),
+            Some(Path::new("/home/example/.gemini"))
+        );
+        assert_eq!(cfg.accounts[0].api_key_env, None);
+        assert!(
+            validate(&cfg).is_empty(),
+            "a well-formed gemini account must validate clean: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn gemini_account_without_config_dir_fails_validation_naming_the_account() {
+        let toml = "\
+[[account]]
+id = \"gemini-personal\"
+label = \"Gemini Personal\"
+provider = \"gemini\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("gemini-personal") && m.contains("config_dir")),
+            "must name the account and the missing field: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn gemini_account_with_api_key_env_fails_validation_naming_the_account() {
+        let toml = format!("{GEMINI}api_key_env = \"GEMINI_API_KEY\"\n");
+        let cfg = Config::parse(&toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("gemini-personal") && m.contains("api_key_env")),
+            "an API-key gemini setup is PAYG, not a subscription — must be rejected: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn gemini_account_accepts_limits_overlay_true_without_a_validation_error() {
+        // spec 020 §A: limits_overlay is accepted but ignored for gemini (no limits surface) —
+        // setting it must never fail validation; `doctor` is where the ignored-flag note lives.
+        let toml = format!("{GEMINI}limits_overlay = true\n");
+        let cfg = Config::parse(&toml).expect("parses");
+        assert!(cfg.accounts[0].limits_overlay);
+        assert!(validate(&cfg).is_empty());
+    }
+
+    #[test]
+    fn validate_environment_flags_a_gemini_accounts_missing_config_dir() {
+        let toml = "\
+[[account]]
+id = \"gemini-personal\"
+label = \"Gemini Personal\"
+provider = \"gemini\"
+config_dir = \"/nonexistent/gemini/home\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert!(
+            validate_environment(&cfg)
+                .iter()
+                .any(|f| f.message.contains("gemini-personal")
+                    && f.message.contains("does not exist"))
+        );
+    }
+
+    #[test]
+    fn existing_claude_codex_zai_accounts_still_validate_after_gemini_added() {
+        // Adding the Gemini variant must not perturb existing per-provider validation branches.
+        let cfg = Config::parse(ONE).expect("parses");
+        assert!(validate(&cfg).is_empty());
+        let zai_cfg = Config::parse(ZAI).expect("parses");
+        assert!(validate(&zai_cfg).is_empty());
     }
 }

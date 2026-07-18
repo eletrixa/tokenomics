@@ -7,10 +7,11 @@
 //!          (claude/ccusage, codex/sessions); Limit via providers/*/ (overlay, codex/rate_limits)
 //!
 //! Key responsibilities:
-//! - `Provider`: the exhaustive provider enum (Claude, Codex, Zai now; Gemini/Grok slot in later).
+//! - `Provider`: the exhaustive provider enum (Claude, Codex, Zai, Gemini now; Grok slots in later).
 //! - `Account`: one monitored subscription account. Attribution is `config_dir`
-//!   (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`) for claude/codex, or `api_key_env` for zai (spec 019 §A) —
-//!   exactly one is the identity handle per provider, enforced by `config::validate`.
+//!   (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GEMINI_CLI_HOME`) for claude/codex/gemini, or `api_key_env`
+//!   for zai (spec 019 §A) — exactly one is the identity handle per provider, enforced by
+//!   `config::validate`.
 //! - `UsageSnapshot` / `Window`: one account's normalized token usage + active 5h window.
 //! - `Limit` / `LimitKind` / `Severity` / `Provenance`: a normalized utilization limit + its badges.
 //!
@@ -36,7 +37,9 @@ pub enum Provider {
     Codex,
     /// z.ai GLM coding plan — limits-only, API-key attributed (spec 019).
     Zai,
-    // Future: Gemini, Grok — add a variant + a providers/<x>/ adapter.
+    /// Google Gemini CLI — usage-only, `config_dir`-attributed, no limits surface (spec 020).
+    Gemini,
+    // Future: Grok — add a variant + a providers/<x>/ adapter.
 }
 
 impl Provider {
@@ -46,6 +49,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Zai => "zai",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -55,6 +59,7 @@ impl Provider {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "zai" => Some(Self::Zai),
+            "gemini" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -80,8 +85,9 @@ pub struct Account {
     pub label: String,
     /// The provider behind this account.
     pub provider: Provider,
-    /// The account's config dir (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`; tilde-expanded at parse time).
-    /// Required for `claude`/`codex`; optional (accepted but unused) for `zai` (spec 019 §A).
+    /// The account's config dir (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GEMINI_CLI_HOME`;
+    /// tilde-expanded at parse time). Required for `claude`/`codex`/`gemini`; optional (accepted
+    /// but unused) for `zai` (spec 019 §A, spec 020 §A).
     #[serde(default)]
     pub config_dir: Option<PathBuf>,
     /// The env-var NAME (never the value) holding the z.ai API key. Required for `zai`, rejected
@@ -95,7 +101,8 @@ pub struct Account {
     #[serde(default)]
     pub color: Option<String>,
     /// Opt-in to the authoritative limits overlay for this account (`/api/oauth/usage` for Claude,
-    /// `codex app-server` for Codex, the z.ai quota endpoint for zai).
+    /// `codex app-server` for Codex, the z.ai quota endpoint for zai). Accepted but IGNORED for
+    /// gemini — no scriptable limits surface exists (spec 020 §A); `doctor` notes it when set.
     #[serde(default)]
     pub limits_overlay: bool,
 }

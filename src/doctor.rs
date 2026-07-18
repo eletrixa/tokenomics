@@ -2,7 +2,7 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/doctor.rs
-//! Deps:    jiff; runner (ccusage/codex version), providers::claude (adapter/creds/overlay),
+//! Deps:    jiff; runner (ccusage/codex/gemini version), providers::claude (adapter/creds/overlay),
 //!          providers::codex (app-server rate-limits probe), providers::zai (quota probe)
 //! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
 //!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
@@ -19,6 +19,9 @@
 //! - Per zai account: `api_key_env` NAME + presence (never the value); quota-endpoint reachability
 //!   (only if opted-in AND active); the monthly MCP-tool quota (`TIME_LIMIT`) informational note —
 //!   it has no gauge home, so this is its only surface (spec 019 §D).
+//! - Per Gemini account: `gemini --version` (argv subprocess, timeout, output never parsed beyond
+//!   success); `oauth_creds.json` existence ONLY (content never read); a note when `limits_overlay`
+//!   is set even though Gemini has no limits surface to opt into (spec 020 §D).
 //! - Cross-account (Claude only): `CLAUDE_CONFIG_DIR` round-trip distinctness + shared-`projects/`.
 //! - Ledger plane (spec 017 §E): resolved path + provenance (`"ledger: not configured"` when `Off`);
 //!   past-dated rows (`renews`/`paid_through` already behind `today`); failed-parse rows with reason;
@@ -97,6 +100,7 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
             Provider::Zai => {
                 report_zai(account, cfg.settings.warn_pct, cfg.settings.crit_pct).await;
             }
+            Provider::Gemini => report_gemini(account).await,
         }
     }
 
@@ -488,6 +492,48 @@ async fn report_zai_overlay(api_key: &str, account_id: &str, warn_pct: f64, crit
     }
 }
 
+/// Gemini diagnostics for one account (read-only, spec 020 §D): `gemini --version` (argv
+/// subprocess, timeout, output never parsed beyond success/failure — mirrors `codex_version`),
+/// `oauth_creds.json` existence ONLY (content never read — Gemini's login state lives inside the
+/// `gemini` binary, same posture as Codex's `auth.json`), and a note when `limits_overlay` is set
+/// even though no limits surface exists to opt into (spec 020 §A/§C).
+async fn report_gemini(account: &crate::domain::Account) {
+    println!("  gemini:      {}", gemini_version().await);
+    let creds_marker = match account.config_dir.as_deref() {
+        Some(dir) if dir.join("oauth_creds.json").exists() => "present",
+        Some(_) => "MISSING (run `gemini` and \"Login with Google\")",
+        None => "n/a (no config_dir)",
+    };
+    println!("  oauth_creds: {creds_marker}");
+    if let Some(note) = gemini_overlay_ignored_note(account.limits_overlay) {
+        println!("  {note}");
+    }
+}
+
+/// Best-effort `gemini --version` string (read-only, argv subprocess, bounded timeout).
+async fn gemini_version() -> String {
+    let spec = CommandSpec {
+        program: "gemini".to_string(),
+        args: vec!["--version".to_string()],
+        env: Vec::new(),
+        timeout: Duration::from_secs(DOCTOR_TIMEOUT_SECS),
+    };
+    match Exec.run(&spec).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+        Err(e) => format!("unavailable ({e})"),
+    }
+}
+
+/// Pure: the note printed when a Gemini account has `limits_overlay = true` — accepted by config
+/// (spec 020 §A) but ignored, since no scriptable quota surface exists for Gemini CLI (spec 020
+/// §C). `None` when the flag is unset, so an un-opted-in account's report stays silent about it.
+fn gemini_overlay_ignored_note(limits_overlay: bool) -> Option<String> {
+    limits_overlay.then(|| {
+        "overlay:     ignored — gemini has no limits/quota surface to opt into (spec 020 §C)"
+            .to_string()
+    })
+}
+
 /// Report whether any accounts share one `projects/` usage-log directory — the precise, deterministic
 /// root cause of identical per-account totals (each `<config_dir>/projects` resolving to the same
 /// real path, e.g. all symlinked to a shared `~/.claude/projects`). Read-only (canonicalize only).
@@ -875,6 +921,18 @@ mod tests {
         assert_eq!(
             verified_annotation(&sub, today),
             "verified 2026-06-01 (outdated — before current period)"
+        );
+    }
+
+    // ── spec 020 §D (AC6): the ignored-limits_overlay note ─────────────────────────────────────
+
+    #[test]
+    fn gemini_overlay_ignored_note_present_only_when_flag_set() {
+        assert!(gemini_overlay_ignored_note(false).is_none());
+        let note = gemini_overlay_ignored_note(true).expect("flag set ⇒ a note");
+        assert!(
+            note.contains("ignored") && note.contains("no limits"),
+            "{note}"
         );
     }
 

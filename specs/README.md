@@ -26,7 +26,7 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 017 | [subscription-dates](017-subscription-dates.md) | ledger plane (third data plane): subscription start / renewal / end dates on the header line; doctor section; PII gate in check.sh | Done |
 | 018 | [verified-pill](018-verified-pill.md) | `✓ <date>` pill on the clause when the ledger row was agent-verified against the provider billing UI within the current period | Done |
 | 019 | [zai-provider](019-zai-provider.md) | z.ai GLM adapter: limits-only authoritative quota overlay (`api_key_env` identity, session %/no-reset + weekly %/reset), honest idle usage | Done |
-| 020 | [gemini-provider](020-gemini-provider.md) | Gemini adapter: usage-only from local chats JSON[L] (fan-out glob, mtime-pruned), both gauges honestly n/a, no cost | Active |
+| 020 | [gemini-provider](020-gemini-provider.md) | Gemini adapter: usage-only from local chats JSON[L] (fan-out glob, mtime-pruned), both gauges honestly n/a, no cost | Done |
 
 Scope now: **Claude** (6 accounts) + **Codex** (spec 013) + **z.ai** (spec 019, limits-only) +
 **Gemini** (spec 020, usage-only — activates on a gemini-cli login). **Grok** is blocked pending a

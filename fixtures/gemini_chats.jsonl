@@ -1,0 +1,6 @@
+{"sessionId":"synthetic-session-a","projectHash":"synthetic-hash-a","startTime":"2026-07-08T12:56:00.000Z","lastUpdated":"2026-07-08T12:56:00.000Z","kind":"main"}
+{"id":"turn-aaa","timestamp":"2026-07-08T12:56:22.581Z","tokens":{"input":10000,"output":300,"cached":8000,"thoughts":800,"tool":0,"total":11100},"model":"gemini-3.5-flash"}
+this is not json at all
+{"id":"turn-bbb","timestamp":"2026-07-08T13:00:00.000Z","model":"gemini-3.5-flash"}
+{"id":"turn-ccc","timestamp":"2026-07-08T13:10:00.000Z","tokens":{"input":4000,"output":700,"cached":0,"thoughts":300,"tool":0,"total":5000},"model":"gemini-3.5-flash"}
+{"$set":{"lastUpdated":"2026-07-08T13:10:00.000Z"}}

@@ -31,3 +31,12 @@ limits_overlay = false    # opt-in, OFF by default — see the README overlay no
 # provider = "zai"
 # api_key_env = "Z_AI_CODING_KEY"  # NAME of the env var holding your z.ai API key — never the key itself
 # limits_overlay = true            # zai has no local usage lane; opt in to see any gauges at all
+
+# A fourth provider — Gemini CLI reads its local chats tree under GEMINI_CLI_HOME. Usage-only: no
+# scriptable limits surface exists, so both gauges always show n/a (never a fabricated daily quota).
+# Uncomment and adjust to monitor a Gemini subscription too:
+# [[account]]
+# id = "gemini-personal"
+# label = "Gemini"
+# provider = "gemini"
+# config_dir = "~/.gemini"  # this account's GEMINI_CLI_HOME — attribution comes from the dir

@@ -7,6 +7,27 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 ## [Unreleased]
 
 ### ADDED
+- **Gemini CLI is now a monitored, usage-only provider (spec 020).** `Provider::Gemini`
+  (`"gemini"`) round-trips through config/store/display. `config_dir` (the `GEMINI_CLI_HOME` dir,
+  default `~/.gemini`) is required, same as claude/codex; `api_key_env` is rejected (a PAYG API-key
+  setup is not a subscription). `providers/gemini/chats.rs` parses gemini-cli's local per-turn
+  session files — the real `.json` session-wrapper shape (`{..., messages: [...]}`, token-less
+  user-message elements filtered out) and the real `.jsonl` event-sourced shape (header line and
+  `{"$set": ...}` patch lines skipped, the same message id re-appended across lines deduped by
+  id — last occurrence wins — so a real multi-line session is never double-counted) — and reduces
+  in-5h-window, deduped turns into a `UsageSnapshot` with real token counts (`input = input −
+  cached`, `output = output + thoughts`, `cache_read = cached`, tool tokens fold into the input
+  bucket) and `cost_notional = None` (no public subscription pricing basis — never fabricated).
+  `GeminiAdapter` fans out across every `tmp/<project-hash>/chats/` directory under `config_dir`
+  with mtime-pruned scanning, skipping symlinked project-hash dirs; a missing `tmp/` is idle, not
+  an error. No limits/quota code exists for Gemini this wave — both gauges render `n/a (no limits
+  surface)` regardless of `limits_overlay`, never a derived daily-quota approximation or a
+  "waiting for overlay" hint for a surface that will never arrive. `tok doctor` reports a
+  `gemini --version` probe, `oauth_creds` existence (content never read), and a note when
+  `limits_overlay` is set despite having no surface to opt into. `tok accounts` / `tok once
+  --json` stay byte-identical (golden-snapshot enforced). The TUI renders a gemini account with
+  the existing provider-agnostic row grammar (tokens, no cost line, both gauges n/a) and the
+  spec-017 ledger clause / spec-018 verified pill unchanged for a matching id.
 - **z.ai (GLM coding plan) is now a monitored, limits-only provider (spec 019).** `Provider::Zai`
   (`"zai"`) round-trips through config/store/display. `Account.config_dir` is now
   `Option<PathBuf>` and a new `Account.api_key_env: Option<String>` names (never holds) the env var

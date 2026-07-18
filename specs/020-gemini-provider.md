@@ -1,9 +1,11 @@
 # Spec 020 — Gemini provider: usage-only adapter
 
-Status: **Active**
+Status: **Done**
 
 Plan: `plans/002-multi-provider/` (research `02-gemini.md`, synthesis `10-adapter-plan.md` §2 —
-verdict YELLOW, usage-only, after z.ai). Local chats JSONL was machine-verified 2026-07-19.
+verdict YELLOW, usage-only, after z.ai). Local chats JSON/JSONL shapes were re-verified against
+real files under `~/.gemini/tmp/**` on 2026-07-19 (see §B below — the first verification pass
+quoted an elided excerpt that hid the envelope and the event-sourced `.jsonl` structure).
 
 ## Motivation
 
@@ -26,12 +28,23 @@ activates once a Google-account-OAuth gemini-cli login exists on this machine.
 ### B. Usage lane (local, ToS-safe)
 
 - `providers/gemini/chats.rs` — pure parse + reduce over
-  `<config_dir>/tmp/<project-hash>/chats/session-*.json[l]`:
-  - **Both file shapes**: single-document `.json` and line-per-event `.jsonl` — normalized on
-    read. Malformed lines/files degrade per-line/per-file, never fail the account.
-  - Per-turn event shape: `{tokens: {input, output, cached, thoughts, tool, total}, model,
-    timestamp}` (observed invariant: `total = input + output + thoughts + tool`, `cached ⊆
-    input`).
+  `<config_dir>/tmp/<project-hash>/chats/session-*.json[l]`. **Real file shapes** (re-verified
+  2026-07-19 against `~/.gemini/tmp/**`, machine — not the elided excerpt the first pass quoted):
+  - `.json` is a **session wrapper OBJECT**: `{sessionId, projectHash, startTime, lastUpdated,
+    messages: [...]}`. Each turn's `tokens`/`timestamp` live on an element of `messages`, mixed
+    with token-less user-message elements that must be filtered out individually, never fail the
+    whole document.
+  - `.jsonl` is **event-sourced**, not one line per finished turn: a header line (`sessionId`/
+    `projectHash`/no `tokens`), `{"$set": {...}}` envelope-patch lines (skipped explicitly), and
+    the SAME message `id` re-appended across multiple lines as it's updated (once on creation,
+    again once `tokens` lands, sometimes again with `toolCalls`). Events **must be deduped by
+    `id`, last occurrence wins**, before reduction — undeduped summation double-counts a real
+    session (verified: one real file overcounted `total_tokens` by +62%, 61,190 vs. the true
+    37,648).
+  - Malformed lines/elements degrade per-line/per-element, never fail the account.
+  - Per-turn `tokens` shape (once isolated from the envelope): `{input, output, cached, thoughts,
+    tool, total}` alongside `id`, `timestamp`, `model` (observed invariant: `total = input +
+    output + thoughts + tool`, `cached ⊆ input`). An all-zero `tokens` object is not a real turn.
   - Bucket mapping: `input = input − cached` (floor 0), `cache_read = cached`,
     `output = output + thoughts` (reasoning folds into output, as Codex), `cache_creation = 0`,
     `total_tokens = tokens.total`. **`tool` folds into the input bucket** (tool results are
@@ -75,9 +88,11 @@ activates once a Google-account-OAuth gemini-cli login exists on this machine.
 
 1. `"gemini"` round-trips config → domain → store → display; validation: `config_dir` required,
    `api_key_env` rejected with the account named; existing provider validations stay green. (A)
-2. Parser handles `.json` and `.jsonl` fixtures; skips malformed lines/files defensively;
-   reduce sums only in-window turns; buckets sum to `total_tokens` (incl. a `tool > 0`
-   synthetic fixture); no events ⇒ `None`. (B)
+2. Parser handles the real `.json` session-wrapper shape and the real `.jsonl` event-sourced
+   shape (header line, `$set` patch lines, duplicate-id re-appends); skips malformed/non-turn
+   lines and elements defensively; **dedups events by message id (last occurrence wins)**,
+   asserted on a synthetic duplicate-id `.jsonl` fixture; reduce sums only in-window turns;
+   buckets sum to `total_tokens` (incl. a `tool > 0` synthetic fixture); no events ⇒ `None`. (B)
 3. Adapter on a fixture tree spanning multiple project hashes returns the merged snapshot;
    mtime pruning skips stale files (asserted); missing `tmp/` ⇒ `Ok(None)`. (B)
 4. `cost_notional = None` flows through store and fleet reduction without poisoning the fleet

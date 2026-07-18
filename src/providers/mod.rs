@@ -2,9 +2,9 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/providers/mod.rs
-//! Deps:    async-trait, jiff; claude/codex/zai adapters; runner (Runner seam)
-//! Tested:  via providers/claude (ClaudeAdapter::collect) + providers/codex + providers/zai inline
-//!          tests
+//! Deps:    async-trait, jiff; claude/codex/zai/gemini adapters; runner (Runner seam)
+//! Tested:  via providers/claude (ClaudeAdapter::collect) + providers/codex + providers/zai +
+//!          providers/gemini inline tests
 //!
 //! Key responsibilities:
 //! - `ProviderAdapter`: collect a normalized snapshot for one account.
@@ -12,9 +12,9 @@
 //!   collector loop stays generic over ONE `ProviderAdapter` (spec 013 §D).
 //!
 //! Design constraints:
-//! - Gemini/Grok slot in by adding a `providers/<x>/` module implementing this trait plus a
-//!   `Provider` enum variant and a registry arm — the collector, store, and TUI stay untouched
-//!   (zai, spec 019, is the most recent example of this seam holding).
+//! - Grok slots in by adding a `providers/<x>/` module implementing this trait plus a `Provider`
+//!   enum variant and a registry arm — the collector, store, and TUI stay untouched (gemini, spec
+//!   020, is the most recent example of this seam holding).
 
 use async_trait::async_trait;
 use jiff::Timestamp;
@@ -25,10 +25,12 @@ use crate::runner::Runner;
 
 pub mod claude;
 pub mod codex;
+pub mod gemini;
 pub mod zai;
 
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
+use gemini::GeminiAdapter;
 use zai::ZaiAdapter;
 
 /// One provider's collection behavior. `collect` returns `None` when the account is idle
@@ -51,6 +53,8 @@ pub struct ProviderRegistry<R: Runner> {
     pub codex: CodexAdapter,
     /// The z.ai usage adapter (always idle this wave — limits-only, spec 019 §C).
     pub zai: ZaiAdapter,
+    /// The Gemini usage adapter (chats-JSONL under each account's `GEMINI_CLI_HOME`, spec 020 §B).
+    pub gemini: GeminiAdapter,
 }
 
 #[async_trait]
@@ -60,6 +64,7 @@ impl<R: Runner> ProviderAdapter for ProviderRegistry<R> {
             Provider::Claude => self.claude.collect(account, now).await,
             Provider::Codex => self.codex.collect(account, now).await,
             Provider::Zai => self.zai.collect(account, now).await,
+            Provider::Gemini => self.gemini.collect(account, now).await,
         }
     }
 }
