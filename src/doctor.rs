@@ -6,7 +6,9 @@
 //!          providers::codex (app-server rate-limits probe)
 //! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
 //!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
-//!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8).
+//!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8); the
+//!          per-row `verified_annotation` / `ledger_verified_lines` helpers get theirs (spec 018 §D
+//!          acceptance 5).
 //!
 //! Key responsibilities:
 //! - Per Claude account: config_dir exists; `.credentials.json` present + owner-only; ccusage active
@@ -18,7 +20,8 @@
 //! - Ledger plane (spec 017 §E): resolved path + provenance (`"ledger: not configured"` when `Off`);
 //!   past-dated rows (`renews`/`paid_through` already behind `today`); failed-parse rows with reason;
 //!   join divergence in both directions (config account with no ledger row, ledger row with no
-//!   matching config account). One read-only poll via the injectable `FileLedgerSource` — never
+//!   matching config account); per-matched-row `verified` annotation — current / outdated /
+//!   human-entered (spec 018 §D). One read-only poll via the injectable `FileLedgerSource` — never
 //!   written, never held past this run.
 //! - Config divergence (spec 015 §B): flag when the RECORDED config path is newer than what the
 //!   running collector loaded, but only once the collector has heartbeated a few local cadences past
@@ -43,7 +46,8 @@ use crate::config::Config;
 use crate::domain::Provider;
 use crate::error::AppResult;
 use crate::ledger::{
-    FileLedgerSource, Ledger, LedgerProvenance, SubStatus, Subscription, LEDGER_ENV,
+    verified_current, FileLedgerSource, Ledger, LedgerProvenance, SubStatus, Subscription,
+    LEDGER_ENV,
 };
 use crate::providers::claude::ccusage::CcusageInvocation;
 use crate::providers::claude::overlay::{HttpUsageEndpoint, UsageEndpoint};
@@ -248,6 +252,10 @@ fn report_ledger(cfg: &Config, today: jiff::civil::Date) {
     }
 
     let config_ids: Vec<&str> = cfg.accounts.iter().map(|a| a.id.as_str()).collect();
+    for line in ledger_verified_lines(&config_ids, ledger.rows(), today) {
+        println!("{line}");
+    }
+
     let (config_only, ledger_only) = ledger_join_divergence(&config_ids, ledger.rows());
     if !config_only.is_empty() {
         println!(
@@ -296,6 +304,41 @@ fn ledger_past_dated(rows: &[Subscription], today: jiff::civil::Date) -> Vec<Str
         })
         .map(|r| r.id.clone())
         .collect()
+}
+
+/// Per-row verified annotation lines for `tok doctor`'s ledger section (spec 018 §D), one per row
+/// matched to a config account (§C join) — an orphan ledger row is already covered by the divergence
+/// report below, so it isn't repeated here. Pure; returns lines in ledger order.
+fn ledger_verified_lines(
+    config_ids: &[&str],
+    rows: &[Subscription],
+    today: jiff::civil::Date,
+) -> Vec<String> {
+    let config_id_set: std::collections::HashSet<&str> = config_ids.iter().copied().collect();
+    rows.iter()
+        .filter(|r| config_id_set.contains(r.id.as_str()))
+        .map(|r| {
+            format!(
+                "  ledger verified ({}): {}",
+                r.id,
+                verified_annotation(r, today)
+            )
+        })
+        .collect()
+}
+
+/// One row's verified annotation: `"verified <date> (current)"`, `"verified <date> (outdated —
+/// before current period)"`, or `"human-entered (no verified)"` (spec 018 §D). Shares
+/// [`crate::ledger::verified_current`] with the TUI's pill math so both stay in lockstep.
+fn verified_annotation(sub: &Subscription, today: jiff::civil::Date) -> String {
+    let Some(verified) = sub.verified else {
+        return "human-entered (no verified)".to_string();
+    };
+    if verified_current(sub, today) {
+        format!("verified {verified} (current)")
+    } else {
+        format!("verified {verified} (outdated — before current period)")
+    }
 }
 
 /// Join divergence in both directions (spec 017 §C/§E): `(config ids with no ledger row, ledger ids
@@ -639,6 +682,7 @@ mod tests {
             renews: None,
             cancelled_on: None,
             paid_through: None,
+            verified: None,
         }
     }
 
@@ -708,5 +752,61 @@ mod tests {
         let (config_only, ledger_only) = ledger_join_divergence(&config_ids, &ledger_rows);
         assert!(config_only.is_empty());
         assert!(ledger_only.is_empty());
+    }
+
+    // ── spec 018 §D (acceptance 5): per-row verified annotation ────────────────────────────────
+
+    #[test]
+    fn verified_annotation_human_entered_when_absent() {
+        let sub = ledger_row("claude-alpha", SubStatus::Active);
+        let today = jiff::civil::date(2026, 7, 18);
+        assert_eq!(
+            verified_annotation(&sub, today),
+            "human-entered (no verified)"
+        );
+    }
+
+    #[test]
+    fn verified_annotation_current_when_verified_on_or_after_purchased() {
+        let mut sub = ledger_row("claude-alpha", SubStatus::Active);
+        sub.purchased = Some(jiff::civil::date(2026, 7, 1));
+        sub.verified = Some(jiff::civil::date(2026, 7, 18));
+        let today = jiff::civil::date(2026, 7, 18);
+        assert_eq!(
+            verified_annotation(&sub, today),
+            "verified 2026-07-18 (current)"
+        );
+    }
+
+    #[test]
+    fn verified_annotation_outdated_when_verified_before_purchased() {
+        let mut sub = ledger_row("claude-alpha", SubStatus::Active);
+        sub.purchased = Some(jiff::civil::date(2026, 7, 1));
+        sub.verified = Some(jiff::civil::date(2026, 6, 1));
+        let today = jiff::civil::date(2026, 7, 18);
+        assert_eq!(
+            verified_annotation(&sub, today),
+            "verified 2026-06-01 (outdated — before current period)"
+        );
+    }
+
+    #[test]
+    fn ledger_verified_lines_only_covers_rows_matched_to_a_config_account() {
+        let today = jiff::civil::date(2026, 7, 18);
+        let mut matched = ledger_row("claude-alpha", SubStatus::Active);
+        matched.verified = Some(jiff::civil::date(2026, 7, 18));
+        let orphan = ledger_row("claude-orphan-ledger", SubStatus::Active);
+        let rows = vec![matched, orphan];
+        let config_ids = vec!["claude-alpha"];
+        let lines = ledger_verified_lines(&config_ids, &rows, today);
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the matched row is annotated: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("claude-alpha") && lines[0].contains("current"),
+            "{lines:?}"
+        );
     }
 }

@@ -5,7 +5,9 @@
 //! Deps:    ratatui (Layout, Block, Sparkline, Paragraph, symbols)
 //! Tested:  inline `#[cfg(test)]` (TestBackend buffer assertions + insta snapshots at several sizes);
 //!          the ledger clause's tier degrade order (`pick_full_clause`, `compact_header_line`,
-//!          `micro_line`) and the fleet header's ledger token (spec 017 §D acceptance 5)
+//!          `micro_line`) and the fleet header's ledger token (spec 017 §D acceptance 5); the
+//!          verified pill's own degrade step + dim-green span styling (`split_pill`,
+//!          `full_title_spans`) and its absence from MICRO (spec 018 §C acceptance 3/4)
 //!
 //! Design constraints:
 //! - `render` takes `&App` only; every value it needs is precomputed on `App` (no I/O, no compute).
@@ -309,15 +311,18 @@ fn render_full_panel(f: &mut Frame<'_>, app: &App, row: &AccountView, area: Rect
     };
     let marker = if selected { "▶ " } else { "" };
     // The border's own title-text budget: `area.width` minus the two corner cells (ratatui's
-    // `Block::titles_area` reserves exactly one column per side) — see `full_title_text`.
-    let title_text = full_title_text(&row.title, marker, &row.sub, area.width.saturating_sub(2));
+    // `Block::titles_area` reserves exactly one column per side) — see `full_title_spans`.
+    let title_spans = full_title_spans(
+        &row.title,
+        marker,
+        &row.sub,
+        area.width.saturating_sub(2),
+        app.use_color,
+    );
     let block = Block::bordered()
         .border_set(border_set)
         .border_style(Style::new().fg(accent))
-        .title(Span::styled(
-            title_text,
-            Style::new().add_modifier(Modifier::BOLD),
-        ));
+        .title(Line::from(title_spans));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -513,34 +518,77 @@ fn tight_label(g: &GaugeView) -> String {
     s
 }
 
-/// Pick the widest ledger-clause form (spec 017 §D) that fits `avail` cells, trying the degrade
-/// order roomiest→narrowest: the full form (start segment + absolute date) → the start segment
-/// dropped → the absolute date also dropped → omit entirely. Each candidate is rendered WHOLE or not
-/// at all — this never truncates a date mid-string (the FULL-tier degrade rule, acceptance 5).
+/// Pick the widest ledger-clause form (spec 017 §D, spec 018 §C) that fits `avail` cells, trying the
+/// degrade order roomiest→narrowest: the full form (start segment + absolute date + verified pill
+/// with its own date) → the pill's date dropped (bare `✓` stays) → the start segment also dropped →
+/// the absolute date also dropped → omit entirely. Each candidate is rendered WHOLE or not at all —
+/// this never truncates a date mid-string (the FULL-tier degrade rule, acceptance 3/5).
 fn pick_full_clause(sub: &SubView, avail: usize) -> Option<&str> {
-    [&sub.full, &sub.full_no_start, &sub.full_no_date]
-        .into_iter()
-        .flatten()
-        .find(|candidate| candidate.chars().count() <= avail)
-        .map(String::as_str)
+    [
+        &sub.full,
+        &sub.full_no_pill_date,
+        &sub.full_no_start,
+        &sub.full_no_date,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| candidate.chars().count() <= avail)
+    .map(String::as_str)
 }
 
-/// Build the FULL-tier border title: `" {marker}{title}[ {clause}] "`. The clause is picked via
-/// [`pick_full_clause`] against whatever room is left after the (always-shown) marker + account
-/// title + the title's own leading/trailing padding spaces — so the whole title, clause included,
-/// is guaranteed to fit the border's `titles_area` (`area.width - 2`, the two corner cells) and is
-/// therefore never truncated by ratatui itself (which would otherwise cut a date mid-string).
-fn full_title_text(title: &str, marker: &str, sub: &SubView, avail_cols: u16) -> String {
+/// Split the verified pill off the end of a picked FULL-tier clause string (spec 018 §C), so it can
+/// be styled distinctly (dim green) from the rest of the title. Compares `clause` against `sub.full`
+/// to know whether the roomiest (date-bearing) pill suffix applies or the bare `" ✓"` suffix shared
+/// by every narrower degrade step; returns the clause with the pill stripped, plus the pill text
+/// itself (`None` when the picked candidate carries no pill at all).
+fn split_pill<'a>(sub: &'a SubView, clause: &'a str) -> (&'a str, Option<&'a str>) {
+    let is_widest = sub.full.as_deref() == Some(clause);
+    let suffix = if is_widest {
+        sub.pill_full.as_deref()
+    } else {
+        sub.pill_bare.as_deref()
+    };
+    suffix
+        .and_then(|p| clause.strip_suffix(p).map(|base| (base, Some(p))))
+        .unwrap_or((clause, None))
+}
+
+/// Build the FULL-tier border title's spans: `" {marker}{title}[ {clause}]"` plus a trailing space,
+/// with the verified pill (when present in the picked clause) styled as its own dim-green span. The
+/// clause is picked via [`pick_full_clause`] against whatever room is left after the (always-shown)
+/// marker + account title + the title's own leading/trailing padding spaces — so the whole title,
+/// clause included, is guaranteed to fit the border's `titles_area` (`area.width - 2`, the two corner
+/// cells) and is therefore never truncated by ratatui itself (which would otherwise cut a date
+/// mid-string).
+fn full_title_spans(
+    title: &str,
+    marker: &str,
+    sub: &SubView,
+    avail_cols: u16,
+    use_color: bool,
+) -> Vec<Span<'static>> {
     let prefix = format!(" {marker}{title}");
     let prefix_w = prefix.chars().count();
     // One cell for the separating space before the clause, one for the title's own trailing space.
     let clause_budget = usize::from(avail_cols)
         .saturating_sub(prefix_w)
         .saturating_sub(2);
-    match pick_full_clause(sub, clause_budget) {
-        Some(clause) => format!("{prefix} {clause} "),
-        None => format!("{prefix} "),
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let Some(clause) = pick_full_clause(sub, clause_budget) else {
+        return vec![Span::styled(format!("{prefix} "), bold)];
+    };
+    let (base, pill) = split_pill(sub, clause);
+    let mut spans = vec![Span::styled(format!("{prefix} {base}"), bold)];
+    if let Some(pill) = pill {
+        spans.push(Span::styled(
+            pill.to_string(),
+            Style::new()
+                .fg(resolve_color(use_color, Color::Green))
+                .add_modifier(Modifier::DIM),
+        ));
     }
+    spans.push(Span::raw(" "));
+    spans
 }
 
 // ── COMPACT tier: borderless, three lines per account, grouped by a left accent spine ────────────
@@ -1522,11 +1570,33 @@ mod tests {
     // ── spec 017 §D (acceptance 5): tier rendering of the ledger clause ────────────────────────
 
     fn sub_view_all_forms() -> SubView {
+        let full = "· period 2026-07-14 → · renews in 27d (2026-08-14)".to_string();
         SubView {
-            full: Some("· period 2026-07-14 → · renews in 27d (2026-08-14)".to_string()),
+            full_no_pill_date: Some(full.clone()),
+            full: Some(full),
             full_no_start: Some("· renews in 27d (2026-08-14)".to_string()),
             full_no_date: Some("· renews in 27d".to_string()),
             compact: Some("· renews 27d".to_string()),
+            pill_full: None,
+            pill_bare: None,
+        }
+    }
+
+    /// [`sub_view_all_forms`] with a verified-current pill (spec 018 §C) — for the pill-specific
+    /// FULL-tier degrade-order and COMPACT-ladder tests.
+    fn sub_view_all_forms_with_pill() -> SubView {
+        SubView {
+            full: Some(
+                "· period 2026-07-14 → · renews in 27d (2026-08-14) ✓ 2026-07-18".to_string(),
+            ),
+            full_no_pill_date: Some(
+                "· period 2026-07-14 → · renews in 27d (2026-08-14) ✓".to_string(),
+            ),
+            full_no_start: Some("· renews in 27d (2026-08-14) ✓".to_string()),
+            full_no_date: Some("· renews in 27d ✓".to_string()),
+            compact: Some("· renews 27d ✓".to_string()),
+            pill_full: Some(" ✓ 2026-07-18".to_string()),
+            pill_bare: Some(" ✓".to_string()),
         }
     }
 
@@ -1543,30 +1613,39 @@ mod tests {
     fn sub_view_cancelled_ends() -> SubView {
         let clause = "· cancelled · ends in 4d (2026-07-22)".to_string();
         SubView {
+            full_no_pill_date: Some(clause.clone()),
             full: Some(clause.clone()),
             full_no_start: Some(clause),
             full_no_date: Some("· cancelled · ends in 4d".to_string()),
             compact: Some("· ends 4d".to_string()),
+            pill_full: None,
+            pill_bare: None,
         }
     }
 
     fn sub_view_ended() -> SubView {
         let clause = "· cancelled · ended 2026-07-22".to_string();
         SubView {
+            full_no_pill_date: Some(clause.clone()),
             full: Some(clause.clone()),
             full_no_start: Some(clause.clone()),
             full_no_date: Some(clause),
             compact: Some("· ended".to_string()),
+            pill_full: None,
+            pill_bare: None,
         }
     }
 
     fn sub_view_unknown() -> SubView {
         let bare = "· cancelled".to_string();
         SubView {
+            full_no_pill_date: Some(bare.clone()),
             full: Some(bare.clone()),
             full_no_start: Some(bare.clone()),
             full_no_date: Some(bare.clone()),
             compact: Some(bare),
+            pill_full: None,
+            pill_bare: None,
         }
     }
 
@@ -1674,6 +1753,85 @@ mod tests {
         );
     }
 
+    // ── spec 018 §C (acceptance 3): FULL-tier pill rendering + degrade order ──────────────────
+
+    #[test]
+    fn full_title_spans_pill_full_form_and_styling_when_roomy() {
+        let sub = sub_view_all_forms_with_pill();
+        let spans = full_title_spans("Personal [claude]", "", &sub, 200, true);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            " Personal [claude] · period 2026-07-14 → · renews in 27d (2026-08-14) ✓ 2026-07-18 ",
+            "roomy width shows the whole pill with its date: {text:?}"
+        );
+        let pill_span = spans
+            .iter()
+            .find(|s| s.content.contains('✓'))
+            .expect("a pill span must exist");
+        assert_eq!(pill_span.style.fg, Some(Color::Green), "pill must be green");
+        assert!(
+            pill_span.style.add_modifier.contains(Modifier::DIM),
+            "pill must be dim"
+        );
+    }
+
+    #[test]
+    fn full_title_spans_degrade_order_pill_date_then_start_then_absolute_date_then_whole_clause() {
+        let sub = sub_view_all_forms_with_pill();
+        let text = |avail| -> String {
+            full_title_spans("Personal [claude]", "", &sub, avail, true)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        // Roomy: full pill with its own date.
+        assert!(text(200).ends_with("✓ 2026-07-18 "), "{}", text(200));
+
+        // Step 1: too narrow for the pill's date, bare ✓ survives with the start segment intact.
+        let step1 = text(75);
+        assert!(
+            step1.contains("period 2026-07-14") && step1.trim_end().ends_with('✓'),
+            "step1: {step1:?}"
+        );
+
+        // Step 2: start segment also dropped, bare ✓ still present.
+        let step2 = text(55);
+        assert!(
+            !step2.contains("period 2026-07-14")
+                && step2.contains("renews in 27d (2026-08-14)")
+                && step2.trim_end().ends_with('✓'),
+            "step2: {step2:?}"
+        );
+
+        // Step 3: absolute date also dropped, bare ✓ still present.
+        let step3 = text(40);
+        assert!(
+            !step3.contains("2026-08-14") && step3.trim_end().ends_with('✓'),
+            "step3: {step3:?}"
+        );
+
+        // Step 4: too narrow for even the bare clause ⇒ whole clause (pill included) drops.
+        let step4 = text(30);
+        assert!(!step4.contains('✓'), "step4: {step4:?}");
+    }
+
+    #[test]
+    fn full_title_spans_no_pill_renders_no_check_mark_or_pill_styling() {
+        let sub = sub_view_all_forms(); // no verified pill
+        let spans = full_title_spans("Personal [claude]", "", &sub, 200, true);
+        assert!(
+            !spans.iter().any(|s| s.content.contains('✓')),
+            "no pill applies ⇒ no ✓ anywhere: {spans:?}"
+        );
+        assert!(
+            !spans.iter().any(|s| {
+                s.style.fg == Some(Color::Green) || s.style.add_modifier.contains(Modifier::DIM)
+            }),
+            "no pill applies ⇒ no span carries pill styling: {spans:?}"
+        );
+    }
+
     /// Flatten a `Line`'s spans into plain text, for asserting on `compact_header_line`/`micro_line`
     /// output directly (pure, no tier-selection geometry involved — those are covered by `choose_tier`
     /// and the full-render tests elsewhere).
@@ -1728,6 +1886,55 @@ mod tests {
         assert!(
             !text.contains("2026-"),
             "MICRO must never show a ledger date (stated decision, spec 017 §D): {text:?}"
+        );
+    }
+
+    // ── spec 018 §C (acceptance 4): COMPACT trailing ✓, MICRO never shows ✓ ───────────────────
+
+    #[test]
+    fn compact_header_shows_trailing_pill_when_verified_current() {
+        let row = row_with_sub("Personal [claude]", sub_view_all_forms_with_pill());
+        let text = line_text(&compact_header_line(
+            &row,
+            false,
+            "▏",
+            Color::Cyan,
+            80,
+            Color::DarkGray,
+        ));
+        assert!(
+            text.contains("renews 27d ✓"),
+            "the compact clause carries the trailing ✓ inside the ladder: {text:?}"
+        );
+    }
+
+    #[test]
+    fn compact_header_drops_pill_together_with_clause_when_narrow() {
+        // The two-step ladder drops clause+pill together — never a bare ✓ with no clause.
+        let row = row_with_sub("Personal [claude]", sub_view_all_forms_with_pill());
+        let text = line_text(&compact_header_line(
+            &row,
+            false,
+            "▏",
+            Color::Cyan,
+            30,
+            Color::DarkGray,
+        ));
+        assert!(
+            !text.contains('✓'),
+            "too narrow for the clause ⇒ the pill goes with it: {text:?}"
+        );
+        assert!(text.chars().count() <= 30, "must never overflow: {text:?}");
+    }
+
+    #[test]
+    fn micro_line_never_shows_the_pill_under_any_state() {
+        let app = App::new(1, true);
+        let row = row_with_sub("Personal [claude]", sub_view_all_forms_with_pill());
+        let text = line_text(&micro_line(&app, &row, 80, false, 0));
+        assert!(
+            !text.contains('✓'),
+            "MICRO must never show a pill under any state (spec 018 §C): {text:?}"
         );
     }
 

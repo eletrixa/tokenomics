@@ -24,7 +24,7 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 015 | [config-hot-reload](015-config-hot-reload.md) | collector + TUI hot-reload config on change; doctor flags config/binary divergence; age-aware overlay hint | Done |
 | 016 | [init-subcommand](016-init-subcommand.md) | `tok init` writes a starter `tokenomics.toml` (never clobbers); embedded from `tokenomics.example.toml`; missing-config commands hint at `tok init` | Done |
 | 017 | [subscription-dates](017-subscription-dates.md) | ledger plane (third data plane): subscription start / renewal / end dates on the header line; doctor section; PII gate in check.sh | Done |
-| 018 | [verified-pill](018-verified-pill.md) | `✓ <date>` pill on the clause when the ledger row was agent-verified against the provider billing UI within the current period | Active |
+| 018 | [verified-pill](018-verified-pill.md) | `✓ <date>` pill on the clause when the ledger row was agent-verified against the provider billing UI within the current period | Done |
 
 Scope now: **Claude** (6 accounts) + **Codex** (1 account, spec 013). Gemini / Grok remain future
 adapters implementing the same `ProviderAdapter` trait.

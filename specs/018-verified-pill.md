@@ -1,6 +1,6 @@
 # Spec 018 — Verified pill on the subscription clause
 
-Status: **Active**
+Status: **Done**
 
 Follow-up to spec 017 (Robert, 2026-07-18): the ledger now carries `verified = <date>` — the date
 an agent last confirmed the row against the provider's billing web UI (Tier-0 read-only run,
@@ -20,10 +20,12 @@ web-verified date must look different on the board.
 
 The pill renders only when the verification still says something about the **current period**:
 
-- `purchased` present: verified-current ⇔ `verified >= purchased` (a verification older than the
-  current period start proves nothing about this period's renewal).
-- `purchased` absent: verified-current ⇔ `today − verified <= 31` days (best-effort recency
-  window; stated constant).
+- `purchased` present: verified-current ⇔ `verified <= today && verified >= purchased` (a
+  verification older than the current period start proves nothing about this period's renewal; a
+  future-dated `verified` — a typo'd ledger date — proves nothing either and must not render a
+  confident pill).
+- `purchased` absent: verified-current ⇔ `verified <= today && today − verified <= 31` days
+  (best-effort recency window; stated constant).
 - The active-with-past-`renews` stale state **suppresses the pill** — a stale-marked clause never
   shows `✓` (contradiction otherwise). The derived "ended" state shows no pill either.
 - Verified-but-not-current renders nothing (no "stale verified" marker; doctor owns that detail).

@@ -6,18 +6,22 @@
 //! Deps:    jiff (civil::Date), toml + serde (parsing, both already deps)
 //! Tested:  inline `#[cfg(test)]` below — parse() row/file degradation (spec 017 §A acceptance 1),
 //!          path resolution (§B acceptance 2), hot reload via the injectable `LedgerSource` seam
-//!          (§B acceptance 6), exact-match join (§C acceptance 3)
+//!          (§B acceptance 6), exact-match join (§C acceptance 3); `verified` field parsing +
+//!          `verified_current` math (spec 018 §A/§B acceptance 1/2)
 //!
 //! Key responsibilities:
-//! - `Subscription`: one ledger row — `id`, `status` (two-variant), and four optional local dates.
-//!   The ledger's `account` field (a raw email) is never given a place to land: it simply isn't a
-//!   field on this struct, so it cannot be deserialized, logged, or rendered.
+//! - `Subscription`: one ledger row — `id`, `status` (two-variant), five optional local dates
+//!   (including `verified`, spec 018). The ledger's `account` field (a raw email) is never given a
+//!   place to land: it simply isn't a field on this struct, so it cannot be deserialized, logged, or
+//!   rendered.
 //! - `parse`: pure `&str` → `ParseOutcome`. Per-row degradation (one malformed row drops that row
 //!   only, reported via `ParseOutcome::errors`); `Err` only for a WHOLLY unparseable file.
 //! - `Ledger`: the stateful, keep-last-good loader (mirrors `collector::ConfigSource`'s discipline)
 //!   behind the injectable `LedgerSource` trait, so hot reload never touches the filesystem in tests.
 //! - `resolve_path`: `TOKENOMICS_LEDGER` env > `[settings] ledger_path` > off (§B). Pure.
 //! - `find`: exact-string-match join on `Account.id` ↔ `Subscription.id` (§C). No fuzzy matching.
+//! - `verified_current`: pure `Subscription` + `today` → is `verified` still current-period-current
+//!   (spec 018 §B); shared by the TUI's pill math and `tok doctor`'s per-row annotation.
 //!
 //! Design constraints:
 //! - Read-through only: never persisted to SQLite, never fetched over the network. TUI-only — the
@@ -77,6 +81,9 @@ pub struct Subscription {
     pub cancelled_on: Option<Date>,
     /// Access lapses after this date — only meaningful when `status` is `Cancelled`.
     pub paid_through: Option<Date>,
+    /// The date an agent last confirmed this row against the provider's billing web UI
+    /// (Tier-0 read-only run). `None` = a human-typed row, never an error (spec 018 §A).
+    pub verified: Option<Date>,
 }
 
 /// One row that failed to parse, kept ONLY for `tok doctor` — never for rendering (spec 017 §A/§E).
@@ -135,6 +142,7 @@ struct RawSub {
     renews: Option<toml::value::Datetime>,
     cancelled_on: Option<toml::value::Datetime>,
     paid_through: Option<toml::value::Datetime>,
+    verified: Option<toml::value::Datetime>,
 }
 
 /// Convert one optional TOML datetime field to `jiff::civil::Date`. `Ok(None)` when the field was
@@ -222,6 +230,13 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
                 continue;
             }
         };
+        let verified = match degrade("verified", row.verified) {
+            Ok(d) => d,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
         rows.push(Subscription {
             id,
             status,
@@ -229,6 +244,7 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
             renews,
             cancelled_on,
             paid_through,
+            verified,
         });
     }
     Ok(ParseOutcome { rows, errors })
@@ -249,6 +265,32 @@ pub fn resolve_path(env_override: Option<&str>, settings_path: Option<&str>) -> 
         }
     }
     None
+}
+
+/// Best-effort recency window (spec 018 §B) for a `verified` date when the row carries no
+/// `purchased` to compare against: `today − verified <= 31` days.
+const VERIFIED_RECENCY_DAYS: i32 = 31;
+
+/// Whether `sub.verified` still says something about the CURRENT billing period (spec 018 §B): with
+/// `purchased` present, verified-current ⇔ `verified >= purchased` (older proves nothing about this
+/// period's renewal); without it, a 31-day best-effort recency window against `today`. `false` when
+/// `verified` is absent (a human-entered row), or when `verified` is in the future (a typo'd ledger
+/// date proves nothing — never render a confident pill from data that can't yet be true). Pure,
+/// `today` injected — shared by the pill math in `tui::model::SubView` and `tok doctor`'s per-row
+/// annotation, so both stay in lockstep.
+pub fn verified_current(sub: &Subscription, today: Date) -> bool {
+    let Some(verified) = sub.verified else {
+        return false;
+    };
+    if verified > today {
+        return false;
+    }
+    match sub.purchased {
+        Some(purchased) => verified >= purchased,
+        None => today
+            .since(verified)
+            .is_ok_and(|span| span.get_days() <= VERIFIED_RECENCY_DAYS),
+    }
 }
 
 /// Join `account_id` against the ledger rows by EXACT string match only — no fuzzy, prefix, or
@@ -485,6 +527,7 @@ first_purchased = 2025-01-01
             renews: None,
             cancelled_on: None,
             paid_through: None,
+            verified: None,
         };
         let Subscription {
             id,
@@ -493,8 +536,17 @@ first_purchased = 2025-01-01
             renews,
             cancelled_on,
             paid_through,
+            verified,
         } = sub;
-        let _ = (id, status, purchased, renews, cancelled_on, paid_through);
+        let _ = (
+            id,
+            status,
+            purchased,
+            renews,
+            cancelled_on,
+            paid_through,
+            verified,
+        );
     }
 
     #[test]
@@ -753,6 +805,7 @@ status = \"cancelled\"
             renews: None,
             cancelled_on: None,
             paid_through: None,
+            verified: None,
         }
     }
 
@@ -775,5 +828,148 @@ status = \"cancelled\"
     fn find_is_case_sensitive() {
         let rows = vec![sub("claude-Alpha")];
         assert_eq!(find(&rows, "claude-alpha"), None);
+    }
+
+    // ── spec 018 §A (acceptance 1): parser reads `verified` ────────────────────────────────────
+
+    #[test]
+    fn verified_absent_is_none() {
+        let toml = "\
+[[subscription]]
+id = \"claude-alpha\"
+status = \"active\"
+";
+        let outcome = parse(toml).expect("well-formed ledger");
+        assert_eq!(outcome.rows[0].verified, None);
+    }
+
+    #[test]
+    fn verified_present_parses_to_date() {
+        let toml = "\
+[[subscription]]
+id = \"claude-alpha\"
+status = \"active\"
+purchased = 2026-07-01
+verified = 2026-07-18
+";
+        let outcome = parse(toml).expect("well-formed ledger");
+        assert_eq!(
+            outcome.rows[0].verified,
+            Some(jiff::civil::date(2026, 7, 18))
+        );
+    }
+
+    #[test]
+    fn invalid_verified_degrades_only_that_row() {
+        let toml = "\
+[[subscription]]
+id = \"claude-alpha\"
+status = \"active\"
+verified = 12:00:00
+
+[[subscription]]
+id = \"claude-bravo\"
+status = \"active\"
+";
+        let outcome = parse(toml).expect("the file itself is well-formed TOML");
+        assert_eq!(
+            outcome
+                .rows
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude-bravo"],
+            "only the row with the bad `verified` date drops"
+        );
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.errors[0].id.as_deref(), Some("claude-alpha"));
+        assert!(
+            outcome.errors[0].reason.contains("verified"),
+            "reason should name the bad field: {:?}",
+            outcome.errors[0]
+        );
+    }
+
+    // ── spec 018 §B (acceptance 2): verified-current math ──────────────────────────────────────
+
+    fn sub_with(purchased: Option<Date>, verified: Option<Date>) -> Subscription {
+        Subscription {
+            id: "claude-alpha".to_string(),
+            status: SubStatus::Active,
+            purchased,
+            renews: None,
+            cancelled_on: None,
+            paid_through: None,
+            verified,
+        }
+    }
+
+    #[test]
+    fn verified_current_true_when_verified_on_or_after_purchased() {
+        let purchased = jiff::civil::date(2026, 7, 1);
+        let today = jiff::civil::date(2026, 7, 20);
+        assert!(
+            verified_current(&sub_with(Some(purchased), Some(purchased)), today),
+            "verified == purchased must count as current"
+        );
+        assert!(verified_current(
+            &sub_with(Some(purchased), Some(jiff::civil::date(2026, 7, 15))),
+            today
+        ));
+    }
+
+    #[test]
+    fn verified_current_false_when_verified_before_purchased() {
+        let purchased = jiff::civil::date(2026, 7, 1);
+        let today = jiff::civil::date(2026, 7, 20);
+        assert!(!verified_current(
+            &sub_with(Some(purchased), Some(jiff::civil::date(2026, 6, 30))),
+            today
+        ));
+    }
+
+    #[test]
+    fn verified_current_purchased_absent_uses_31_day_window() {
+        let today = jiff::civil::date(2026, 7, 31);
+        // exactly 31 days ago ⇒ still in the window
+        assert!(verified_current(
+            &sub_with(None, Some(jiff::civil::date(2026, 6, 30))),
+            today
+        ));
+        // 32 days ago ⇒ out of the window
+        assert!(!verified_current(
+            &sub_with(None, Some(jiff::civil::date(2026, 6, 29))),
+            today
+        ));
+    }
+
+    #[test]
+    fn verified_current_false_when_verified_absent() {
+        let today = jiff::civil::date(2026, 7, 20);
+        assert!(!verified_current(
+            &sub_with(Some(jiff::civil::date(2026, 7, 1)), None),
+            today
+        ));
+        assert!(!verified_current(&sub_with(None, None), today));
+    }
+
+    #[test]
+    fn verified_current_false_when_verified_is_in_the_future() {
+        // A typo'd ledger date (e.g. `verified = 2027-07-18`) must never render a confident pill —
+        // `verified >= purchased` and the 31-day window are both trivially/vacuously satisfied by a
+        // future date, so this needs its own explicit guard (not just coverage by the other cases).
+        let today = jiff::civil::date(2026, 7, 20);
+        let purchased = jiff::civil::date(2026, 7, 1);
+        assert!(
+            !verified_current(
+                &sub_with(Some(purchased), Some(jiff::civil::date(2027, 7, 18))),
+                today
+            ),
+            "future-dated verified with purchased present must not read as current"
+        );
+        assert!(
+            !verified_current(&sub_with(None, Some(jiff::civil::date(2027, 7, 18))), today),
+            "future-dated verified with purchased absent must not read as current"
+        );
     }
 }

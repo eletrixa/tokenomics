@@ -28,6 +28,17 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   reads it (dates are a render concern). `tok accounts` / `tok once --json` are byte-identical this
   wave (golden-snapshot enforced). `check.sh` gained a PII gate (`.pii-allowlist`) so no real email
   ever lands in a committed fixture.
+- **A verified pill on the subscription clause (spec 018).** The ledger now carries `verified =
+  <date>` — the date an agent last confirmed a row against the provider's billing web UI. A
+  verified-current row (`verified >= purchased`, or within 31 days when `purchased` is absent) gets
+  a dim-green ` ✓ 2026-07-18` appended to its FULL-tier clause and a trailing ` ✓` on its COMPACT
+  clause, so a human-typed renewal date and a web-verified one read differently on the board. The
+  pill never appears on a stale-`renews` or derived-`ended` clause (a contradiction otherwise), and
+  never in MICRO. FULL degrades in one more step than before: pill's own date drops first (bare `✓`
+  stays) → start segment → absolute date → whole clause, still never truncating a date mid-string.
+  `tok doctor` annotates every ledger row matched to a config account: `verified <date> (current)`,
+  `verified <date> (outdated — before current period)`, or `human-entered (no verified)`. `tok
+  accounts` / `tok once --json` stay byte-identical (golden-snapshot enforced).
 - **`tok init` writes a starter config (spec 016).** On a fresh machine every command used to fail
   with a bare `cannot read config …` and no next step. `tok init` now writes a commented starter
   `tokenomics.toml` (one Claude account, a commented Codex account, thresholds, and the overlay

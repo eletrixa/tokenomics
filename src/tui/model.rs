@@ -6,7 +6,8 @@
 //! Tested:  inline `#[cfg(test)]` — update/selection, severity→color, NO_COLOR, view-row build,
 //!          show-inactive toggle + tagged/dimmed inactive rows (spec 014), age-aware overlay hint
 //!          (spec 015 §C); `build_sub_view` clause math + `Account.active`/ledger-status
-//!          independence + `ledger_fleet_note` tokens (spec 017 §D acceptance 4/5/7)
+//!          independence + `ledger_fleet_note` tokens (spec 017 §D acceptance 4/5/7); the verified
+//!          pill's suppression + degrade-form math (spec 018 §B/§C acceptance 2)
 //!
 //! Key responsibilities:
 //! - `App`: selection, help/quit/show-inactive flags, colour policy, and the precomputed
@@ -15,7 +16,9 @@
 //! - `build_account_view`: pure store-data → display-ready row (so `view` only lays out); it now
 //!   also does the exact-id ledger join (`ledger::find`) and calls `build_sub_view`, independent of
 //!   `Account.active` (spec 017 §C/§D).
-//! - `build_sub_view`: pure ledger-row + `today` → `SubView` (spec 017 §D clause text).
+//! - `build_sub_view`: pure ledger-row + `today` → `SubView` (spec 017 §D clause text), now also
+//!   folding in the verified-pill suffixes (`pill_suffixes`, spec 018 §B/§C) — suppressed on the
+//!   stale-`renews` and derived-`ended` states.
 //!
 //! Design constraints:
 //! - Everything the view needs is precomputed here; colour is a pure function of state.
@@ -29,7 +32,9 @@ use crate::format::{
     format_ago, format_ago_ms, format_cost, format_dollars, format_pct, format_reset,
     format_tokens, provenance_label, provenance_short, reset_expired, severity_label, RESET_DONE,
 };
-use crate::ledger::{find as ledger_find, LedgerProvenance, SubStatus, Subscription};
+use crate::ledger::{
+    find as ledger_find, verified_current, LedgerProvenance, SubStatus, Subscription,
+};
 use crate::store::TokenStatus;
 use crate::tui::keys::Action;
 
@@ -122,15 +127,27 @@ pub struct Badge {
 /// or an active row with no dates) — the header then renders byte-identical to the pre-spec-017 form.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubView {
-    /// FULL tier, roomiest form (start segment + absolute date), e.g.
-    /// `"· period 2026-07-14 → · renews in 27d (2026-08-14)"`.
+    /// FULL tier, roomiest form (start segment + absolute date [+ the ` ✓ <date>` pill when
+    /// verified-current, spec 018 §C]), e.g.
+    /// `"· period 2026-07-14 → · renews in 27d (2026-08-14) ✓ 2026-07-18"`.
     pub full: Option<String>,
-    /// FULL tier, degrade step 1: the start segment dropped.
+    /// FULL tier, degrade step 1: the pill's own date dropped (a bare ` ✓` stays, spec 018 §C) —
+    /// everything else identical to `full`. Equal to `full` when no pill applies.
+    pub full_no_pill_date: Option<String>,
+    /// FULL tier, degrade step 2: the start segment also dropped.
     pub full_no_start: Option<String>,
-    /// FULL tier, degrade step 2: the absolute `(…)` date also dropped.
+    /// FULL tier, degrade step 3: the absolute `(…)` date also dropped.
     pub full_no_date: Option<String>,
-    /// COMPACT tier's short dim clause, e.g. `"· renews 27d"` / `"· ends 4d"` / `"· cancelled"`.
+    /// COMPACT tier's short dim clause, e.g. `"· renews 27d"` / `"· ends 4d"` / `"· cancelled"` —
+    /// already carries a trailing `" ✓"` when verified-current (spec 018 §C), so the clause and its
+    /// pill render or drop together in the two-step ladder.
     pub compact: Option<String>,
+    /// The roomiest pill suffix (` ✓ <date>`), present only in `full`. `view.rs` uses this (and
+    /// [`Self::pill_bare`]) to style the pill distinctly from the rest of the FULL-tier title.
+    pub pill_full: Option<String>,
+    /// The bare pill suffix (` ✓`, no date), present in `full_no_pill_date`/`full_no_start`/
+    /// `full_no_date` when verified-current.
+    pub pill_bare: Option<String>,
 }
 
 /// Whole calendar days from `from` to `to` (positive when `to` is in the future) — pure date math,
@@ -160,9 +177,29 @@ fn day_phrase_compact(days: i32) -> String {
     }
 }
 
-/// Build the `active` states' clause (spec 017 §D table, rows 1–2): a future/`today` `renews` gets
-/// the full "period → renews" form; a past `renews` gets the never-negative stale marker; no
-/// `renews` at all carries no information to render.
+/// Append `suffix` (when present) to `base`, else return `base` unchanged. Used to fold the
+/// verified-pill suffix (spec 018 §C) onto an already-built clause string.
+fn append_opt(base: &str, suffix: Option<&str>) -> String {
+    suffix.map_or_else(|| base.to_string(), |s| format!("{base}{s}"))
+}
+
+/// The verified pill's two suffix forms (spec 018 §C) for a pill-eligible clause: `(" ✓ <date>",
+/// " ✓")` when `sub` is verified-current, else `(None, None)` — the caller never applies these to a
+/// suppressed state (stale-`renews` / ended, spec 018 §B) by simply not calling this there.
+fn pill_suffixes(sub: &Subscription, today: jiff::civil::Date) -> (Option<String>, Option<String>) {
+    if !verified_current(sub, today) {
+        return (None, None);
+    }
+    let Some(verified) = sub.verified else {
+        return (None, None);
+    };
+    (Some(format!(" ✓ {verified}")), Some(" ✓".to_string()))
+}
+
+/// Build the `active` states' clause (spec 017 §D table, rows 1–2; spec 018 §B/§C pill): a
+/// future/`today` `renews` gets the full "period → renews" form, plus the verified pill when
+/// verified-current; a past `renews` gets the never-negative stale marker AND suppresses the pill
+/// (a stale-marked clause never shows `✓`, spec 018 §B); no `renews` at all carries no information.
 fn build_active_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubView {
     let Some(renews) = sub.renews else {
         return SubView::default();
@@ -171,40 +208,56 @@ fn build_active_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubVie
     let date = renews.to_string();
     if days < 0 {
         // The renewal date is in the past and no new one has landed — the ledger is stale, not the
-        // subscription negative. Never a negative countdown (acceptance 4).
+        // subscription negative. Never a negative countdown (acceptance 4), never a pill.
         let full = format!("· renews {date} (past — ledger stale?)");
         return SubView {
             full: Some(full.clone()),
+            full_no_pill_date: Some(full.clone()),
             full_no_start: Some(full.clone()),
             full_no_date: Some(full),
             compact: Some("· renews ?".to_string()),
+            pill_full: None,
+            pill_bare: None,
         };
     }
+    let (pill_full, pill_bare) = pill_suffixes(sub, today);
     let renews_clause = format!("· renews {} ({date})", day_phrase_full(days));
-    let full = sub.purchased.map_or_else(
+    let renews_clause_no_date = format!("· renews {}", day_phrase_full(days));
+    let base_full = sub.purchased.map_or_else(
         || renews_clause.clone(),
         |purchased| format!("· period {purchased} → {renews_clause}"),
     );
+    let compact_base = format!("· renews {}", day_phrase_compact(days));
     SubView {
-        full: Some(full),
-        full_no_start: Some(renews_clause),
-        full_no_date: Some(format!("· renews {}", day_phrase_full(days))),
-        compact: Some(format!("· renews {}", day_phrase_compact(days))),
+        full: Some(append_opt(&base_full, pill_full.as_deref())),
+        full_no_pill_date: Some(append_opt(&base_full, pill_bare.as_deref())),
+        full_no_start: Some(append_opt(&renews_clause, pill_bare.as_deref())),
+        full_no_date: Some(append_opt(&renews_clause_no_date, pill_bare.as_deref())),
+        compact: Some(append_opt(&compact_base, pill_bare.as_deref())),
+        pill_full,
+        pill_bare,
     }
 }
 
-/// Build the `cancelled` states' clause (spec 017 §D table, rows 3–5): a future/`today`
-/// `paid_through` reads "ends", verb-swapped but visually parallel to `renews`; a past one reads
-/// "ended" (dimmed by the caller, not by text); an unknown one is the bare `"· cancelled"` label —
-/// the status alone is information, never a placeholder.
+/// Build the `cancelled` states' clause (spec 017 §D table, rows 3–5; spec 018 §B/§C pill): a
+/// future/`today` `paid_through` reads "ends", verb-swapped but visually parallel to `renews`, plus
+/// the verified pill when verified-current; a past one reads "ended" (dimmed by the caller, never a
+/// pill — the derived "ended" state suppresses it, spec 018 §B); an unknown one is the bare
+/// `"· cancelled"` label — still pill-eligible, since the status alone is information.
 fn build_cancelled_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubView {
     let Some(paid_through) = sub.paid_through else {
+        let (pill_full, pill_bare) = pill_suffixes(sub, today);
         let bare = "· cancelled".to_string();
+        let full = append_opt(&bare, pill_full.as_deref());
+        let narrow = append_opt(&bare, pill_bare.as_deref());
         return SubView {
-            full: Some(bare.clone()),
-            full_no_start: Some(bare.clone()),
-            full_no_date: Some(bare.clone()),
-            compact: Some(bare),
+            full: Some(full),
+            full_no_pill_date: Some(narrow.clone()),
+            full_no_start: Some(narrow.clone()),
+            full_no_date: Some(narrow.clone()),
+            compact: Some(narrow),
+            pill_full,
+            pill_bare,
         };
     };
     let days = days_between(today, paid_through);
@@ -213,17 +266,27 @@ fn build_cancelled_sub_view(sub: &Subscription, today: jiff::civil::Date) -> Sub
         let full = format!("· cancelled · ended {date}");
         return SubView {
             full: Some(full.clone()),
+            full_no_pill_date: Some(full.clone()),
             full_no_start: Some(full.clone()),
             full_no_date: Some(full),
             compact: Some("· ended".to_string()),
+            pill_full: None,
+            pill_bare: None,
         };
     }
-    let full = format!("· cancelled · ends {} ({date})", day_phrase_full(days));
+    let (pill_full, pill_bare) = pill_suffixes(sub, today);
+    let base = format!("· cancelled · ends {} ({date})", day_phrase_full(days));
+    let base_no_date = format!("· cancelled · ends {}", day_phrase_full(days));
+    let narrow = append_opt(&base, pill_bare.as_deref());
+    let compact_base = format!("· ends {}", day_phrase_compact(days));
     SubView {
-        full: Some(full.clone()),
-        full_no_start: Some(full),
-        full_no_date: Some(format!("· cancelled · ends {}", day_phrase_full(days))),
-        compact: Some(format!("· ends {}", day_phrase_compact(days))),
+        full: Some(append_opt(&base, pill_full.as_deref())),
+        full_no_pill_date: Some(narrow.clone()),
+        full_no_start: Some(narrow),
+        full_no_date: Some(append_opt(&base_no_date, pill_bare.as_deref())),
+        compact: Some(append_opt(&compact_base, pill_bare.as_deref())),
+        pill_full,
+        pill_bare,
     }
 }
 
@@ -1673,6 +1736,7 @@ mod tests {
             renews: None,
             cancelled_on: None,
             paid_through: None,
+            verified: None,
         }
     }
 
@@ -1801,6 +1865,140 @@ mod tests {
             "the status alone is information, never hidden — but never a placeholder either"
         );
         assert_eq!(view.compact.as_deref(), Some("· cancelled"));
+    }
+
+    // ── spec 018 §B/§C (acceptance 2): the verified pill ────────────────────────────────────────
+
+    #[test]
+    fn active_future_renews_verified_current_shows_the_pill() {
+        let today = jiff::civil::date(2026, 7, 18);
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.purchased = Some(jiff::civil::date(2026, 7, 14));
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        sub.verified = Some(jiff::civil::date(2026, 7, 18)); // >= purchased ⇒ current
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· period 2026-07-14 → · renews in 27d (2026-08-14) ✓ 2026-07-18")
+        );
+        assert_eq!(
+            view.full_no_pill_date.as_deref(),
+            Some("· period 2026-07-14 → · renews in 27d (2026-08-14) ✓"),
+            "degrade step 1: the pill's own date drops, bare ✓ stays"
+        );
+        assert_eq!(
+            view.full_no_start.as_deref(),
+            Some("· renews in 27d (2026-08-14) ✓"),
+            "degrade step 2: start segment also dropped, bare ✓ stays"
+        );
+        assert_eq!(
+            view.full_no_date.as_deref(),
+            Some("· renews in 27d ✓"),
+            "degrade step 3: absolute date also dropped, bare ✓ still stays"
+        );
+        assert_eq!(view.compact.as_deref(), Some("· renews 27d ✓"));
+    }
+
+    #[test]
+    fn verified_older_than_purchased_shows_no_pill() {
+        let today = jiff::civil::date(2026, 7, 18);
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.purchased = Some(jiff::civil::date(2026, 7, 14));
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        sub.verified = Some(jiff::civil::date(2026, 6, 1)); // predates this period's start
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· period 2026-07-14 → · renews in 27d (2026-08-14)"),
+            "a verification older than the current period proves nothing about it"
+        );
+        assert_eq!(view.compact.as_deref(), Some("· renews 27d"));
+    }
+
+    #[test]
+    fn purchased_absent_uses_the_31_day_recency_window() {
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        sub.verified = Some(jiff::civil::date(2026, 6, 30));
+
+        let today_in_window = jiff::civil::date(2026, 7, 31); // 31 days after verified
+        let view = build_sub_view(Some(&sub), today_in_window);
+        assert!(
+            view.full.as_deref().unwrap_or_default().contains('✓'),
+            "31 days ago is still within the recency window: {:?}",
+            view.full
+        );
+
+        let today_outside_window = jiff::civil::date(2026, 8, 1); // 32 days after verified
+        let view = build_sub_view(Some(&sub), today_outside_window);
+        assert!(
+            !view.full.as_deref().unwrap_or_default().contains('✓'),
+            "32 days ago is outside the recency window: {:?}",
+            view.full
+        );
+    }
+
+    #[test]
+    fn stale_renews_suppresses_the_pill_even_when_verified_current() {
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.purchased = Some(jiff::civil::date(2026, 7, 14));
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        sub.verified = Some(jiff::civil::date(2026, 8, 20)); // >= purchased ⇒ would be current
+        let today = jiff::civil::date(2026, 8, 21); // AFTER renews ⇒ stale-marked clause
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· renews 2026-08-14 (past — ledger stale?)"),
+            "a stale-marked clause never shows ✓, even when verified-current"
+        );
+        assert!(!view.full.as_deref().unwrap_or_default().contains('✓'));
+        assert_eq!(view.compact.as_deref(), Some("· renews ?"));
+    }
+
+    #[test]
+    fn ended_state_suppresses_the_pill_even_when_verified_current() {
+        let mut sub = ledger_sub(SubStatus::Cancelled);
+        sub.paid_through = Some(jiff::civil::date(2026, 7, 22));
+        sub.verified = Some(jiff::civil::date(2026, 7, 25)); // after paid_through, still "current"
+        let today = jiff::civil::date(2026, 7, 30); // after paid_through ⇒ ended
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(view.full.as_deref(), Some("· cancelled · ended 2026-07-22"));
+        assert!(!view.full.as_deref().unwrap_or_default().contains('✓'));
+        assert_eq!(view.compact.as_deref(), Some("· ended"));
+    }
+
+    #[test]
+    fn cancelled_future_paid_through_verified_current_shows_the_pill() {
+        let mut sub = ledger_sub(SubStatus::Cancelled);
+        sub.paid_through = Some(jiff::civil::date(2026, 7, 22));
+        sub.verified = Some(jiff::civil::date(2026, 7, 18));
+        let today = jiff::civil::date(2026, 7, 18);
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· cancelled · ends in 4d (2026-07-22) ✓ 2026-07-18")
+        );
+        assert_eq!(view.compact.as_deref(), Some("· ends 4d ✓"));
+    }
+
+    #[test]
+    fn bare_cancelled_verified_current_shows_the_pill() {
+        let mut sub = ledger_sub(SubStatus::Cancelled);
+        sub.verified = Some(jiff::civil::date(2026, 7, 1));
+        let today = jiff::civil::date(2026, 7, 18); // within the 31-day window, no `purchased`
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(view.full.as_deref(), Some("· cancelled ✓ 2026-07-01"));
+        assert_eq!(view.compact.as_deref(), Some("· cancelled ✓"));
+    }
+
+    #[test]
+    fn no_verified_field_shows_no_pill_anywhere() {
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let today = jiff::civil::date(2026, 7, 18);
+        let view = build_sub_view(Some(&sub), today);
+        assert!(!view.full.as_deref().unwrap_or_default().contains('✓'));
+        assert!(!view.compact.as_deref().unwrap_or_default().contains('✓'));
     }
 
     // ── spec 017 §C/§D (acceptance 7): independence — Account.active vs ledger status ─────────

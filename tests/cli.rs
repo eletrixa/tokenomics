@@ -338,6 +338,9 @@ status = \"active\"
                     "ledger parse error (claude-bravo): unknown status 'canceled'",
                 ))
                 .and(predicate::str::contains(
+                    "ledger verified (claude-alpha): human-entered (no verified)",
+                ))
+                .and(predicate::str::contains(
                     "ledger divergence: config account(s) with no ledger row: claude-orphan-config",
                 ))
                 .and(predicate::str::contains(
