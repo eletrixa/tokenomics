@@ -1,0 +1,3 @@
+claude-alpha  Claude Alpha  [claude]  /nonexistent/tokenomics-golden/claude-alpha  overlay:on
+claude-beta  Claude Beta  [claude]  /nonexistent/tokenomics-golden/claude-beta  overlay:off  (inactive)
+codex-gamma  Codex Gamma  [codex]  /nonexistent/tokenomics-golden/codex-gamma  overlay:off

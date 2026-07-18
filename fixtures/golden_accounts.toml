@@ -1,0 +1,28 @@
+# Synthetic fixture for the R16 golden-snapshot gate (spec 017 §E, acceptance 8) — see
+# tests/golden_cli.rs. Every id/label/config_dir here is made up; none of these paths are ever
+# resolved on disk (no `~`, so nothing tilde-expands against a real $HOME either).
+[settings]
+poll_local_secs = 10
+poll_overlay_secs = 300
+warn_pct = 75.0
+crit_pct = 90.0
+
+[[account]]
+id = "claude-alpha"
+label = "Claude Alpha"
+provider = "claude"
+config_dir = "/nonexistent/tokenomics-golden/claude-alpha"
+limits_overlay = true
+
+[[account]]
+id = "claude-beta"
+label = "Claude Beta"
+provider = "claude"
+config_dir = "/nonexistent/tokenomics-golden/claude-beta"
+active = false
+
+[[account]]
+id = "codex-gamma"
+label = "Codex Gamma"
+provider = "codex"
+config_dir = "/nonexistent/tokenomics-golden/codex-gamma"

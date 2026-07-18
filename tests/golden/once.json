@@ -1,0 +1,13 @@
+[
+  {
+    "account": "claude-alpha",
+    "label": "Claude Alpha",
+    "provider": "claude",
+    "error": "<ERR>"
+  },
+  {
+    "account": "codex-gamma",
+    "label": "Codex Gamma",
+    "provider": "codex"
+  }
+]
