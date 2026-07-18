@@ -4,7 +4,9 @@
 //! Module:  src/doctor.rs
 //! Deps:    jiff; runner (ccusage/codex version), providers::claude (adapter/creds/overlay),
 //!          providers::codex (app-server rate-limits probe)
-//! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints.
+//! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
+//!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
+//!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8).
 //!
 //! Key responsibilities:
 //! - Per Claude account: config_dir exists; `.credentials.json` present + owner-only; ccusage active
@@ -13,6 +15,11 @@
 //! - Per Codex account: config_dir + `sessions/` present; `auth.json` present (existence only);
 //!   `codex --version`; app-server reachability (only if opted-in AND active) (spec 013 §D).
 //! - Cross-account (Claude only): `CLAUDE_CONFIG_DIR` round-trip distinctness + shared-`projects/`.
+//! - Ledger plane (spec 017 §E): resolved path + provenance (`"ledger: not configured"` when `Off`);
+//!   past-dated rows (`renews`/`paid_through` already behind `today`); failed-parse rows with reason;
+//!   join divergence in both directions (config account with no ledger row, ledger row with no
+//!   matching config account). One read-only poll via the injectable `FileLedgerSource` — never
+//!   written, never held past this run.
 //! - Config divergence (spec 015 §B): flag when the RECORDED config path is newer than what the
 //!   running collector loaded, but only once the collector has heartbeated a few local cadences past
 //!   the edit without reloading (else the reload is simply pending). A persistent mismatch means the
@@ -29,11 +36,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jiff::tz::TimeZone;
 use jiff::Timestamp;
 
 use crate::config::Config;
 use crate::domain::Provider;
 use crate::error::AppResult;
+use crate::ledger::{
+    FileLedgerSource, Ledger, LedgerProvenance, SubStatus, Subscription, LEDGER_ENV,
+};
 use crate::providers::claude::ccusage::CcusageInvocation;
 use crate::providers::claude::overlay::{HttpUsageEndpoint, UsageEndpoint};
 use crate::providers::claude::{creds, ClaudeAdapter};
@@ -82,6 +93,7 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
     report_distinctness(&signatures);
     report_shared_projects(cfg);
     report_config_divergence(cfg);
+    report_ledger(cfg, now.to_zoned(TimeZone::system()).date());
     Ok(())
 }
 
@@ -195,6 +207,119 @@ fn exe_staleness_hint(current_mtime: Option<i64>, recorded_mtime: Option<i64>) -
         ),
         _ => None,
     }
+}
+
+// ── spec 017 §E: ledger diagnostics (provenance/path, freshness, failed-parse, join divergence) ──
+
+/// Read the ledger once (path resolution → a single poll of the injectable `FileLedgerSource`) and
+/// print: the resolved path + provenance (or `"not configured"`); past-dated rows; failed-parse rows
+/// with reason; join divergence in both directions. Read-only — never writes the ledger, never holds
+/// the reader past this call.
+fn report_ledger(cfg: &Config, today: jiff::civil::Date) {
+    let env_override = std::env::var(LEDGER_ENV).ok();
+    let path =
+        crate::ledger::resolve_path(env_override.as_deref(), cfg.settings.ledger_path.as_deref());
+    let Some(path) = path else {
+        println!("\n{}", ledger_status_line(None, LedgerProvenance::Off));
+        return;
+    };
+
+    let mut ledger = Ledger::new();
+    let mut source = FileLedgerSource::new(path.clone());
+    ledger.poll(&mut source);
+
+    println!("\n{}", ledger_status_line(Some(&path), ledger.provenance()));
+    if ledger.provenance() == LedgerProvenance::Stale {
+        if let Some(reason) = ledger.stale_reason() {
+            println!("  ledger stale reason: {reason}");
+        }
+    }
+
+    let past = ledger_past_dated(ledger.rows(), today);
+    if !past.is_empty() {
+        println!("  ledger past-dated: {}", past.join(", "));
+    }
+    for err in ledger.errors() {
+        println!(
+            "  ledger parse error ({}): {}",
+            err.id.as_deref().unwrap_or("<no id>"),
+            err.reason
+        );
+    }
+
+    let config_ids: Vec<&str> = cfg.accounts.iter().map(|a| a.id.as_str()).collect();
+    let (config_only, ledger_only) = ledger_join_divergence(&config_ids, ledger.rows());
+    if !config_only.is_empty() {
+        println!(
+            "  ledger divergence: config account(s) with no ledger row: {}",
+            config_only.join(", ")
+        );
+    }
+    if !ledger_only.is_empty() {
+        println!(
+            "  ledger divergence: ledger row(s) with no matching config account: {}",
+            ledger_only.join(", ")
+        );
+    }
+}
+
+/// The `"ledger: …"` status line: `"ledger: not configured"` when no path resolved (`Off`), else
+/// `"ledger: {path} [{provenance}]"`. Pure.
+fn ledger_status_line(path: Option<&Path>, provenance: LedgerProvenance) -> String {
+    match path {
+        None => "ledger: not configured".to_string(),
+        Some(p) => format!("ledger: {} [{}]", p.display(), provenance_label(provenance)),
+    }
+}
+
+/// Lowercase provenance label for the doctor status line (diagnostics text only — not TUI render).
+fn provenance_label(provenance: LedgerProvenance) -> &'static str {
+    match provenance {
+        LedgerProvenance::Off => "off",
+        LedgerProvenance::Fresh => "fresh",
+        LedgerProvenance::Stale => "stale",
+        LedgerProvenance::Missing => "missing",
+    }
+}
+
+/// Ledger rows whose `renews` (active) or `paid_through` (cancelled) date has already passed
+/// `today` — a freshness signal ("this ledger looks stale, an agent should renew/reconcile it").
+/// Pure; returns row ids in ledger order.
+fn ledger_past_dated(rows: &[Subscription], today: jiff::civil::Date) -> Vec<String> {
+    rows.iter()
+        .filter(|r| {
+            let relevant = match r.status {
+                SubStatus::Active => r.renews,
+                SubStatus::Cancelled => r.paid_through,
+            };
+            relevant.is_some_and(|d| d < today)
+        })
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+/// Join divergence in both directions (spec 017 §C/§E): `(config ids with no ledger row, ledger ids
+/// with no matching config account)`. Exact-match join only (mirrors `ledger::find`). Pure.
+fn ledger_join_divergence(
+    config_ids: &[&str],
+    ledger_rows: &[Subscription],
+) -> (Vec<String>, Vec<String>) {
+    let ledger_ids: std::collections::HashSet<&str> =
+        ledger_rows.iter().map(|r| r.id.as_str()).collect();
+    let config_only: Vec<String> = config_ids
+        .iter()
+        .filter(|id| !ledger_ids.contains(*id))
+        .map(|id| (*id).to_string())
+        .collect();
+
+    let config_id_set: std::collections::HashSet<&str> = config_ids.iter().copied().collect();
+    let ledger_only: Vec<String> = ledger_rows
+        .iter()
+        .filter(|r| !config_id_set.contains(r.id.as_str()))
+        .map(|r| r.id.clone())
+        .collect();
+
+    (config_only, ledger_only)
 }
 
 /// Codex diagnostics for one account (read-only): `sessions/` present, `auth.json` present
@@ -501,5 +626,87 @@ mod tests {
             exe_staleness_hint(Some(200), None).is_none(),
             "nothing recorded → no warn"
         );
+    }
+
+    // ── spec 017 §E (acceptance 8): ledger diagnostics ─────────────────────────────────────────
+    // `LedgerProvenance`/`SubStatus`/`Subscription` are already in scope via `use super::*` above.
+
+    fn ledger_row(id: &str, status: SubStatus) -> Subscription {
+        Subscription {
+            id: id.to_string(),
+            status,
+            purchased: None,
+            renews: None,
+            cancelled_on: None,
+            paid_through: None,
+        }
+    }
+
+    #[test]
+    fn ledger_status_line_reports_not_configured_when_off() {
+        assert_eq!(
+            ledger_status_line(None, LedgerProvenance::Off),
+            "ledger: not configured"
+        );
+    }
+
+    #[test]
+    fn ledger_status_line_names_the_resolved_path_when_configured() {
+        let line = ledger_status_line(
+            Some(Path::new("/synthetic/subscriptions.toml")),
+            LedgerProvenance::Fresh,
+        );
+        assert!(
+            line.contains("/synthetic/subscriptions.toml"),
+            "must name the resolved path: {line}"
+        );
+    }
+
+    #[test]
+    fn ledger_past_dated_flags_past_renews_and_past_paid_through() {
+        let today = jiff::civil::date(2026, 7, 18);
+        let mut stale_active = ledger_row("claude-alpha", SubStatus::Active);
+        stale_active.renews = Some(jiff::civil::date(2026, 7, 10)); // 8 days ago
+        let mut stale_cancelled = ledger_row("claude-bravo", SubStatus::Cancelled);
+        stale_cancelled.paid_through = Some(jiff::civil::date(2026, 7, 1));
+        let mut fresh = ledger_row("claude-charlie", SubStatus::Active);
+        fresh.renews = Some(jiff::civil::date(2026, 8, 1)); // future
+
+        let rows = vec![stale_active, stale_cancelled, fresh];
+        let past = ledger_past_dated(&rows, today);
+        assert_eq!(
+            past,
+            vec!["claude-alpha".to_string(), "claude-bravo".to_string()],
+            "past: {past:?}"
+        );
+    }
+
+    #[test]
+    fn ledger_join_divergence_flags_both_directions() {
+        let config_ids = vec!["claude-alpha", "claude-orphan-config"];
+        let ledger_rows = vec![
+            ledger_row("claude-alpha", SubStatus::Active),
+            ledger_row("claude-orphan-ledger", SubStatus::Cancelled),
+        ];
+        let (config_only, ledger_only) = ledger_join_divergence(&config_ids, &ledger_rows);
+        assert_eq!(
+            config_only,
+            vec!["claude-orphan-config".to_string()],
+            "config account with no ledger row: {config_only:?}"
+        );
+        assert_eq!(
+            ledger_only,
+            vec!["claude-orphan-ledger".to_string()],
+            "ledger row with no matching config account: {ledger_only:?}"
+        );
+    }
+
+    #[test]
+    fn ledger_join_divergence_empty_when_every_id_matches() {
+        let config_ids = vec!["claude-alpha"];
+        let ledger_rows = vec![ledger_row("claude-alpha", SubStatus::Active)];
+        let (config_only, ledger_only) = ledger_join_divergence(&config_ids, &ledger_rows);
+        assert!(config_only.is_empty());
+        assert!(ledger_only.is_empty());
     }
 }

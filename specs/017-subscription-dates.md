@@ -1,6 +1,6 @@
 # Spec 017 — Subscription dates from the ledger (third data plane)
 
-Status: **Active**
+Status: **Done**
 
 Plan: `plans/001-subscription-lifecycle/` (PRD `10-PRD.md` R1–R18; decisions Q1=a, Q6=dates-only
 recorded in `20-synthesis.md`). This spec covers Feature 1 only — the enable/disable driver lives
@@ -52,10 +52,16 @@ degrade-to-blank, never a guess.
   `tokenomics.toml` > **off**. No hardcoded path in the binary. Both unset = plane `Off`: zero
   rendering, zero warnings in the TUI; `doctor` reports "ledger: not configured".
 - Hot reload: the TUI event loop polls the ledger per tick with the spec-015 discipline
-  (mtime/size/content-hash change detection, keep-last-good on failure). An edit is reflected
-  without restart. The reader source is **injectable** so tests never touch the filesystem.
-  Unlike spec 015's config swap, a ledger change only updates display data — it never changes
-  which accounts exist or are polled.
+  (mtime/size/content-hash change detection, keep-last-good on failure). An edit to the ledger
+  **file's content** is reflected without restart. The reader source is **injectable** so tests
+  never touch the filesystem. Unlike spec 015's config swap, a ledger change only updates display
+  data — it never changes which accounts exist or are polled.
+  - The ledger **path itself** (`TOKENOMICS_LEDGER` / `[settings] ledger_path`) resolves once at TUI
+    startup, not on the config hot-reload — a foreign-repo file isn't expected to move mid-session.
+    Changing `ledger_path` in `tokenomics.toml` (or the env var) mid-session requires a TUI restart
+    to take effect; only the ledger's *content* hot-reloads. This is a deliberate, cheaper scope than
+    spec 015's config swap (which re-resolves everything the config drives) — add path re-resolution
+    on the tick only if a user needs to relocate the ledger file without restarting.
 
 ### C. Join + independence
 
@@ -89,6 +95,11 @@ Never a placeholder ("?", "n/a", "unknown") for missing data.
 
 - **FULL** degrade order when the border title would overflow the panel width: drop start
   segment → drop absolute `(…)` date → drop whole clause. Never truncate a date mid-string.
+- Width budgets throughout `view.rs` (this clause math included) measure with `chars().count()`,
+  not display width — a pre-existing, file-wide convention, not new to this wave. A label with wide
+  (CJK/emoji) characters can under-measure and let ratatui itself truncate the composed title. Known
+  ceiling; the fix, if ever needed, is a file-wide switch to `unicode-width` (already an indirect
+  dependency of ratatui, would need promoting to a direct one) — out of scope for this spec.
 - **COMPACT**: short dim clause after the name — `· renews 27d` / `· ends 4d` / `· cancelled` /
   `· ended`; past-`renews` stale state renders `· renews ?`. Two-step ladder in
   `compact_header_line`: if padding would hit 0, recompute without the clause — name + severity
@@ -115,7 +126,10 @@ Never a placeholder ("?", "n/a", "unknown") for missing data.
 ### F. Hygiene
 
 - `check.sh` gains a PII gate: email regex `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}` over
-  `plans/ specs/ src/ docs/`; policy is zero matches outside a committed `.pii-allowlist` file.
+  `plans/ specs/ src/ docs/ tests/ fixtures/` — `tests/` and `fixtures/` are included because that is
+  where committed fixtures actually live (`tests/cli.rs` ledger fixtures, `tests/golden/`,
+  `fixtures/golden_accounts.toml`); a gate that skipped them couldn't back the "no real email in a
+  committed fixture" claim. Policy is zero matches outside a committed `.pii-allowlist` file.
 - All fixtures in this spec's tests are synthetic (`claude-alpha`-style ids, made-up dates) —
   never live ledger content.
 - Same commit as the implementation: `CLAUDE.md` Architecture gains the ledger as the third

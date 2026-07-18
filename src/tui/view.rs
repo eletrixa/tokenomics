@@ -3,7 +3,9 @@
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/tui/view.rs
 //! Deps:    ratatui (Layout, Block, Sparkline, Paragraph, symbols)
-//! Tested:  inline `#[cfg(test)]` (TestBackend buffer assertions + insta snapshots at several sizes)
+//! Tested:  inline `#[cfg(test)]` (TestBackend buffer assertions + insta snapshots at several sizes);
+//!          the ledger clause's tier degrade order (`pick_full_clause`, `compact_header_line`,
+//!          `micro_line`) and the fleet header's ledger token (spec 017 §D acceptance 5)
 //!
 //! Design constraints:
 //! - `render` takes `&App` only; every value it needs is precomputed on `App` (no I/O, no compute).
@@ -24,7 +26,7 @@ use ratatui::Frame;
 use crate::domain::Severity;
 use crate::format::severity_label;
 
-use super::model::{resolve_color, severity_glyph, AccountView, App, GaugeView};
+use super::model::{resolve_color, severity_glyph, AccountView, App, GaugeView, SubView};
 
 /// Bordered panel height: border (2) + 2 inner lines (5h · weekly). Token/cost/burn moved to the
 /// fleet header line, so the panel no longer carries a per-account meta row.
@@ -306,11 +308,14 @@ fn render_full_panel(f: &mut Frame<'_>, app: &App, row: &AccountView, area: Rect
         symbols::border::PLAIN
     };
     let marker = if selected { "▶ " } else { "" };
+    // The border's own title-text budget: `area.width` minus the two corner cells (ratatui's
+    // `Block::titles_area` reserves exactly one column per side) — see `full_title_text`.
+    let title_text = full_title_text(&row.title, marker, &row.sub, area.width.saturating_sub(2));
     let block = Block::bordered()
         .border_set(border_set)
         .border_style(Style::new().fg(accent))
         .title(Span::styled(
-            format!(" {marker}{} ", row.title),
+            title_text,
             Style::new().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -448,6 +453,16 @@ fn render_fleet(f: &mut Frame<'_>, app: &App, area: Rect) {
         spans.push(Span::styled(text, style));
         used += add;
     }
+    // The ledger plane's one dim fleet token (spec 017 §D), lowest priority of all — it already
+    // carries its own leading `"· "` bullet (see `ledger_fleet_note`), so it's appended with a
+    // plain space rather than through the `SEP`-joined segments above.
+    if let Some(note) = &fleet.ledger_note {
+        let add = 1 + note.chars().count();
+        if used + add <= width {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(note.clone(), dim));
+        }
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -496,6 +511,36 @@ fn tight_label(g: &GaugeView) -> String {
         s.push_str(reset);
     }
     s
+}
+
+/// Pick the widest ledger-clause form (spec 017 §D) that fits `avail` cells, trying the degrade
+/// order roomiest→narrowest: the full form (start segment + absolute date) → the start segment
+/// dropped → the absolute date also dropped → omit entirely. Each candidate is rendered WHOLE or not
+/// at all — this never truncates a date mid-string (the FULL-tier degrade rule, acceptance 5).
+fn pick_full_clause(sub: &SubView, avail: usize) -> Option<&str> {
+    [&sub.full, &sub.full_no_start, &sub.full_no_date]
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.chars().count() <= avail)
+        .map(String::as_str)
+}
+
+/// Build the FULL-tier border title: `" {marker}{title}[ {clause}] "`. The clause is picked via
+/// [`pick_full_clause`] against whatever room is left after the (always-shown) marker + account
+/// title + the title's own leading/trailing padding spaces — so the whole title, clause included,
+/// is guaranteed to fit the border's `titles_area` (`area.width - 2`, the two corner cells) and is
+/// therefore never truncated by ratatui itself (which would otherwise cut a date mid-string).
+fn full_title_text(title: &str, marker: &str, sub: &SubView, avail_cols: u16) -> String {
+    let prefix = format!(" {marker}{title}");
+    let prefix_w = prefix.chars().count();
+    // One cell for the separating space before the clause, one for the title's own trailing space.
+    let clause_budget = usize::from(avail_cols)
+        .saturating_sub(prefix_w)
+        .saturating_sub(2);
+    match pick_full_clause(sub, clause_budget) {
+        Some(clause) => format!("{prefix} {clause} "),
+        None => format!("{prefix} "),
+    }
 }
 
 // ── COMPACT tier: borderless, three lines per account, grouped by a left accent spine ────────────
@@ -563,6 +608,7 @@ fn render_compact_block(
             spine_ch,
             spine_color,
             area.width,
+            resolve_color(app.use_color, Color::DarkGray),
         )),
         sub[0],
     );
@@ -588,13 +634,24 @@ fn compact_header_line(
     spine_ch: &str,
     spine_color: Color,
     width: u16,
+    dim: Color,
 ) -> Line<'static> {
     let caret = if selected { "▶ " } else { "  " };
     let name = format!("{caret}{}", row.title);
+    let name_w = name.chars().count();
     let (cluster, cluster_w) = compact_cluster(row);
     let avail = usize::from(width).saturating_sub(1); // minus the spine column
-    let pad = avail.saturating_sub(name.chars().count() + cluster_w);
-    let mut spans = Vec::with_capacity(cluster.len() + 3);
+
+    // spec 017 §D: two-step ladder — try the short dim clause first; if adding it would leave no
+    // padding at all (name + clause + cluster would fill or overflow the line), drop the clause.
+    // Name and the severity cluster always win over the ledger clause.
+    let clause = row
+        .sub
+        .compact
+        .as_deref()
+        .filter(|c| name_w + 1 + c.chars().count() + cluster_w < avail);
+
+    let mut spans = Vec::with_capacity(cluster.len() + 4);
     spans.push(Span::styled(
         spine_ch.to_string(),
         Style::new().fg(spine_color),
@@ -603,6 +660,14 @@ fn compact_header_line(
         name,
         Style::new().add_modifier(Modifier::BOLD),
     ));
+    let content_w = if let Some(clause) = clause {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(clause.to_string(), Style::new().fg(dim)));
+        name_w + 1 + clause.chars().count()
+    } else {
+        name_w
+    };
+    let pad = avail.saturating_sub(content_w + cluster_w);
     if pad > 0 {
         spans.push(Span::raw(" ".repeat(pad)));
     }
@@ -958,7 +1023,7 @@ fn render_help(f: &mut Frame<'_>, area: Rect) {
 mod tests {
     use super::*;
     use crate::domain::{Provenance, Severity};
-    use crate::tui::model::{severity_color, AccountView, Badge, FleetView, GaugeView};
+    use crate::tui::model::{severity_color, AccountView, Badge, FleetView, GaugeView, SubView};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -999,6 +1064,7 @@ mod tests {
             status: None,
             severity,
             inactive: false,
+            sub: SubView::default(),
         }
     }
 
@@ -1018,6 +1084,7 @@ mod tests {
             status: None,
             severity: Severity::Crit,
             inactive: false,
+            sub: SubView::default(),
         }
     }
 
@@ -1036,6 +1103,7 @@ mod tests {
             usage_age: Some("usage 8s ago".to_string()),
             usage_stale: false,
             overlay_age: None,
+            ledger_note: None,
         }
     }
 
@@ -1055,6 +1123,7 @@ mod tests {
             status: None,
             severity: Severity::Warn,
             inactive: false,
+            sub: SubView::default(),
         }
     }
 
@@ -1074,6 +1143,7 @@ mod tests {
             usage_age: Some("usage 5s ago".to_string()),
             usage_stale: false,
             overlay_age: Some("limits 1m ago".to_string()),
+            ledger_note: None,
         }
     }
 
@@ -1092,6 +1162,7 @@ mod tests {
             usage_age: Some("usage 5s ago".to_string()),
             usage_stale: false,
             overlay_age: Some("limits 2m ago".to_string()),
+            ledger_note: None,
         }
     }
 
@@ -1124,6 +1195,7 @@ mod tests {
             status: None,
             severity: Severity::Crit,
             inactive: true,
+            sub: SubView::default(),
         }
     }
 
@@ -1445,5 +1517,257 @@ mod tests {
     #[test]
     fn narrow_board_snapshot() {
         insta::assert_snapshot!("board_narrow", draw(&board(), 42, 14));
+    }
+
+    // ── spec 017 §D (acceptance 5): tier rendering of the ledger clause ────────────────────────
+
+    fn sub_view_all_forms() -> SubView {
+        SubView {
+            full: Some("· period 2026-07-14 → · renews in 27d (2026-08-14)".to_string()),
+            full_no_start: Some("· renews in 27d (2026-08-14)".to_string()),
+            full_no_date: Some("· renews in 27d".to_string()),
+            compact: Some("· renews 27d".to_string()),
+        }
+    }
+
+    fn row_with_sub(title: &str, sub: SubView) -> AccountView {
+        AccountView {
+            sub,
+            ..row(title, 42.0, Severity::Ok)
+        }
+    }
+
+    /// The other three ledger states (spec 017 §D table rows 3–5) as `SubView`s, so acceptance 5's
+    /// "snapshot coverage for active, cancelled, ended, and unknown states in FULL and COMPACT" has
+    /// fixtures beyond the one active-future-renews case `sub_view_all_forms` covers above.
+    fn sub_view_cancelled_ends() -> SubView {
+        let clause = "· cancelled · ends in 4d (2026-07-22)".to_string();
+        SubView {
+            full: Some(clause.clone()),
+            full_no_start: Some(clause),
+            full_no_date: Some("· cancelled · ends in 4d".to_string()),
+            compact: Some("· ends 4d".to_string()),
+        }
+    }
+
+    fn sub_view_ended() -> SubView {
+        let clause = "· cancelled · ended 2026-07-22".to_string();
+        SubView {
+            full: Some(clause.clone()),
+            full_no_start: Some(clause.clone()),
+            full_no_date: Some(clause),
+            compact: Some("· ended".to_string()),
+        }
+    }
+
+    fn sub_view_unknown() -> SubView {
+        let bare = "· cancelled".to_string();
+        SubView {
+            full: Some(bare.clone()),
+            full_no_start: Some(bare.clone()),
+            full_no_date: Some(bare.clone()),
+            compact: Some(bare),
+        }
+    }
+
+    #[test]
+    fn tier_snapshot_coverage_for_cancelled_ended_and_unknown_states() {
+        // acceptance 5: FULL (border title) and COMPACT (header line) both render each of the
+        // three non-active-renewal states correctly, mirroring the active-state coverage above.
+        let cases: [(&str, SubView, &str, &str); 3] = [
+            (
+                "cancelled-ends",
+                sub_view_cancelled_ends(),
+                "cancelled · ends in 4d (2026-07-22)",
+                "ends 4d",
+            ),
+            (
+                "ended",
+                sub_view_ended(),
+                "cancelled · ended 2026-07-22",
+                "ended",
+            ),
+            ("unknown", sub_view_unknown(), "cancelled", "cancelled"),
+        ];
+        for (name, sub, full_needle, compact_needle) in cases {
+            let mut app = App::new(1, true);
+            app.rows = vec![row_with_sub("Personal [claude]", sub.clone())];
+            let full_text = draw(&app, 140, 40);
+            assert!(
+                full_text.contains(full_needle),
+                "[{name}] FULL tier must show '{full_needle}':\n{full_text}"
+            );
+
+            let compact_text = line_text(&compact_header_line(
+                &row_with_sub("Personal [claude]", sub),
+                false,
+                "▏",
+                Color::Cyan,
+                80,
+                Color::DarkGray,
+            ));
+            assert!(
+                compact_text.contains(compact_needle),
+                "[{name}] COMPACT header must show '{compact_needle}': {compact_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_tier_shows_the_roomiest_clause_when_it_fits() {
+        let mut app = App::new(1, true);
+        app.rows = vec![row_with_sub("Personal [claude]", sub_view_all_forms())];
+        let text = draw(&app, 140, 40);
+        assert!(
+            text.contains("period 2026-07-14"),
+            "roomy width must show the full clause with its start segment:\n{text}"
+        );
+        assert!(
+            text.contains("renews in 27d (2026-08-14)"),
+            "the absolute date must be present at roomy width:\n{text}"
+        );
+    }
+
+    #[test]
+    fn full_tier_degrade_order_never_truncates_a_date_mid_string() {
+        // acceptance 5: start segment → absolute date → whole clause, in that order, and a date is
+        // either shown WHOLE or not shown — never a fragment like "2026-08-1" missing its final
+        // digit. Every occurrence of the date's 9-char prefix must be immediately followed by the
+        // completing "4" (i.e. it is always the full "2026-08-14", never cut short), at every width.
+        for width in [140u16, 90, 70, 50, 30] {
+            let mut app = App::new(1, true);
+            app.rows = vec![row_with_sub("Personal [claude]", sub_view_all_forms())];
+            let text = draw(&app, width, 40);
+            for (idx, _) in text.match_indices("2026-08-1") {
+                let next = text[idx + "2026-08-1".len()..].chars().next();
+                assert_eq!(
+                    next,
+                    Some('4'),
+                    "a truncated date fragment appeared at width {width}:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pick_full_clause_picks_the_widest_form_that_fits() {
+        let sub = sub_view_all_forms();
+        assert_eq!(
+            pick_full_clause(&sub, 200),
+            Some("· period 2026-07-14 → · renews in 27d (2026-08-14)"),
+            "roomy width picks the full roomiest form"
+        );
+        assert_eq!(
+            pick_full_clause(&sub, 40),
+            Some("· renews in 27d (2026-08-14)"),
+            "medium width drops the start segment first"
+        );
+        assert_eq!(
+            pick_full_clause(&sub, 25),
+            Some("· renews in 27d"),
+            "narrower still drops the absolute date next"
+        );
+        assert_eq!(
+            pick_full_clause(&sub, 5),
+            None,
+            "too narrow for even the bare clause ⇒ omit entirely"
+        );
+    }
+
+    /// Flatten a `Line`'s spans into plain text, for asserting on `compact_header_line`/`micro_line`
+    /// output directly (pure, no tier-selection geometry involved — those are covered by `choose_tier`
+    /// and the full-render tests elsewhere).
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn compact_header_shows_the_short_clause_when_it_fits() {
+        let row = row_with_sub("Personal [claude]", sub_view_all_forms());
+        let text = line_text(&compact_header_line(
+            &row,
+            false,
+            "▏",
+            Color::Cyan,
+            80,
+            Color::DarkGray,
+        ));
+        assert!(
+            text.contains("renews 27d"),
+            "the compact header must carry the short dim clause when it fits: {text:?}"
+        );
+    }
+
+    #[test]
+    fn compact_header_two_step_ladder_drops_clause_before_overflowing() {
+        // acceptance 5 / spec 017 §D: if padding for name + cluster + clause would hit 0, the
+        // clause is dropped first — name and the severity cluster always win, and the line must
+        // never overflow the given width.
+        let row = row_with_sub("Personal [claude]", sub_view_all_forms());
+        let text = line_text(&compact_header_line(
+            &row,
+            false,
+            "▏",
+            Color::Cyan,
+            30,
+            Color::DarkGray,
+        ));
+        assert!(
+            text.chars().count() <= 30,
+            "must never overflow the given width: {text:?} ({} cols)",
+            text.chars().count()
+        );
+        assert!(text.contains("Personal"), "the name must survive: {text:?}");
+    }
+
+    #[test]
+    fn micro_line_never_shows_a_date_under_any_state() {
+        let app = App::new(1, true);
+        let row = row_with_sub("Personal [claude]", sub_view_all_forms());
+        let text = line_text(&micro_line(&app, &row, 80, false, 0));
+        assert!(
+            !text.contains("2026-"),
+            "MICRO must never show a ledger date (stated decision, spec 017 §D): {text:?}"
+        );
+    }
+
+    fn fleet_with_note(note: &str) -> FleetView {
+        FleetView {
+            ledger_note: Some(note.to_string()),
+            ..fleet_derived()
+        }
+    }
+
+    #[test]
+    fn fleet_header_shows_missing_ledger_token() {
+        let mut app = board();
+        app.fleet = Some(fleet_with_note("· no ledger"));
+        let text = draw(&app, 140, 40);
+        assert!(text.contains("no ledger"), "Missing token:\n{text}");
+    }
+
+    #[test]
+    fn fleet_header_shows_stale_ledger_token() {
+        let mut app = board();
+        app.fleet = Some(fleet_with_note("· ledger stale"));
+        let text = draw(&app, 140, 40);
+        assert!(text.contains("ledger stale"), "Stale token:\n{text}");
+    }
+
+    #[test]
+    fn fleet_header_shows_zero_matched_ledger_token() {
+        let mut app = board();
+        app.fleet = Some(fleet_with_note("· ledger: 0 matched"));
+        let text = draw(&app, 140, 40);
+        assert!(text.contains("0 matched"), "zero-matched token:\n{text}");
+    }
+
+    #[test]
+    fn fleet_header_off_shows_no_ledger_token_at_all() {
+        // Off is `ledger_note: None` — nothing ledger-related renders anywhere (deliberate, spec
+        // 017 §D: unconfigured is a valid permanent state, `doctor` owns the distinction).
+        let app = board(); // fleet_derived() already carries ledger_note: None
+        let text = draw(&app, 140, 40);
+        assert!(!text.contains("ledger"), "Off must render nothing:\n{text}");
     }
 }

@@ -39,6 +39,10 @@ fn with_config(body: &str) -> TempDir {
 fn tok_with(dir: &TempDir) -> Command {
     let mut cmd = tok();
     cmd.env("TOKENOMICS_CONFIG", dir.path().join("tokenomics.toml"));
+    // Isolate from the ambient environment: a developer machine with a real `TOKENOMICS_LEDGER`
+    // exported would otherwise make `doctor_reports_ledger_not_configured_when_unset` fail, and
+    // every other doctor test would silently read the developer's real ledger file.
+    cmd.env_remove("TOKENOMICS_LEDGER");
     cmd
 }
 
@@ -279,6 +283,115 @@ config_dir = \"{DIR}\"
         .success()
         .stdout(predicate::str::contains("config divergence").not());
     assert!(!absent_db.exists(), "doctor must not create the store file");
+}
+
+#[test]
+fn doctor_reports_ledger_provenance_freshness_parse_errors_and_join_divergence() {
+    // Spec 017 §E / acceptance 8: `tok doctor`'s ledger section, exercised end-to-end through the
+    // real CLI (path resolution → poll → parse → print), not just the pure helpers unit-tested in
+    // `doctor.rs`. All ids/dates are synthetic (`claude-*`, made-up dates) per spec 017 §F.
+    let dir = with_config(
+        "\
+[[account]]
+id = \"claude-alpha\"
+label = \"Alpha\"
+provider = \"claude\"
+config_dir = \"{DIR}\"
+
+[[account]]
+id = \"claude-orphan-config\"
+label = \"Orphan Config\"
+provider = \"claude\"
+config_dir = \"{DIR}\"
+",
+    );
+    let ledger_path = dir.path().join("subscriptions.toml");
+    fs::write(
+        &ledger_path,
+        "\
+[[subscription]]
+id = \"claude-alpha\"
+status = \"active\"
+renews = 2000-01-01
+
+[[subscription]]
+id = \"claude-bravo\"
+status = \"canceled\"
+
+[[subscription]]
+id = \"claude-orphan-ledger\"
+status = \"active\"
+",
+    )
+    .expect("write ledger fixture");
+
+    tok_with(&dir)
+        .env("TOKENOMICS_LEDGER", &ledger_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("ledger: ")
+                .and(predicate::str::contains("[fresh]"))
+                .and(predicate::str::contains("ledger past-dated: claude-alpha"))
+                .and(predicate::str::contains(
+                    "ledger parse error (claude-bravo): unknown status 'canceled'",
+                ))
+                .and(predicate::str::contains(
+                    "ledger divergence: config account(s) with no ledger row: claude-orphan-config",
+                ))
+                .and(predicate::str::contains(
+                    "ledger divergence: ledger row(s) with no matching config account: \
+                     claude-orphan-ledger",
+                )),
+        );
+}
+
+#[test]
+fn doctor_reports_the_reason_a_wholly_unparseable_ledger_is_stale() {
+    // A blanked row is diagnosable via "ledger parse error (id): reason"; a wholly unparseable
+    // FILE must be diagnosable too — `[stale]` alone names no reason (adversarial-review finding).
+    let dir = with_config(
+        "\
+[[account]]
+id = \"claude-alpha\"
+label = \"Alpha\"
+provider = \"claude\"
+config_dir = \"{DIR}\"
+",
+    );
+    let ledger_path = dir.path().join("subscriptions.toml");
+    fs::write(&ledger_path, "this is [[[ not toml at all").expect("write malformed ledger");
+
+    tok_with(&dir)
+        .env("TOKENOMICS_LEDGER", &ledger_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[stale]")
+                .and(predicate::str::contains("ledger stale reason:")),
+        );
+}
+
+#[test]
+fn doctor_reports_ledger_not_configured_when_unset() {
+    // Spec 017 §B/§E: both `TOKENOMICS_LEDGER` and `[settings] ledger_path` unset ⇒ `Off`, and
+    // `doctor` says so plainly rather than staying silent about the plane's existence.
+    let dir = with_config(
+        "\
+[[account]]
+id = \"a\"
+label = \"Account A\"
+provider = \"claude\"
+config_dir = \"{DIR}\"
+",
+    );
+    tok_with(&dir)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ledger: not configured"));
 }
 
 #[test]

@@ -52,6 +52,9 @@ fn tok(db_dir: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("tok").expect("binary `tok` builds");
     cmd.env("TOKENOMICS_CONFIG", fixture_config_path());
     cmd.env("TOKENOMICS_DB", db_dir.path().join("tokenomics.db"));
+    // Belt-and-braces: neither surface under test reads the ledger, but isolate from an ambient
+    // `TOKENOMICS_LEDGER` anyway so this golden can never depend on the developer's environment.
+    cmd.env_remove("TOKENOMICS_LEDGER");
     cmd
 }
 

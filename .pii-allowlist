@@ -1,0 +1,7 @@
+# Email-shaped strings that check.sh's PII gate (spec 017 §F) may see in plans/ specs/ src/ docs/.
+# One literal email per line (exact match against the regex hit, not a pattern). Every entry here
+# must be synthetic/placeholder — never a real personal or account email. Comments start with `#`.
+
+# src/ledger.rs: synthetic AC1 fixture proving the ledger's `account` field is parsed-and-discarded
+# — RFC 2606 reserved placeholder domain, not a real address.
+someone@example.com

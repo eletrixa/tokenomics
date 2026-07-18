@@ -63,11 +63,16 @@ ambiguities `[NEEDS CLARIFICATION]`; never guess. Update the spec alongside the 
 
 ## Architecture
 
-**Two data planes, never conflated.** (1) Local ccusage / JSONL token usage = the ToS-safe core.
+**Three data planes, never conflated.** (1) Local ccusage / JSONL token usage = the ToS-safe core.
 (2) The `/api/oauth/usage` overlay = **opt-in**, provenance-tagged, and degrades silently to derived
-estimates on any 429/failure. Rendering is a pure function of state; the event loop is the only place
-that does I/O — collection runs as tokio tasks that send results back as messages; `view` only reads
-`App`. **Account attribution is the `CLAUDE_CONFIG_DIR`, never the logs** (logs carry no identity).
+estimates on any 429/failure. (3) The subscription ledger (`src/ledger.rs`, spec 017) = billing/
+lifecycle dates (purchased/renews/cancelled_on/paid_through) read-through from an external
+git-versioned TOML file — **TUI-only** (the collector never reads it), never persisted to SQLite,
+provenance-tagged (`Fresh`/`Stale`/`Missing`/`Off`), degrades to a blank clause on any parse failure,
+and joins to `Account.id` by exact match only. Rendering is a pure function of state; the event loop
+is the only place that does I/O — collection runs as tokio tasks that send results back as messages;
+`view` only reads `App`. **Account attribution is the `CLAUDE_CONFIG_DIR`, never the logs** (logs
+carry no identity).
 
 ## Conventions
 
@@ -92,6 +97,7 @@ that does I/O — collection runs as tokio tasks that send results back as messa
 | `~/.config/tokenomics/tokenomics.toml` | Accounts + thresholds (source of truth) |
 | `src/providers/claude/ccusage.rs` | ccusage JSON → `UsageSnapshot` (pure core) |
 | `src/providers/claude/overlay.rs` | `/api/oauth/usage` parse + backoff (opt-in) |
+| `src/ledger.rs` | Subscription ledger (billing dates) — read-through, TUI-only, third plane |
 | `src/domain.rs` | `Account` / `UsageSnapshot` / `Limit` / `Provenance` contracts |
 | `src/store.rs` | SQLite (WAL) — collector writes, TUI reads |
 | `rules/_index.md` | Coding rules index · `rules/crossroads.md` task routing |

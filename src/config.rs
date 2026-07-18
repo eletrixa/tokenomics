@@ -3,7 +3,8 @@
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/config.rs
 //! Deps:    serde, toml (path resolution lives in `crate::paths`)
-//! Tested:  inline `#[cfg(test)]` below + tests/cli.rs (validate/accounts)
+//! Tested:  inline `#[cfg(test)]` below + tests/cli.rs (validate/accounts); `ledger_path` parsing
+//!          (spec 017 §B)
 //!
 //! Key responsibilities:
 //! - `Config`/`Settings` schema with `deny_unknown_fields` (typos are errors).
@@ -54,6 +55,10 @@ pub struct Settings {
     /// `PATH`; set to e.g. `["npx", "ccusage"]` on machines without a global install.
     #[serde(default)]
     pub ccusage_cmd: Option<Vec<String>>,
+    /// Optional path to the subscription ledger (spec 017 §B) — beaten by `$TOKENOMICS_LEDGER`;
+    /// absent (and no env override) ⇒ the ledger plane is `Off` (no rendering, no warning).
+    #[serde(default)]
+    pub ledger_path: Option<String>,
 }
 
 const POLL_LOCAL_FLOOR: u64 = 5;
@@ -80,6 +85,7 @@ impl Default for Settings {
             warn_pct: default_warn(),
             crit_pct: default_crit(),
             ccusage_cmd: None,
+            ledger_path: None,
         }
     }
 }
@@ -370,5 +376,34 @@ color = \"burple\"
         assert!(validate(&cfg)
             .iter()
             .any(|f| f.message.contains("no accounts")));
+    }
+
+    // ── spec 017 §B: `[settings] ledger_path` ──────────────────────────────────────────────────
+
+    #[test]
+    fn ledger_path_absent_by_default_and_existing_configs_still_parse() {
+        // A config with no `ledger_path` at all (every config written before spec 017) must keep
+        // parsing exactly as before — the field is optional and defaults to `None`.
+        let cfg = Config::parse(ONE).expect("pre-spec-017 config still parses");
+        assert_eq!(cfg.settings.ledger_path, None);
+    }
+
+    #[test]
+    fn ledger_path_parses_when_present() {
+        let toml = "\
+[settings]
+ledger_path = \"/home/example/ledger/subscriptions.toml\"
+
+[[account]]
+id = \"a\"
+label = \"A\"
+provider = \"claude\"
+config_dir = \"/tmp\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert_eq!(
+            cfg.settings.ledger_path.as_deref(),
+            Some("/home/example/ledger/subscriptions.toml")
+        );
     }
 }

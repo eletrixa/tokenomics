@@ -2,16 +2,20 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/tui/model.rs
-//! Deps:    ratatui (Color), jiff; domain + format (display logic)
+//! Deps:    ratatui (Color), jiff; domain + format (display logic); ledger (subscription clause)
 //! Tested:  inline `#[cfg(test)]` — update/selection, severity→color, NO_COLOR, view-row build,
 //!          show-inactive toggle + tagged/dimmed inactive rows (spec 014), age-aware overlay hint
-//!          (spec 015 §C)
+//!          (spec 015 §C); `build_sub_view` clause math + `Account.active`/ledger-status
+//!          independence + `ledger_fleet_note` tokens (spec 017 §D acceptance 4/5/7)
 //!
 //! Key responsibilities:
 //! - `App`: selection, help/quit/show-inactive flags, colour policy, and the precomputed
 //!   `AccountView` rows.
 //! - `update(Msg)`: fold Key / Data (store) / Tick / Resize; selection clamps to the row count.
-//! - `build_account_view`: pure store-data → display-ready row (so `view` only lays out).
+//! - `build_account_view`: pure store-data → display-ready row (so `view` only lays out); it now
+//!   also does the exact-id ledger join (`ledger::find`) and calls `build_sub_view`, independent of
+//!   `Account.active` (spec 017 §C/§D).
+//! - `build_sub_view`: pure ledger-row + `today` → `SubView` (spec 017 §D clause text).
 //!
 //! Design constraints:
 //! - Everything the view needs is precomputed here; colour is a pure function of state.
@@ -25,6 +29,7 @@ use crate::format::{
     format_ago, format_ago_ms, format_cost, format_dollars, format_pct, format_reset,
     format_tokens, provenance_label, provenance_short, reset_expired, severity_label, RESET_DONE,
 };
+use crate::ledger::{find as ledger_find, LedgerProvenance, SubStatus, Subscription};
 use crate::store::TokenStatus;
 use crate::tui::keys::Action;
 
@@ -111,6 +116,143 @@ pub struct Badge {
     pub color: Color,
 }
 
+/// The precomputed subscription-lifecycle clause (ledger plane, spec 017 §D) for one account's
+/// header — every FULL/COMPACT form `view.rs` might need, so it stays a pure lookup with zero date
+/// math at render time. All `None` means "the ledger has nothing to say" (unmatched id, plane off,
+/// or an active row with no dates) — the header then renders byte-identical to the pre-spec-017 form.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubView {
+    /// FULL tier, roomiest form (start segment + absolute date), e.g.
+    /// `"· period 2026-07-14 → · renews in 27d (2026-08-14)"`.
+    pub full: Option<String>,
+    /// FULL tier, degrade step 1: the start segment dropped.
+    pub full_no_start: Option<String>,
+    /// FULL tier, degrade step 2: the absolute `(…)` date also dropped.
+    pub full_no_date: Option<String>,
+    /// COMPACT tier's short dim clause, e.g. `"· renews 27d"` / `"· ends 4d"` / `"· cancelled"`.
+    pub compact: Option<String>,
+}
+
+/// Whole calendar days from `from` to `to` (positive when `to` is in the future) — pure date math,
+/// no wall-clock/timezone involved beyond the injected `civil::Date`s themselves. `Date - Date`
+/// never fails (jiff guarantees this for two `civil::Date`s), but `since` is used over the `-`
+/// operator so no runtime path here can ever reach an `.expect()`; the `map_or(0, …)` fallback is
+/// unreachable in practice, not a silently-wrong default.
+fn days_between(from: jiff::civil::Date, to: jiff::civil::Date) -> i32 {
+    to.since(from).map_or(0, |span| span.get_days())
+}
+
+/// `"today"` for a zero-day difference, else `"in {n}d"` (FULL tier's relative phrase).
+fn day_phrase_full(days: i32) -> String {
+    if days == 0 {
+        "today".to_string()
+    } else {
+        format!("in {days}d")
+    }
+}
+
+/// `"today"` for a zero-day difference, else `"{n}d"` (COMPACT tier's shorter relative phrase).
+fn day_phrase_compact(days: i32) -> String {
+    if days == 0 {
+        "today".to_string()
+    } else {
+        format!("{days}d")
+    }
+}
+
+/// Build the `active` states' clause (spec 017 §D table, rows 1–2): a future/`today` `renews` gets
+/// the full "period → renews" form; a past `renews` gets the never-negative stale marker; no
+/// `renews` at all carries no information to render.
+fn build_active_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubView {
+    let Some(renews) = sub.renews else {
+        return SubView::default();
+    };
+    let days = days_between(today, renews);
+    let date = renews.to_string();
+    if days < 0 {
+        // The renewal date is in the past and no new one has landed — the ledger is stale, not the
+        // subscription negative. Never a negative countdown (acceptance 4).
+        let full = format!("· renews {date} (past — ledger stale?)");
+        return SubView {
+            full: Some(full.clone()),
+            full_no_start: Some(full.clone()),
+            full_no_date: Some(full),
+            compact: Some("· renews ?".to_string()),
+        };
+    }
+    let renews_clause = format!("· renews {} ({date})", day_phrase_full(days));
+    let full = sub.purchased.map_or_else(
+        || renews_clause.clone(),
+        |purchased| format!("· period {purchased} → {renews_clause}"),
+    );
+    SubView {
+        full: Some(full),
+        full_no_start: Some(renews_clause),
+        full_no_date: Some(format!("· renews {}", day_phrase_full(days))),
+        compact: Some(format!("· renews {}", day_phrase_compact(days))),
+    }
+}
+
+/// Build the `cancelled` states' clause (spec 017 §D table, rows 3–5): a future/`today`
+/// `paid_through` reads "ends", verb-swapped but visually parallel to `renews`; a past one reads
+/// "ended" (dimmed by the caller, not by text); an unknown one is the bare `"· cancelled"` label —
+/// the status alone is information, never a placeholder.
+fn build_cancelled_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubView {
+    let Some(paid_through) = sub.paid_through else {
+        let bare = "· cancelled".to_string();
+        return SubView {
+            full: Some(bare.clone()),
+            full_no_start: Some(bare.clone()),
+            full_no_date: Some(bare.clone()),
+            compact: Some(bare),
+        };
+    };
+    let days = days_between(today, paid_through);
+    let date = paid_through.to_string();
+    if days < 0 {
+        let full = format!("· cancelled · ended {date}");
+        return SubView {
+            full: Some(full.clone()),
+            full_no_start: Some(full.clone()),
+            full_no_date: Some(full),
+            compact: Some("· ended".to_string()),
+        };
+    }
+    let full = format!("· cancelled · ends {} ({date})", day_phrase_full(days));
+    SubView {
+        full: Some(full.clone()),
+        full_no_start: Some(full),
+        full_no_date: Some(format!("· cancelled · ends {}", day_phrase_full(days))),
+        compact: Some(format!("· ends {}", day_phrase_compact(days))),
+    }
+}
+
+/// Build one account's ledger clause (spec 017 §D), pure with `today` injected. `sub` is the
+/// already-joined ledger row (via [`crate::ledger::find`]) — `None` for an unmatched id, an off
+/// plane, or before the first poll. `Account.active` never enters this function — the ledger's
+/// `status` is the only input (spec 017 §C independence).
+pub fn build_sub_view(sub: Option<&Subscription>, today: jiff::civil::Date) -> SubView {
+    let Some(sub) = sub else {
+        return SubView::default();
+    };
+    match sub.status {
+        SubStatus::Active => build_active_sub_view(sub, today),
+        SubStatus::Cancelled => build_cancelled_sub_view(sub, today),
+    }
+}
+
+/// The fleet header's one dim ledger-plane token (spec 017 §D): `Missing` → `"· no ledger"`,
+/// `Stale` → `"· ledger stale"`, `Fresh` with zero matched rows → `"· ledger: 0 matched"`. `Off` (and
+/// `Fresh` with ≥1 matched row — the per-account clauses already say enough) render nothing.
+pub fn ledger_fleet_note(provenance: LedgerProvenance, matched: usize) -> Option<String> {
+    match provenance {
+        LedgerProvenance::Missing => Some("· no ledger".to_string()),
+        LedgerProvenance::Stale => Some("· ledger stale".to_string()),
+        LedgerProvenance::Fresh if matched == 0 => Some("· ledger: 0 matched".to_string()),
+        LedgerProvenance::Off | LedgerProvenance::Fresh => None,
+    }
+}
+
 /// One account's display-ready row. `view` only lays these out — no computation.
 #[derive(Debug, Clone)]
 pub struct AccountView {
@@ -140,6 +282,9 @@ pub struct AccountView {
     /// `App::rows` while `show_inactive` is on; it always stays excluded from the alert banner,
     /// the warn count, and the fleet reductions — see [`App::alert_count`] and `view::worst`.
     pub inactive: bool,
+    /// The ledger-plane clause (spec 017 §D), precomputed and pure — `view.rs` renders whichever
+    /// degrade-order form fits, never computing dates itself. See [`SubView`].
+    pub sub: SubView,
 }
 
 /// The fleet-wide usage line: the shared token / cost / burn figures shown **once** in the header
@@ -171,6 +316,8 @@ pub struct FleetView {
     /// `"limits 4m ago"` — the overlay/authoritative plane's age, from the *oldest* overlay refresh
     /// across accounts (most stale wins). Distinct from `usage_age` so the two planes never conflate.
     pub overlay_age: Option<String>,
+    /// The ledger plane's one dim fleet-header token (spec 017 §D) — see [`ledger_fleet_note`].
+    pub ledger_note: Option<String>,
 }
 
 /// One account's shared usage facts, extracted from its store reads — the raw numeric inputs to the
@@ -450,6 +597,12 @@ pub struct AccountData<'a> {
     /// overlay" hint honestly once a past success has gone silent without a recorded failure
     /// (spec 015 §C; the same value `account_usage` reads for the fleet header).
     pub overlay_ms: Option<i64>,
+    /// The ledger plane's current rows (spec 017 §C), or empty when `Off`/`Missing`/unpolled.
+    /// `build_account_view` joins these against `account.id` via `ledger::find` (exact match only).
+    pub ledger_rows: &'a [Subscription],
+    /// "Today" for the ledger's day-count math (spec 017 §D) — injected so the date math inside
+    /// `build_sub_view` stays pure; the caller derives it from `now` once per read.
+    pub today: jiff::civil::Date,
 }
 
 /// How long an opted-in overlay must fail continuously before the row flags "check account". A live
@@ -471,7 +624,13 @@ pub fn build_account_view(
         token_status,
         overlay_failing_since,
         overlay_ms,
+        ledger_rows,
+        today,
     } = data;
+
+    // Exact-id join (spec 017 §C) — `Account.active` never enters this lookup or `build_sub_view`,
+    // so an inactive (config-flagged) account still shows an active ledger clause and vice versa.
+    let sub = build_sub_view(ledger_find(ledger_rows, &account.id), today);
 
     // Every gauge carries its OWN reset countdown (like Claude's /usage) — session, weekly-all, and
     // the per-model scoped weekly — so each line reads consistently: <pct> <sev> · resets <when>.
@@ -563,6 +722,7 @@ pub fn build_account_view(
         status,
         severity,
         inactive: !account.active,
+        sub,
     }
 }
 
@@ -698,6 +858,8 @@ pub fn build_fleet_view(
     now: Timestamp,
     use_color: bool,
     poll_local_secs: u64,
+    ledger_provenance: LedgerProvenance,
+    ledger_matched: usize,
 ) -> Option<FleetView> {
     let total_tokens = usages.iter().filter_map(|u| u.total_tokens).max();
     let cost = usages
@@ -745,6 +907,7 @@ pub fn build_fleet_view(
         usage_age: newest_local.map(|ms| format!("usage {}", format_ago(ms, now))),
         usage_stale,
         overlay_age: oldest_overlay.map(|ms| format!("limits {}", format_ago(ms, now))),
+        ledger_note: ledger_fleet_note(ledger_provenance, ledger_matched),
     })
 }
 
@@ -762,6 +925,7 @@ pub fn error_view(account: &Account, use_color: bool, message: &str) -> AccountV
         status: Some(format!("store read error: {message}")),
         severity: Severity::Ok,
         inactive: !account.active,
+        sub: SubView::default(),
     }
 }
 
@@ -769,6 +933,7 @@ pub fn error_view(account: &Account, use_color: bool, message: &str) -> AccountV
 mod tests {
     use super::*;
     use crate::domain::{Provider, Window};
+    use crate::ledger::SubStatus;
     use std::path::PathBuf;
 
     fn view(severity: Severity) -> AccountView {
@@ -783,6 +948,7 @@ mod tests {
             status: None,
             severity,
             inactive: false,
+            sub: SubView::default(),
         }
     }
 
@@ -980,6 +1146,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: None,
             overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         };
         let row = build_account_view(&account(), data, now, true);
 
@@ -1066,7 +1234,8 @@ mod tests {
         let now: Timestamp = "2026-07-04T10:49:00Z".parse().unwrap();
         let usage = account_usage(Some(&snapshot), &[], None);
         assert_eq!(usage.tokens_per_minute, Some(4520.0));
-        let fleet = build_fleet_view(&[usage], now, true, 20).expect("fleet");
+        let fleet =
+            build_fleet_view(&[usage], now, true, 20, LedgerProvenance::Off, 0).expect("fleet");
         assert_eq!(fleet.burn_rate.as_deref(), Some("271.2K/h"));
     }
 
@@ -1092,7 +1261,8 @@ mod tests {
             &[],
             None,
         );
-        let fleet = build_fleet_view(&[usage], now, true, 20).expect("fleet");
+        let fleet =
+            build_fleet_view(&[usage], now, true, 20, LedgerProvenance::Off, 0).expect("fleet");
         assert_eq!(fleet.usage_age.as_deref(), Some("usage 12s ago"));
         assert!(!fleet.usage_stale, "12s < 2×20s is fresh");
         assert_eq!(fleet.overlay_age, None, "overlay off ⇒ no limits age");
@@ -1101,7 +1271,7 @@ mod tests {
         let stale: Timestamp = "2026-07-04T11:58:30Z".parse().unwrap();
         let mut u = usage;
         u.collected_at_ms = Some(stale.as_millisecond());
-        let fleet = build_fleet_view(&[u], now, true, 20).expect("fleet");
+        let fleet = build_fleet_view(&[u], now, true, 20, LedgerProvenance::Off, 0).expect("fleet");
         assert!(fleet.usage_stale, "90s > 2×20s is stale");
     }
 
@@ -1143,6 +1313,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: None,
             overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         }
     }
 
@@ -1260,6 +1432,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: failing_since.map(jiff::Timestamp::as_millisecond),
             overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         };
 
         // Failing for 20m (past the 15m stall threshold) ⇒ the honest "check account" flag.
@@ -1291,6 +1465,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: None,
             overlay_ms: Some(last_success.as_millisecond()),
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         };
         let row = build_account_view(&opted_in, data, now, true);
         assert_eq!(row.weekly_hint, "n/a (overlay silent 30m ago)");
@@ -1310,6 +1486,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: None,
             overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         };
         let row = build_account_view(&opted_in, data, now, true);
         assert_eq!(row.weekly_hint, "n/a (waiting for overlay)");
@@ -1332,6 +1510,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: None,
             overlay_ms: Some(recent_success.as_millisecond()),
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         };
         let row = build_account_view(&opted_in, data, now, true);
         assert_eq!(row.weekly_hint, "n/a (waiting for overlay)");
@@ -1355,6 +1535,8 @@ mod tests {
             token_status: None,
             overlay_failing_since: Some(stalled_since.as_millisecond()),
             overlay_ms: Some(last_success.as_millisecond()),
+            ledger_rows: &[],
+            today: jiff::civil::Date::default(),
         };
         let row = build_account_view(&opted_in, data, now, true);
         assert_eq!(row.weekly_hint, "n/a (overlay stalled — check account)");
@@ -1365,13 +1547,22 @@ mod tests {
         let now: Timestamp = "2026-07-04T12:00:00Z".parse().unwrap();
         let two_min_ago: Timestamp = "2026-07-04T11:58:00Z".parse().unwrap();
         let usage = account_usage(None, &[], Some(two_min_ago.as_millisecond()));
-        let fleet = build_fleet_view(&[usage], now, true, 20).expect("fleet");
+        let fleet =
+            build_fleet_view(&[usage], now, true, 20, LedgerProvenance::Off, 0).expect("fleet");
         // The overlay age is scoped "limits …" so it can never imply the local numbers are fresh.
         assert_eq!(fleet.overlay_age.as_deref(), Some("limits 2m ago"));
         assert_eq!(fleet.usage_age, None, "no snapshot ⇒ no local age");
 
         // No recorded overlay success and no snapshot anywhere ⇒ no fleet line.
-        assert!(build_fleet_view(&[account_usage(None, &[], None)], now, true, 20).is_none());
+        assert!(build_fleet_view(
+            &[account_usage(None, &[], None)],
+            now,
+            true,
+            20,
+            LedgerProvenance::Off,
+            0
+        )
+        .is_none());
     }
 
     #[test]
@@ -1447,7 +1638,8 @@ mod tests {
             ),
             ..a
         };
-        let fleet = build_fleet_view(&[a, b], now, true, 20).expect("some fleet");
+        let fleet =
+            build_fleet_view(&[a, b], now, true, 20, LedgerProvenance::Off, 0).expect("some fleet");
         // Representative (identical) usage — never summed.
         assert_eq!(fleet.tokens, "445.63M");
         assert_eq!(fleet.cost_notional, "$382.65 (notional)");
@@ -1460,6 +1652,298 @@ mod tests {
         assert_eq!(fleet.usage_age.as_deref(), Some("usage 1m ago"));
 
         // No account has any data ⇒ no fleet line at all.
-        assert!(build_fleet_view(&[AccountUsage::default()], now, true, 20).is_none());
+        assert!(build_fleet_view(
+            &[AccountUsage::default()],
+            now,
+            true,
+            20,
+            LedgerProvenance::Off,
+            0
+        )
+        .is_none());
+    }
+
+    // ── spec 017 §D (acceptance 4): clause math, pure, `today` injected ───────────────────────
+
+    fn ledger_sub(status: SubStatus) -> Subscription {
+        Subscription {
+            id: "claude-alpha".to_string(),
+            status,
+            purchased: None,
+            renews: None,
+            cancelled_on: None,
+            paid_through: None,
+        }
+    }
+
+    #[test]
+    fn no_ledger_row_omits_the_clause() {
+        // "active with no dates / no row / plane off" ⇒ every SubView field is None — the header
+        // must render byte-identical to the pre-spec-017 form.
+        let today = jiff::civil::date(2026, 7, 18);
+        let view = build_sub_view(None, today);
+        assert_eq!(view, SubView::default());
+    }
+
+    #[test]
+    fn active_no_dates_at_all_omits_the_clause() {
+        let today = jiff::civil::date(2026, 7, 18);
+        let sub = ledger_sub(SubStatus::Active);
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view,
+            SubView::default(),
+            "an active row with no dates carries no information to render"
+        );
+    }
+
+    #[test]
+    fn active_future_renews_with_purchased_full_clause() {
+        // Spec 017 §D table, row 1: `purchased` present ⇒ the start segment is shown.
+        let today = jiff::civil::date(2026, 7, 18); // 27 days before renews
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.purchased = Some(jiff::civil::date(2026, 7, 14));
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· period 2026-07-14 → · renews in 27d (2026-08-14)")
+        );
+        assert_eq!(
+            view.full_no_start.as_deref(),
+            Some("· renews in 27d (2026-08-14)"),
+            "degrade step 1: start segment dropped"
+        );
+        assert_eq!(
+            view.full_no_date.as_deref(),
+            Some("· renews in 27d"),
+            "degrade step 2: absolute date also dropped"
+        );
+        assert_eq!(view.compact.as_deref(), Some("· renews 27d"));
+    }
+
+    #[test]
+    fn active_future_renews_without_purchased_has_no_start_segment() {
+        let today = jiff::civil::date(2026, 7, 18);
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· renews in 27d (2026-08-14)"),
+            "no `purchased` ⇒ the roomiest form already has no start segment"
+        );
+    }
+
+    #[test]
+    fn zero_day_renews_reads_today_not_in_0d() {
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let today = jiff::civil::date(2026, 8, 14); // renews is today
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(view.full.as_deref(), Some("· renews today (2026-08-14)"));
+        assert_eq!(view.compact.as_deref(), Some("· renews today"));
+    }
+
+    #[test]
+    fn active_past_renews_shows_the_stale_marker_never_a_negative_countdown() {
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let today = jiff::civil::date(2026, 8, 20); // 6 days AFTER renews
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· renews 2026-08-14 (past — ledger stale?)")
+        );
+        assert!(
+            // NOTE: the exact clause above legitimately contains ASCII hyphens (the ISO date
+            // itself) — a blanket `contains('-')` would contradict the `assert_eq!` right above
+            // it. The actual invariant is "no negative relative count" (e.g. never `in -6d`),
+            // which the fixed `(past — ledger stale?)` marker replaces entirely, so check for
+            // that specific pattern instead.
+            !view.full.as_deref().unwrap_or_default().contains("in -"),
+            "must never render a negative day count"
+        );
+        assert_eq!(view.compact.as_deref(), Some("· renews ?"));
+    }
+
+    #[test]
+    fn cancelled_future_paid_through_reads_ends_in_parallel_to_active() {
+        let mut sub = ledger_sub(SubStatus::Cancelled);
+        sub.paid_through = Some(jiff::civil::date(2026, 7, 22));
+        let today = jiff::civil::date(2026, 7, 18); // 4 days before paid_through
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· cancelled · ends in 4d (2026-07-22)")
+        );
+        assert_eq!(view.compact.as_deref(), Some("· ends 4d"));
+    }
+
+    #[test]
+    fn cancelled_past_paid_through_reads_ended() {
+        let mut sub = ledger_sub(SubStatus::Cancelled);
+        sub.paid_through = Some(jiff::civil::date(2026, 7, 22));
+        let today = jiff::civil::date(2026, 7, 30); // after paid_through
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(view.full.as_deref(), Some("· cancelled · ended 2026-07-22"));
+        assert_eq!(view.compact.as_deref(), Some("· ended"));
+    }
+
+    #[test]
+    fn cancelled_unknown_paid_through_is_the_bare_label() {
+        let sub = ledger_sub(SubStatus::Cancelled);
+        let today = jiff::civil::date(2026, 7, 18);
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· cancelled"),
+            "the status alone is information, never hidden — but never a placeholder either"
+        );
+        assert_eq!(view.compact.as_deref(), Some("· cancelled"));
+    }
+
+    // ── spec 017 §C/§D (acceptance 7): independence — Account.active vs ledger status ─────────
+
+    #[test]
+    fn inactive_config_account_still_shows_an_active_ledger_clause() {
+        // `active = false` (spec 014, dims/tags the row) must not suppress an `active`-status
+        // ledger clause — the two bits are independent. Exercises `build_account_view`'s OWN
+        // exact-id join (`ledger_rows` is non-empty and matches `account.id`), not a manually
+        // stapled-on `SubView` — proving the join itself, not just `build_sub_view` in isolation.
+        let account = Account {
+            id: "personal".to_string(),
+            label: "Personal".to_string(),
+            provider: Provider::Claude,
+            config_dir: PathBuf::from("/tmp"),
+            color: None,
+            active: false,
+            limits_overlay: false,
+        };
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.id = "personal".to_string();
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let row = build_account_view(
+            &account,
+            AccountData {
+                snapshot: None,
+                limits: &[],
+                token_status: None,
+                overlay_failing_since: None,
+                overlay_ms: None,
+                ledger_rows: std::slice::from_ref(&sub),
+                today: jiff::civil::date(2026, 7, 18),
+            },
+            "2026-07-18T00:00:00Z".parse().unwrap(),
+            true,
+        );
+        assert!(row.inactive, "the config flag still dims/tags the row");
+        assert!(
+            row.sub.full.is_some(),
+            "an inactive (config) account must still render its active-in-the-ledger clause"
+        );
+    }
+
+    #[test]
+    fn active_config_account_still_shows_a_cancelled_ledger_clause() {
+        // `active = true` must not suppress a `cancelled`-status ledger clause — the ledger never
+        // drives monitoring on/off, and the config flag never drives the date display. Same
+        // real-join exercise as above, mirrored.
+        let account = Account {
+            id: "personal".to_string(),
+            label: "Personal".to_string(),
+            provider: Provider::Claude,
+            config_dir: PathBuf::from("/tmp"),
+            color: None,
+            active: true,
+            limits_overlay: false,
+        };
+        let mut sub = ledger_sub(SubStatus::Cancelled);
+        sub.id = "personal".to_string();
+        let row = build_account_view(
+            &account,
+            AccountData {
+                snapshot: None,
+                limits: &[],
+                token_status: None,
+                overlay_failing_since: None,
+                overlay_ms: None,
+                ledger_rows: std::slice::from_ref(&sub),
+                today: jiff::civil::date(2026, 7, 18),
+            },
+            "2026-07-18T00:00:00Z".parse().unwrap(),
+            true,
+        );
+        assert!(!row.inactive);
+        assert_eq!(
+            row.sub.full.as_deref(),
+            Some("· cancelled"),
+            "a monitored (active) account still shows its ledger-cancelled clause"
+        );
+    }
+
+    #[test]
+    fn build_account_view_does_not_join_a_near_miss_id() {
+        // Spec 017 §C acceptance 3: the join inside `build_account_view` itself (not just
+        // `ledger::find` in isolation) must stay exact-match — a near-miss id joins nothing.
+        let account = Account {
+            id: "claude-rob-7".to_string(),
+            label: "Rob".to_string(),
+            provider: Provider::Claude,
+            config_dir: PathBuf::from("/tmp"),
+            color: None,
+            active: true,
+            limits_overlay: false,
+        };
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.id = "claude-rob7".to_string();
+        sub.renews = Some(jiff::civil::date(2026, 8, 14));
+        let row = build_account_view(
+            &account,
+            AccountData {
+                snapshot: None,
+                limits: &[],
+                token_status: None,
+                overlay_failing_since: None,
+                overlay_ms: None,
+                ledger_rows: std::slice::from_ref(&sub),
+                today: jiff::civil::date(2026, 7, 18),
+            },
+            "2026-07-18T00:00:00Z".parse().unwrap(),
+            true,
+        );
+        assert_eq!(
+            row.sub,
+            SubView::default(),
+            "a near-miss id must never join through build_account_view"
+        );
+    }
+
+    // ── spec 017 §D (fleet header token, part of acceptance 3/5) ───────────────────────────────
+
+    #[test]
+    fn ledger_fleet_note_tokens_per_provenance() {
+        assert_eq!(
+            ledger_fleet_note(LedgerProvenance::Missing, 0).as_deref(),
+            Some("· no ledger")
+        );
+        assert_eq!(
+            ledger_fleet_note(LedgerProvenance::Stale, 0).as_deref(),
+            Some("· ledger stale")
+        );
+        assert_eq!(
+            ledger_fleet_note(LedgerProvenance::Fresh, 0).as_deref(),
+            Some("· ledger: 0 matched")
+        );
+        assert_eq!(
+            ledger_fleet_note(LedgerProvenance::Fresh, 3),
+            None,
+            "Fresh with at least one matched row says nothing extra"
+        );
+        assert_eq!(
+            ledger_fleet_note(LedgerProvenance::Off, 0),
+            None,
+            "Off renders nothing anywhere in the TUI"
+        );
     }
 }

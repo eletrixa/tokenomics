@@ -1293,6 +1293,7 @@ mod tests {
                 warn_pct: 75.0,
                 crit_pct: 90.0,
                 ccusage_cmd: None,
+                ledger_path: None,
             },
             accounts,
         }
@@ -2020,6 +2021,7 @@ mod tests {
                 warn_pct: 75.0,
                 crit_pct: 90.0,
                 ccusage_cmd: None,
+                ledger_path: None,
             },
             accounts,
         }

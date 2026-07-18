@@ -7,6 +7,27 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 ## [Unreleased]
 
 ### ADDED
+- **Subscription dates from the ledger — a third, read-through-only data plane (spec 017).** A
+  git-versioned subscription ledger (external TOML, `id`/`status`/`purchased`/`renews`/
+  `cancelled_on`/`paid_through`) already tracks which Max/Codex accounts are active vs. cancelled —
+  previously invisible in Tokenomics, so a cancelled account looked identical to a live one until the
+  overlay started failing. The header line now appends a clause per state: an active account with a
+  known `renews` date shows `· period 2026-07-14 → · renews in 27d (2026-08-14)`; a cancelled account
+  shows `· cancelled · ends in 4d (2026-07-22)` while still paid-through, `· cancelled · ended
+  2026-07-22` once lapsed, or a bare `· cancelled` when the date is unknown — never a placeholder, and
+  never a negative countdown for a stale `renews`. Path resolution is `$TOKENOMICS_LEDGER` >
+  `[settings] ledger_path` > off (unconfigured is a permanent, silent, valid state — nothing renders,
+  nothing warns). The join to `Account.id` is exact-string-match only; a near-miss id gets no clause
+  and shows up in `tok doctor`. The ledger is hot-reloaded per tick like `tokenomics.toml` (keep-
+  last-good on a mid-edit/garbage file, `Stale` until it's fixed); a malformed row (e.g. the
+  `"canceled"` typo) degrades only that row, never the whole read. **`Account.active` (spec 014) and
+  the ledger's `status` stay independent bits** — the ledger never drives monitoring on/off, and the
+  config flag never drives the date display. `tok doctor` gains a ledger section: resolved path +
+  provenance, past-dated rows, failed-parse rows with reason, and join divergence in both directions.
+  Read-through only — never written by Tokenomics, never persisted to SQLite, and the collector never
+  reads it (dates are a render concern). `tok accounts` / `tok once --json` are byte-identical this
+  wave (golden-snapshot enforced). `check.sh` gained a PII gate (`.pii-allowlist`) so no real email
+  ever lands in a committed fixture.
 - **`tok init` writes a starter config (spec 016).** On a fresh machine every command used to fail
   with a bare `cannot read config …` and no next step. `tok init` now writes a commented starter
   `tokenomics.toml` (one Claude account, a commented Codex account, thresholds, and the overlay

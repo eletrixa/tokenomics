@@ -14,10 +14,14 @@
 //! - Hot-reload the config file on the existing tick (spec 015 §A2): the TUI is the other long-running
 //!   process, so account/threshold edits reach the board without a relaunch. Same injectable
 //!   `ConfigSource` seam as the collector; the TUI stays READ-ONLY on the store (only the FILE reloads).
+//! - Poll the subscription ledger on the same tick (spec 017 §B): a third, TUI-only, read-through
+//!   plane via the injectable `LedgerSource` seam — display-only, so unlike the config swap it never
+//!   changes which accounts exist or are polled. The path resolves once at startup (a foreign-repo
+//!   file, not expected to move mid-session — see `run`).
 //!
 //! Design constraints:
 //! - Reader only: the collector process writes the store; the TUI reads it (CLAUDE.md data planes).
-//! - `view`/`update` do no I/O; the only I/O is this loop's store reads, config-file reload, and draws.
+//! - `view`/`update` do no I/O; the only I/O is this loop's store reads, config/ledger reload, and draws.
 
 pub mod keys;
 pub mod model;
@@ -35,6 +39,9 @@ use crate::collector::{ConfigSource, FileConfigSource};
 use crate::config::Config;
 use crate::domain::Account;
 use crate::error::{AppError, AppResult};
+use crate::ledger::{
+    self, find as ledger_find, FileLedgerSource, Ledger, LedgerProvenance, Subscription,
+};
 use crate::store::Store;
 
 use model::{
@@ -61,11 +68,43 @@ pub async fn run(cfg: &Config, store_path: &Path) -> AppResult<()> {
     let mut cfg = cfg.clone();
     let config_source = FileConfigSource::new();
 
+    // The ledger plane (spec 017 §B) resolves its path once at startup, unlike the config file — a
+    // foreign-repo file whose location isn't expected to move mid-session (accounts/thresholds DO
+    // hot-reload via `cfg`; the ledger's own CONTENT still hot-reloads below, just not its path).
+    // ponytail: re-resolving the path every tick (in case `[settings] ledger_path` itself changes via
+    // a config hot-reload) would add a second path-resolution seam for no test-driven need — add it
+    // if a user asks to move the ledger file mid-session without restarting.
+    let mut ledger = Ledger::new();
+    let mut ledger_source = ledger::resolve_path(
+        std::env::var(ledger::LEDGER_ENV).ok().as_deref(),
+        cfg.settings.ledger_path.as_deref(),
+    )
+    .map(FileLedgerSource::new);
+
     let mut terminal = ratatui::try_init()
         .map_err(|e| AppError::Terminal(format!("cannot start the TUI: {e}")))?;
-    let result = event_loop(&mut terminal, &mut app, &mut cfg, config_source, &reader).await;
+    let result = event_loop(
+        &mut terminal,
+        &mut app,
+        &mut cfg,
+        config_source,
+        &reader,
+        &mut ledger,
+        ledger_source.as_mut(),
+    )
+    .await;
     let _ = ratatui::try_restore();
     result
+}
+
+/// Poll the ledger source (spec 017 §B) — a no-op when the plane is unconfigured (`source` is
+/// `None`, i.e. `Off` forever, per [`Ledger::new`]'s own doc). Mirrors [`apply_tui_reload`]'s split:
+/// the keep-last-good / `Stale` discipline lives in `Ledger::poll` itself, this is just the one-line
+/// call site the event loop needs.
+fn poll_ledger(ledger: &mut Ledger, source: Option<&mut FileLedgerSource>) {
+    if let Some(source) = source {
+        ledger.poll(source);
+    }
 }
 
 /// Swap the TUI's working config from a polled reload (spec 015 §A2). A `Some` poll swaps the whole
@@ -84,6 +123,8 @@ async fn event_loop<S: ConfigSource>(
     cfg: &mut Config,
     mut config_source: S,
     reader: &Store,
+    ledger: &mut Ledger,
+    mut ledger_source: Option<&mut FileLedgerSource>,
 ) -> AppResult<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
@@ -91,7 +132,7 @@ async fn event_loop<S: ConfigSource>(
     // backlogged ticks (spec 011 §F).
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    refresh(app, cfg, reader);
+    refresh(app, cfg, reader, ledger);
     loop {
         terminal
             .draw(|f| view::render(f, app))
@@ -109,17 +150,19 @@ async fn event_loop<S: ConfigSource>(
             },
             _ = tick.tick() => {
                 // Hot-reload BEFORE the store read, so an added/(re)activated account or a changed
-                // threshold reaches this tick's board (spec 015 §A2).
+                // threshold reaches this tick's board (spec 015 §A2); the ledger polls the same tick
+                // (spec 017 §B) — display-only, so it never changes which accounts are read below.
                 apply_tui_reload(cfg, &mut config_source);
+                poll_ledger(ledger, ledger_source.as_deref_mut());
                 app.update(Msg::Tick);
-                refresh(app, cfg, reader);
+                refresh(app, cfg, reader, ledger);
             }
             _ = tokio::signal::ctrl_c() => app.should_quit = true,
         }
 
         if app.reload_requested {
             app.reload_requested = false;
-            refresh(app, cfg, reader);
+            refresh(app, cfg, reader, ledger);
         }
         if app.should_quit {
             break;
@@ -130,7 +173,7 @@ async fn event_loop<S: ConfigSource>(
 
 /// Re-read the store into `app` — the one place `read_rows` feeds `Msg::Data`, so the three call
 /// sites (initial load, the redraw tick, and a `r`/`i` refresh) can't drift out of sync.
-fn refresh(app: &mut App, cfg: &Config, reader: &Store) {
+fn refresh(app: &mut App, cfg: &Config, reader: &Store, ledger: &Ledger) {
     let rows = read_rows(
         cfg,
         reader,
@@ -138,8 +181,20 @@ fn refresh(app: &mut App, cfg: &Config, reader: &Store) {
         app.show_inactive,
         &app.rows,
         app.collector_alert.as_deref(),
+        LedgerRead {
+            rows: ledger.rows(),
+            provenance: ledger.provenance(),
+        },
     );
     app.update(Msg::Data(Box::new(rows)));
+}
+
+/// One ledger read (spec 017 §D), bundled so `read_rows` stays under clippy's argument-count lint —
+/// mirrors [`AccountData`]'s own bundling for the same reason.
+#[derive(Debug, Clone, Copy)]
+struct LedgerRead<'a> {
+    rows: &'a [Subscription],
+    provenance: LedgerProvenance,
 }
 
 /// Read the latest per-account rows plus the fleet-wide aggregate burn series from the store.
@@ -158,8 +213,18 @@ fn read_rows(
     show_inactive: bool,
     previous: &[AccountView],
     previous_alert: Option<&str>,
+    ledger: LedgerRead<'_>,
 ) -> Dashboard {
+    let LedgerRead {
+        rows: ledger_rows,
+        provenance: ledger_provenance,
+    } = ledger;
     let now = Timestamp::now();
+    // "Today" for the ledger's day-count math (spec 017 §D: "calendar-day differences in local
+    // time") — the system timezone, mirroring `doctor::run_doctor`'s
+    // `now.to_zoned(TimeZone::system()).date()` so the TUI and `tok doctor` never disagree on
+    // "today" (and neither reads a day early/late relative to the user's own clock).
+    let today = now.to_zoned(jiff::tz::TimeZone::system()).date();
     let visible: Vec<&Account> = cfg
         .accounts
         .iter()
@@ -167,8 +232,16 @@ fn read_rows(
         .collect();
     let mut rows = Vec::with_capacity(visible.len());
     let mut usages = Vec::with_capacity(visible.len());
+    // Counted over ALL configured accounts, not just the visibility-filtered `visible` list below
+    // (spec 017 acceptance 3 ties this token to the config↔ledger join, not row visibility) — with
+    // `show_inactive` off, a ledger row matching a hidden inactive account must still count.
+    let ledger_matched = cfg
+        .accounts
+        .iter()
+        .filter(|a| ledger_find(ledger_rows, &a.id).is_some())
+        .count();
     for (idx, account) in visible.into_iter().enumerate() {
-        match read_account_row(reader, account, use_color, now) {
+        match read_account_row(reader, account, use_color, now, ledger_rows, today) {
             Ok((row, usage)) => {
                 rows.push(row);
                 // An inactive account's usage never feeds the fleet reduction (shared tokens/cost/
@@ -195,7 +268,14 @@ fn read_rows(
     let aggregate_burn = reader
         .aggregate_burn_history(HISTORY_POINTS)
         .unwrap_or_default();
-    let fleet = build_fleet_view(&usages, now, use_color, cfg.settings.poll_local_secs);
+    let fleet = build_fleet_view(
+        &usages,
+        now,
+        use_color,
+        cfg.settings.poll_local_secs,
+        ledger_provenance,
+        ledger_matched,
+    );
     // Collector liveness: a stale/absent heartbeat means the store isn't being written — the rows
     // above are frozen, not live. A transient read error (SQLITE_BUSY) must NOT read as "never
     // started": it keeps last tick's verdict rather than flashing the loud "not running" banner.
@@ -235,6 +315,8 @@ fn read_account_row(
     account: &Account,
     use_color: bool,
     now: Timestamp,
+    ledger_rows: &[Subscription],
+    today: jiff::civil::Date,
 ) -> AppResult<(AccountView, AccountUsage)> {
     let snapshot = reader.latest_snapshot(&account.id)?;
     let limits = reader.latest_limits(&account.id)?;
@@ -245,6 +327,8 @@ fn read_account_row(
         token_status: reader.latest_token_status(&account.id)?,
         overlay_failing_since: reader.overlay_failing_since(&account.id)?,
         overlay_ms,
+        ledger_rows,
+        today,
     };
     let usage = account_usage(snapshot.as_ref(), &limits, overlay_ms);
     Ok((build_account_view(account, data, now, use_color), usage))
@@ -319,11 +403,33 @@ mod tests {
             .into(),
         );
 
-        let before = read_rows(&cfg, &store, true, false, &[], None);
+        let before = read_rows(
+            &cfg,
+            &store,
+            true,
+            false,
+            &[],
+            None,
+            LedgerRead {
+                rows: &[],
+                provenance: LedgerProvenance::Off,
+            },
+        );
         assert_eq!(before.rows.len(), 1, "only 'a' before the reload");
 
         apply_tui_reload(&mut cfg, &mut source);
-        let after = read_rows(&cfg, &store, true, false, &before.rows, None);
+        let after = read_rows(
+            &cfg,
+            &store,
+            true,
+            false,
+            &before.rows,
+            None,
+            LedgerRead {
+                rows: &[],
+                provenance: LedgerProvenance::Off,
+            },
+        );
         assert_eq!(after.rows.len(), 2, "the swapped-in 'b' reaches the board");
 
         // A bad reload (None) leaves the last-good (2-account) config in place.
@@ -385,7 +491,18 @@ mod tests {
             .expect("seed dead limit");
 
         // Default: show_inactive = false ⇒ the dead account is entirely absent (AC3).
-        let hidden = read_rows(&cfg, &store, true, false, &[], None);
+        let hidden = read_rows(
+            &cfg,
+            &store,
+            true,
+            false,
+            &[],
+            None,
+            LedgerRead {
+                rows: &[],
+                provenance: LedgerProvenance::Off,
+            },
+        );
         assert_eq!(hidden.rows.len(), 1, "only the active account is visible");
         assert!(!hidden.rows[0].title.contains("(inactive)"));
         let fleet_hidden = hidden.fleet.expect("active account has data");
@@ -393,7 +510,18 @@ mod tests {
 
         // Shown: the dead row appears, tagged — but the fleet line is UNCHANGED (still only
         // active's 500 tokens, not dead's 999,000), and its crit never displaces the header count.
-        let shown = read_rows(&cfg, &store, true, true, &hidden.rows, None);
+        let shown = read_rows(
+            &cfg,
+            &store,
+            true,
+            true,
+            &hidden.rows,
+            None,
+            LedgerRead {
+                rows: &[],
+                provenance: LedgerProvenance::Off,
+            },
+        );
         assert_eq!(shown.rows.len(), 2, "both accounts now visible");
         let dead_row = shown
             .rows
