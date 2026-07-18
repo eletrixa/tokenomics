@@ -50,9 +50,17 @@ impl CodexAdapter {
 #[async_trait]
 impl ProviderAdapter for CodexAdapter {
     async fn collect(&self, account: &Account, now: Timestamp) -> AppResult<Option<UsageSnapshot>> {
+        // Validation (spec 019 §A) guarantees a codex account always carries a config_dir; this is
+        // a defensive early return, never a panic, if that guarantee is ever violated upstream.
+        let Some(config_dir) = account.config_dir.as_deref() else {
+            return Err(AppError::SessionsScan(format!(
+                "account '{}': codex requires config_dir",
+                account.id
+            )));
+        };
         let cutoff: SystemTime = (now - MTIME_LOOKBACK).into();
         let window = covering_window(now);
-        let sessions_dir = account.config_dir.join("sessions");
+        let sessions_dir = config_dir.join("sessions");
         let account_id = account.id.clone();
 
         // The walk + file reads are synchronous filesystem I/O; run them on the blocking pool so a
@@ -201,7 +209,8 @@ mod tests {
             id: "codex-acct".to_string(),
             label: "Codex".to_string(),
             provider: Provider::Codex,
-            config_dir,
+            config_dir: Some(config_dir),
+            api_key_env: None,
             active: true,
             color: None,
             limits_overlay: false,

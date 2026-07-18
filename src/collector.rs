@@ -6,12 +6,14 @@
 //! Tested:  inline `#[cfg(test)]` — `should_apply` table, a fake-adapter loop, degrade-to-derived,
 //!          concurrent-overlay + loop-not-blocked timing, an opt-in overlay run, inactive-account
 //!          skip on both cadences (spec 014), a Codex app-server overlay pass + failure backoff (013),
-//!          config hot-reload activation/deactivation + bad-reload resilience (spec 015)
+//!          config hot-reload activation/deactivation + bad-reload resilience (spec 015), a z.ai
+//!          quota overlay pass + opt-in/env-var eligibility gating (spec 019 §D)
 //!
 //! Key responsibilities:
 //! - `run_collector`: local-cadence tick → `collect` → `insert_snapshot` + derived limit; overlay
-//!   cadence tick → spawn opt-in `/api/oauth/usage` fetches, harvest → authoritative limits (degrade
-//!   to derived on stale/failure); a slow retention sweep prunes old snapshots + checkpoints the WAL.
+//!   cadence tick → spawn opt-in Claude `/api/oauth/usage`, Codex app-server, and z.ai quota fetches,
+//!   harvest → authoritative limits (degrade to derived on stale/failure); a slow retention sweep
+//!   prunes old snapshots + checkpoints the WAL.
 //! - Guards: inflight (never stack a second collect per account), generation (`should_apply`),
 //!   isolation (a failing account keeps last-good and never crashes the loop), bounded concurrency,
 //!   `MissedTickBehavior::Skip` (resume cadence from now after a suspend, not a catch-up burst).
@@ -53,6 +55,8 @@ use crate::providers::claude::overlay::{
     next_backoff, parse_oauth_usage, BackoffOutcome, UsageEndpoint,
 };
 use crate::providers::codex::rate_limits::{parse_rate_limits_response, RateLimitsSource};
+use crate::providers::zai::quota::{parse_quota_response, QuotaEndpoint};
+use crate::providers::zai::resolve_api_key;
 use crate::providers::ProviderAdapter;
 use crate::store::{Store, TokenStatus};
 
@@ -274,14 +278,16 @@ fn apply_config_reload<S: ConfigSource>(
 }
 
 /// Run the collector loop until `shutdown` resolves. Generic over the adapter, the Claude overlay
-/// endpoint, the Codex rate-limits source, and the config source so the loop is tested with fakes
-/// (no process spawn, no network, no filesystem).
-pub async fn run_collector<A, E, C, S>(
+/// endpoint, the Codex rate-limits source, the z.ai quota endpoint, and the config source so the
+/// loop is tested with fakes (no process spawn, no network, no filesystem).
+#[allow(clippy::too_many_arguments)] // one collaborator per provider's overlay lane, threaded explicitly
+pub async fn run_collector<A, E, C, Z, S>(
     cfg: &Config,
     mut config_source: S,
     adapter: A,
     endpoint: E,
     rate_source: C,
+    zai_endpoint: Z,
     store: Store,
     shutdown: impl Future<Output = ()>,
 ) -> AppResult<()>
@@ -289,6 +295,7 @@ where
     A: ProviderAdapter + Send + Sync + 'static,
     E: UsageEndpoint + 'static,
     C: RateLimitsSource + 'static,
+    Z: QuotaEndpoint + 'static,
     S: ConfigSource,
 {
     let mut cfg = cfg.clone();
@@ -311,6 +318,7 @@ where
     let adapter = Arc::new(adapter);
     let endpoint = Arc::new(endpoint);
     let rate_source = Arc::new(rate_source);
+    let zai_endpoint = Arc::new(zai_endpoint);
     let mut local = cadence_interval(cfg.settings.poll_local_secs);
     let mut overlay = cadence_interval(cfg.settings.poll_overlay_secs);
     let mut retention = tokio::time::interval(Duration::from_secs(RETENTION_SWEEP_SECS));
@@ -327,6 +335,9 @@ where
     // The Codex limits overlay (`codex app-server` subprocess) runs on the same cadence, off the loop
     // task, harvested on its own arm — the Codex twin of `overlay_tasks` (spec 013 §C).
     let mut codex_overlay_tasks: JoinSet<CodexOverlayOutcome> = JoinSet::new();
+    // The z.ai quota overlay runs on the same cadence, off the loop task, harvested on its own arm —
+    // the zai twin of `codex_overlay_tasks` (spec 019 §D).
+    let mut zai_overlay_tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
 
     tokio::pin!(shutdown);
     loop {
@@ -363,6 +374,7 @@ where
                 // is individually time-boxed, so a slow account can't stall the loop or shutdown.
                 spawn_overlay_fetches(&cfg, &endpoint, &store, &mut overlay_state, &mut overlay_tasks);
                 spawn_codex_overlay_fetches(&cfg, &rate_source, &mut overlay_state, &mut codex_overlay_tasks);
+                spawn_zai_overlay_fetches(&cfg, &zai_endpoint, &mut overlay_state, &mut zai_overlay_tasks);
             }
             Some(joined) = overlay_tasks.join_next() => {
                 match joined {
@@ -380,6 +392,16 @@ where
                     }
                     Err(join_err) => {
                         eprintln!("collector: codex overlay task join error: {join_err}");
+                    }
+                }
+            }
+            Some(joined) = zai_overlay_tasks.join_next() => {
+                match joined {
+                    Ok(outcome) => {
+                        apply_zai_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome);
+                    }
+                    Err(join_err) => {
+                        eprintln!("collector: zai overlay task join error: {join_err}");
                     }
                 }
             }
@@ -588,7 +610,18 @@ fn try_spawn_overlay_fetch<E: UsageEndpoint + 'static>(
             return false; // still cooling down from a 429
         }
     }
-    let token = match creds::read_token(&account.config_dir) {
+    // Validation (spec 019 §A) guarantees a Claude account always carries a config_dir; this is a
+    // defensive early return, never a panic, if that guarantee is ever violated upstream.
+    let Some(config_dir) = account.config_dir.as_deref() else {
+        if log_stale {
+            eprintln!(
+                "collector: [{}] overlay skipped — claude account missing config_dir",
+                account.id
+            );
+        }
+        return false;
+    };
+    let token = match creds::read_token(config_dir) {
         Ok(token) => token,
         Err(e) => {
             if log_stale {
@@ -787,12 +820,21 @@ fn spawn_codex_overlay_fetches<C: RateLimitsSource + 'static>(
                 continue; // still backing off from a prior failure
             }
         }
+        // Validation (spec 019 §A) guarantees a Codex account always carries a config_dir; this is
+        // a defensive skip, never a panic, if that guarantee is ever violated upstream.
+        let Some(config_dir) = account.config_dir.clone() else {
+            eprintln!(
+                "collector: [{}] codex overlay skipped — missing config_dir",
+                account.id
+            );
+            continue;
+        };
         let backoff_current = state.backoff_secs.get(&account.id).copied().unwrap_or(base);
         let source = Arc::clone(source);
         let account = account.clone();
         let cap = Duration::from_secs(OVERLAY_TICK_BUDGET_SECS);
         tasks.spawn(async move {
-            let result = match tokio::time::timeout(cap, source.fetch(&account.config_dir)).await {
+            let result = match tokio::time::timeout(cap, source.fetch(&config_dir)).await {
                 Ok(result) => result,
                 Err(_elapsed) => Err(AppError::Overlay(
                     "codex rate-limits fetch exceeded budget".to_string(),
@@ -859,6 +901,127 @@ fn apply_codex_overlay_outcome(
                 "collector: [{}] codex overlay fetch failed: {e}",
                 account.id
             );
+        }
+    }
+}
+
+// ── spec 019 §D: z.ai overlay integration ──────────────────────────────────────────────────────
+// Wired into `run_collector`'s `select!` loop as its 4th `JoinSet` arm, mirroring the Codex twin
+// above: same cadence (`poll_overlay_secs`), same per-account backoff/cooldown/TTL-demotion
+// machinery (`OverlayState`, `apply_authoritative_limits`), claude/codex paths untouched.
+
+/// One z.ai quota fetch handed back for harvesting — the zai twin of [`CodexOverlayOutcome`].
+#[derive(Debug)]
+struct ZaiOverlayOutcome {
+    /// The account this fetch was for.
+    account: Account,
+    /// The backoff interval in effect when the fetch was spawned (drives [`next_backoff`] on harvest).
+    backoff_current: u64,
+    /// The raw quota body on success, or the typed error (429 → backoff, other → logged).
+    result: AppResult<Vec<u8>>,
+}
+
+/// Spawn one z.ai quota fetch per eligible opted-in zai account, run OFF the loop task (single-
+/// writer preserved). Eligible = active, opted-in, provider zai, not cooling down from a prior
+/// failure, AND its named env var resolves to a non-empty value — an account missing that (not
+/// opted in, or the env var unset/empty) is skipped with a logged reason, mirroring the Claude
+/// stale-token skip; no store write (zai carries no token-warmth state to persist).
+fn spawn_zai_overlay_fetches<Z: QuotaEndpoint + 'static>(
+    cfg: &Config,
+    endpoint: &Arc<Z>,
+    state: &mut OverlayState,
+    tasks: &mut JoinSet<ZaiOverlayOutcome>,
+) {
+    let base = cfg.settings.poll_overlay_secs.max(1);
+    for account in cfg
+        .accounts
+        .iter()
+        .filter(|a| a.active && a.limits_overlay && a.provider == Provider::Zai)
+    {
+        if let Some(ticks) = state.cooldown_ticks.get_mut(&account.id) {
+            if *ticks > 0 {
+                *ticks -= 1;
+                continue; // still backing off from a prior failure
+            }
+        }
+        let key = match resolve_api_key(account) {
+            Ok(key) => key,
+            Err(reason) => {
+                eprintln!("collector: [{}] zai overlay skipped — {reason}", account.id);
+                continue;
+            }
+        };
+        let backoff_current = state.backoff_secs.get(&account.id).copied().unwrap_or(base);
+        let endpoint = Arc::clone(endpoint);
+        let account = account.clone();
+        let cap = Duration::from_secs(OVERLAY_TICK_BUDGET_SECS);
+        // The key is moved into the task (used for the request, never logged).
+        tasks.spawn(async move {
+            let result = match tokio::time::timeout(cap, endpoint.fetch(&key)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(AppError::Overlay(
+                    "zai quota fetch exceeded budget".to_string(),
+                )),
+            };
+            ZaiOverlayOutcome {
+                account,
+                backoff_current,
+                result,
+            }
+        });
+    }
+}
+
+/// Harvest one z.ai quota fetch on the loop task: parse → authoritative limits → merge + persist
+/// (degrading to derived on error), and advance the 429 backoff / cooldown — the zai twin of
+/// [`apply_codex_overlay_outcome`]. Single writer — the only zai-overlay `Store` writes.
+fn apply_zai_overlay_outcome(
+    cfg: &Config,
+    store: &Store,
+    state: &mut OverlayState,
+    alerts: &mut AlertTracker,
+    outcome: ZaiOverlayOutcome,
+) {
+    // Harvest guard: drop a fetch that landed after a reload removed/deactivated this account (§A).
+    if !present_and_active(cfg, &outcome.account.id) {
+        return;
+    }
+    let base = cfg.settings.poll_overlay_secs.max(1);
+    let ZaiOverlayOutcome {
+        account,
+        backoff_current,
+        result,
+    } = outcome;
+    let now = Timestamp::now();
+    let parsed = result.and_then(|body| {
+        parse_quota_response(
+            &body,
+            &account.id,
+            cfg.settings.warn_pct,
+            cfg.settings.crit_pct,
+        )
+    });
+    match parsed {
+        Ok(authoritative) if !authoritative.is_empty() => {
+            apply_authoritative_limits(
+                cfg,
+                store,
+                &account.id,
+                authoritative,
+                now,
+                alerts,
+                "zai overlay",
+            );
+            state.note_success(&account.id, backoff_current, base);
+        }
+        // Defensive-only: `parse_quota_response` returns `Err` (not `Ok(vec![])`) when neither
+        // expected `TOKENS_LIMIT` entry is present, so this arm is unreachable given its current
+        // contract — kept only as a guard against that contract changing underfoot.
+        Ok(_) => {}
+        Err(e) => {
+            state.note_throttled(&account.id, backoff_current, base);
+            let _ = store.mark_overlay_failing(&account.id, now.as_millisecond());
+            eprintln!("collector: [{}] zai overlay fetch failed: {e}", account.id);
         }
     }
 }
@@ -1065,6 +1228,7 @@ mod tests {
     use crate::domain::{Provenance, Provider};
     use crate::providers::claude::overlay::{Canned, CannedEndpoint};
     use crate::providers::codex::rate_limits::CannedSource;
+    use crate::providers::zai::quota::{Canned as ZaiCanned, CannedEndpoint as ZaiCannedEndpoint};
     use async_trait::async_trait;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1075,6 +1239,15 @@ mod tests {
     fn idle_rate_source() -> CannedSource {
         CannedSource {
             response: String::new(),
+        }
+    }
+
+    /// A never-invoked z.ai quota endpoint for the non-zai collector tests: no zai account is
+    /// configured, so `spawn_zai_overlay_fetches` never calls it — only threaded to satisfy
+    /// `run_collector`'s `Z` generic.
+    fn idle_zai_endpoint() -> ZaiCannedEndpoint {
+        ZaiCannedEndpoint {
+            canned: ZaiCanned::Fail,
         }
     }
 
@@ -1278,7 +1451,8 @@ mod tests {
             id: id.to_string(),
             label: id.to_uppercase(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/tmp"),
+            config_dir: Some(PathBuf::from("/tmp")),
+            api_key_env: None,
             color: None,
             active: true,
             limits_overlay: false,
@@ -1317,6 +1491,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1360,6 +1535,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1433,6 +1609,7 @@ mod tests {
             IdleAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1476,7 +1653,7 @@ mod tests {
 
         let mut acct = account("personal");
         acct.limits_overlay = true;
-        acct.config_dir = creds_dir.path().to_path_buf();
+        acct.config_dir = Some(creds_dir.path().to_path_buf());
         let cfg = config(vec![acct]);
 
         let body = br#"{"five_hour":{"utilization":19.0,"resets_at":"2026-07-04T12:00:00Z"},
@@ -1491,6 +1668,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1542,6 +1720,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1580,7 +1759,7 @@ mod tests {
         }
         let mut acct = account(id);
         acct.limits_overlay = true;
-        acct.config_dir = dir.to_path_buf();
+        acct.config_dir = Some(dir.to_path_buf());
         acct
     }
 
@@ -1629,6 +1808,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1673,7 +1853,7 @@ mod tests {
         }
         let mut stale_acct = account("stale");
         stale_acct.limits_overlay = true;
-        stale_acct.config_dir = stale_dir.path().to_path_buf();
+        stale_acct.config_dir = Some(stale_dir.path().to_path_buf());
 
         let warm_dir = tempfile::tempdir().expect("warm dir");
         let warm_acct = opted_in_account("warm", warm_dir.path());
@@ -1750,6 +1930,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1771,7 +1952,8 @@ mod tests {
             id: id.to_string(),
             label: id.to_uppercase(),
             provider: Provider::Codex,
-            config_dir: dir.to_path_buf(),
+            config_dir: Some(dir.to_path_buf()),
+            api_key_env: None,
             color: None,
             active: true,
             limits_overlay: true,
@@ -1812,6 +1994,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             source,
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1876,6 +2059,7 @@ mod tests {
             IdleAdapter,
             endpoint,
             source,
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1895,6 +2079,237 @@ mod tests {
         assert!(
             store.latest_limits("codex").expect("query").is_empty(),
             "a failing fetch must land no authoritative limits"
+        );
+    }
+
+    // ── spec 019 §D (AC4) — z.ai overlay integration, exercised directly via spawn/apply (also
+    // wired into `run_collector`'s select! loop as its 4th JoinSet arm, see above) ────────────────
+
+    /// An opted-in zai account whose `api_key_env` names `env_var`. Its actual presence in the real
+    /// process environment is up to each test (unique names avoid parallel-test collisions).
+    fn zai_account(id: &str, env_var: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            label: id.to_uppercase(),
+            provider: Provider::Zai,
+            config_dir: None,
+            api_key_env: Some(env_var.to_string()),
+            color: None,
+            active: true,
+            limits_overlay: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn opted_in_zai_account_produces_limits_on_the_overlay_pass() {
+        // Encodes the end-to-end shape (spec 019 AC4): an opted-in zai account with a present key
+        // and a 200 response lands Session + WeeklyAll limits via the real `parse_quota_response`
+        // mapping (`providers::zai::quota`).
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = Store::open(&store_dir.path().join("t.db")).expect("open store");
+        let env_var = "TOK_TEST_ZAI_KEY_OPTED_IN";
+        std::env::set_var(env_var, "fake-key-never-logged");
+        let cfg = config(vec![zai_account("zai-lite", env_var)]);
+        store.upsert_accounts(&cfg.accounts).expect("upsert");
+
+        let endpoint = Arc::new(ZaiCannedEndpoint {
+            canned: ZaiCanned::Body(
+                br#"{"data":{"limits":[
+                    {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":42},
+                    {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":81,"nextResetTime":1784713715974}
+                ]}}"#
+                    .to_vec(),
+            ),
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
+        spawn_zai_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        while let Some(joined) = tasks.join_next().await {
+            apply_zai_overlay_outcome(&cfg, &store, &mut state, &mut alerts, joined.expect("join"));
+        }
+
+        std::env::remove_var(env_var);
+        let limits = store.latest_limits("zai-lite").expect("query");
+        assert!(
+            !limits.is_empty(),
+            "an opted-in zai account with a 200 response should produce Session + WeeklyAll limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_opted_in_zai_account_is_skipped_with_no_fetch() {
+        let mut acct = zai_account("zai-lite", "TOK_TEST_ZAI_KEY_NOT_OPTED_IN");
+        acct.limits_overlay = false;
+        std::env::set_var("TOK_TEST_ZAI_KEY_NOT_OPTED_IN", "fake-key-never-logged");
+        let cfg = config(vec![acct]);
+
+        let endpoint = Arc::new(ZaiCannedEndpoint {
+            canned: ZaiCanned::Fail,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
+        spawn_zai_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        std::env::remove_var("TOK_TEST_ZAI_KEY_NOT_OPTED_IN");
+        assert_eq!(
+            tasks.len(),
+            0,
+            "an un-opted-in zai account must never be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_var_missing_zai_account_is_skipped_with_no_fetch() {
+        // Deliberately never set — the eligibility check must reject an absent/empty env var, not
+        // just an opted-out account.
+        let acct = zai_account("zai-lite", "TOK_TEST_ZAI_KEY_DOES_NOT_EXIST");
+        let cfg = config(vec![acct]);
+
+        let endpoint = Arc::new(ZaiCannedEndpoint {
+            canned: ZaiCanned::Fail,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
+        spawn_zai_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        assert_eq!(
+            tasks.len(),
+            0,
+            "a zai account whose env var is unset must never be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn zai_overlay_pass_never_touches_claude_or_codex_accounts() {
+        // claude/codex collection stays byte-identical: `spawn_zai_overlay_fetches` must only ever
+        // pick up `Provider::Zai` accounts, even when a claude/codex sibling is also opted in.
+        let env_var = "TOK_TEST_ZAI_KEY_MIXED_FLEET";
+        std::env::set_var(env_var, "fake-key-never-logged");
+        let mut claude_acct = account("claude-acct");
+        claude_acct.limits_overlay = true;
+        let cfg = config(vec![claude_acct, zai_account("zai-lite", env_var)]);
+
+        let endpoint = Arc::new(ZaiCannedEndpoint {
+            canned: ZaiCanned::Fail,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
+        spawn_zai_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        std::env::remove_var(env_var);
+        assert_eq!(tasks.len(), 1, "only the zai account is fetched");
+        let outcome = tasks.join_next().await.expect("one task").expect("join");
+        assert_eq!(outcome.account.id, "zai-lite");
+    }
+
+    #[tokio::test]
+    async fn zai_overlay_failure_backs_off_and_demotes_stale_authoritative_to_estimate() {
+        // spec 019 AC3 (the ERROR path, end to end): a failing zai overlay fetch must (a) advance
+        // backoff/cooldown, (b) mark the account overlay-failing, and (c) — once the failure persists
+        // past the TTL — demote the account's now-stale authoritative limits to `Estimate` on the next
+        // re-evaluation. Same machinery, same posture as the Codex twin
+        // (`failing_codex_overlay_fetch_marks_the_account_failing`) plus the TTL-demotion half that
+        // twin doesn't itself assert (covered generically by `stale_overlay_demotes_authoritative_to_
+        // derived_via_apply_limits` above — this pins it for zai specifically, per the contract).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_ZAI_KEY_FAILURE_BACKOFF";
+        std::env::set_var(env_var, "fake-key-never-logged");
+        let cfg = config(vec![zai_account("zai-lite", env_var)]);
+        store.upsert_accounts(&cfg.accounts).expect("upsert");
+
+        // Seed an authoritative set from a "previous" successful overlay pass, recorded long ago.
+        let seeded = "2026-07-04T10:00:00Z".parse::<Timestamp>().unwrap();
+        store
+            .set_limits(
+                "zai-lite",
+                &[
+                    Limit {
+                        account_id: "zai-lite".to_string(),
+                        provider: Provider::Zai,
+                        kind: crate::domain::LimitKind::Session,
+                        scope: None,
+                        utilization_pct: 42.0,
+                        resets_at: String::new(),
+                        severity: Severity::Ok,
+                        source: Provenance::Authoritative,
+                    },
+                    Limit {
+                        account_id: "zai-lite".to_string(),
+                        provider: Provider::Zai,
+                        kind: crate::domain::LimitKind::WeeklyAll,
+                        scope: None,
+                        utilization_pct: 81.0,
+                        resets_at: "2026-07-10T00:00:00Z".to_string(),
+                        severity: Severity::Ok,
+                        source: Provenance::Authoritative,
+                    },
+                ],
+                seeded,
+            )
+            .expect("seed");
+        store
+            .record_overlay_success("zai-lite", seeded.as_millisecond())
+            .expect("record");
+
+        // Drive one failing fetch through the real spawn + harvest path (a 429, same as an exhausted
+        // key or dead subscription would produce).
+        let endpoint = Arc::new(ZaiCannedEndpoint {
+            canned: ZaiCanned::RateLimited,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
+        spawn_zai_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        while let Some(joined) = tasks.join_next().await {
+            apply_zai_overlay_outcome(&cfg, &store, &mut state, &mut alerts, joined.expect("join"));
+        }
+
+        // (a) backoff/cooldown advanced for the account.
+        let base = cfg.settings.poll_overlay_secs.max(1);
+        assert!(
+            state.backoff_secs.get("zai-lite").copied().unwrap_or(base) > base,
+            "a failed fetch must grow the account's backoff: {:?}",
+            state.backoff_secs
+        );
+        assert!(
+            state.cooldown_ticks.get("zai-lite").copied().unwrap_or(0) > 0,
+            "a failed fetch must set a cooldown: {:?}",
+            state.cooldown_ticks
+        );
+
+        // (b) the account is marked overlay-failing.
+        assert!(
+            store
+                .overlay_failing_since("zai-lite")
+                .expect("query")
+                .is_some(),
+            "a failing zai overlay fetch must pin the failing-since marker"
+        );
+
+        // The seeded authoritative limits are untouched immediately after the failure — the TTL
+        // hasn't elapsed yet, so nothing demotes prematurely.
+        let limits = store.latest_limits("zai-lite").expect("query");
+        assert!(
+            !limits.is_empty() && limits.iter().all(|l| l.source == Provenance::Authoritative),
+            "the stale set must not demote before the TTL elapses: {limits:?}"
+        );
+
+        // (c) once the last overlay success ages past the TTL, the next re-evaluation demotes the
+        // stale authoritative set to Estimate (spec 011 §C — provider-agnostic demotion).
+        let ttl = cfg
+            .settings
+            .poll_overlay_secs
+            .saturating_mul(OVERLAY_TTL_FACTOR);
+        let past_ttl = "2026-07-04T10:30:00Z".parse::<Timestamp>().unwrap(); // 30 min > 10 min ttl
+        reevaluate_limits(&store, "zai-lite", past_ttl, &mut alerts, ttl);
+
+        let demoted = store.latest_limits("zai-lite").expect("query");
+        assert!(
+            !demoted.is_empty() && demoted.iter().all(|l| l.source == Provenance::Estimate),
+            "the stale authoritative zai limits must demote to Estimate past the TTL: {demoted:?}"
         );
     }
 
@@ -1932,6 +2347,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1988,6 +2404,7 @@ mod tests {
             FakeAdapter,
             endpoint,
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2102,6 +2519,7 @@ mod tests {
                 fetches: Arc::clone(&fetches),
             },
             idle_rate_source(),
+            idle_zai_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_mins(1)).await;

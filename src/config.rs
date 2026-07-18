@@ -13,14 +13,16 @@
 //!
 //! Design constraints:
 //! - `validate` performs no I/O so the whole rule set is table-testable.
-//! - The account list is the single source of truth; each account owns its `CLAUDE_CONFIG_DIR`.
+//! - The account list is the single source of truth; each account owns its `CLAUDE_CONFIG_DIR` /
+//!   `CODEX_HOME` (claude/codex) or `api_key_env` (zai) — `validate` enforces which per provider
+//!   (spec 019 §A).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::domain::Account;
+use crate::domain::{Account, Provider};
 use crate::error::{AppError, AppResult};
 
 /// Parsed `tokenomics.toml`.
@@ -118,7 +120,9 @@ impl Config {
             toml::from_str(text).map_err(|e| AppError::ConfigParse(e.to_string()))?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         for account in &mut cfg.accounts {
-            account.config_dir = expand_tilde(&account.config_dir, home.as_deref());
+            if let Some(dir) = &account.config_dir {
+                account.config_dir = Some(expand_tilde(dir, home.as_deref()));
+            }
         }
         Ok(cfg)
     }
@@ -206,6 +210,7 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
                 )));
             }
         }
+        findings.extend(validate_provider_fields(account));
     }
     let s = &cfg.settings;
     if s.crit_pct <= s.warn_pct {
@@ -229,16 +234,58 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
     findings
 }
 
-/// Filesystem checks kept separate so [`validate`] stays pure: each `config_dir` must exist.
+/// Per-provider account-field validation (spec 019 §A): `claude`/`codex` require `config_dir` and
+/// reject `api_key_env`; `zai` requires `api_key_env` (a non-empty env-var NAME) and leaves
+/// `config_dir` optional (accepted but unused this wave). Pure — no I/O, no env-var reads.
+fn validate_provider_fields(account: &Account) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    match account.provider {
+        Provider::Claude | Provider::Codex => {
+            if account.config_dir.is_none() {
+                findings.push(Finding::error(format!(
+                    "account '{}': config_dir is required for provider '{}'",
+                    account.id, account.provider
+                )));
+            }
+            if account.api_key_env.is_some() {
+                findings.push(Finding::error(format!(
+                    "account '{}': api_key_env is not used by provider '{}'",
+                    account.id, account.provider
+                )));
+            }
+        }
+        Provider::Zai => {
+            let missing = account
+                .api_key_env
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty());
+            if missing {
+                findings.push(Finding::error(format!(
+                    "account '{}': api_key_env is required for provider 'zai'",
+                    account.id
+                )));
+            }
+        }
+    }
+    findings
+}
+
+/// Filesystem checks kept separate so [`validate`] stays pure: each account whose provider
+/// requires a `config_dir` (claude/codex — see [`validate_provider_fields`]) must have one that
+/// exists. A zai account's `config_dir` is accepted but unused this wave (spec 019 §A), so it is
+/// never existence-checked here even when provided — a placeholder value for a future GLM lane
+/// must not hard-fail environment validation for a field nothing reads.
 pub fn validate_environment(cfg: &Config) -> Vec<Finding> {
     cfg.accounts
         .iter()
-        .filter(|a| !a.config_dir.is_dir())
-        .map(|a| {
+        .filter(|a| matches!(a.provider, Provider::Claude | Provider::Codex))
+        .filter_map(|a| a.config_dir.as_ref().map(|dir| (a, dir)))
+        .filter(|(_, dir)| !dir.is_dir())
+        .map(|(a, dir)| {
             Finding::error(format!(
                 "account '{}': config_dir {} does not exist",
                 a.id,
-                a.config_dir.display()
+                dir.display()
             ))
         })
         .collect()
@@ -405,5 +452,165 @@ config_dir = \"/tmp\"
             cfg.settings.ledger_path.as_deref(),
             Some("/home/example/ledger/subscriptions.toml")
         );
+    }
+
+    // ── spec 019 §A (AC1): "zai" round-trips; per-provider config_dir/api_key_env validation ────
+
+    const ZAI: &str = "\
+[[account]]
+id = \"zai-lite\"
+label = \"z.ai GLM Lite\"
+provider = \"zai\"
+api_key_env = \"Z_AI_CODING_KEY\"
+";
+
+    #[test]
+    fn zai_round_trips_provider_id() {
+        assert_eq!(Provider::parse("zai"), Some(Provider::Zai));
+        assert_eq!(Provider::Zai.as_str(), "zai");
+    }
+
+    #[test]
+    fn zai_account_parses_with_no_config_dir_and_a_named_api_key_env() {
+        let cfg = Config::parse(ZAI).expect("parses");
+        assert_eq!(cfg.accounts[0].provider, Provider::Zai);
+        assert_eq!(cfg.accounts[0].config_dir, None);
+        assert_eq!(
+            cfg.accounts[0].api_key_env.as_deref(),
+            Some("Z_AI_CODING_KEY")
+        );
+        assert!(
+            validate(&cfg).is_empty(),
+            "a well-formed zai account must validate clean: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn zai_account_accepts_an_optional_unused_config_dir() {
+        let toml = format!("{ZAI}config_dir = \"/tmp\"\n");
+        let cfg = Config::parse(&toml).expect("parses");
+        assert_eq!(
+            cfg.accounts[0].config_dir.as_deref(),
+            Some(Path::new("/tmp"))
+        );
+        assert!(validate(&cfg).is_empty());
+    }
+
+    #[test]
+    fn zai_account_without_api_key_env_fails_validation_naming_the_account() {
+        let toml = "\
+[[account]]
+id = \"zai-lite\"
+label = \"z.ai GLM Lite\"
+provider = \"zai\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("zai-lite") && m.contains("api_key_env")),
+            "must name the account and the missing field: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn zai_account_with_empty_api_key_env_fails_validation() {
+        let toml = format!("{}\n", ZAI.replace("Z_AI_CODING_KEY", "   "));
+        let cfg = Config::parse(&toml).expect("parses");
+        assert!(validate(&cfg)
+            .iter()
+            .any(|f| f.message.contains("api_key_env")));
+    }
+
+    #[test]
+    fn claude_account_without_config_dir_fails_validation_naming_the_account() {
+        let toml = "\
+[[account]]
+id = \"claude-work\"
+label = \"Work\"
+provider = \"claude\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("claude-work") && m.contains("config_dir")),
+            "must name the account and the missing field: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn codex_account_without_config_dir_fails_validation() {
+        let toml = "\
+[[account]]
+id = \"codex-work\"
+label = \"Work\"
+provider = \"codex\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert!(validate(&cfg)
+            .iter()
+            .any(|f| f.message.contains("config_dir")));
+    }
+
+    #[test]
+    fn claude_account_with_api_key_env_fails_validation() {
+        let toml = "\
+[[account]]
+id = \"claude-work\"
+label = \"Work\"
+provider = \"claude\"
+config_dir = \"/tmp\"
+api_key_env = \"SOME_KEY\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert!(validate(&cfg)
+            .iter()
+            .any(|f| f.message.contains("api_key_env")));
+    }
+
+    #[test]
+    fn codex_account_with_api_key_env_fails_validation() {
+        let toml = "\
+[[account]]
+id = \"codex-work\"
+label = \"Work\"
+provider = \"codex\"
+config_dir = \"/tmp\"
+api_key_env = \"SOME_KEY\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert!(validate(&cfg)
+            .iter()
+            .any(|f| f.message.contains("api_key_env")));
+    }
+
+    #[test]
+    fn validate_environment_never_checks_a_zai_accounts_absent_config_dir() {
+        // A zai account with no config_dir at all must not be flagged as a "missing directory" —
+        // that filesystem check only applies to providers that require the field (claude/codex).
+        let cfg = Config::parse(ZAI).expect("parses");
+        assert!(validate_environment(&cfg).is_empty());
+    }
+
+    #[test]
+    fn validate_environment_never_checks_a_zai_accounts_provided_but_nonexistent_config_dir() {
+        // zai's config_dir is accepted-but-unused this wave — a placeholder value that happens not
+        // to exist must not hard-fail environment validation for a field nothing reads.
+        let toml = format!("{ZAI}config_dir = \"/nonexistent/path/for/a/future/glm/lane\"\n");
+        let cfg = Config::parse(&toml).expect("parses");
+        assert!(validate_environment(&cfg).is_empty());
+    }
+
+    #[test]
+    fn existing_claude_and_codex_accounts_still_validate_and_round_trip_unchanged() {
+        // Existing tests already cover parsing; this pins the validation side post-scaffolding —
+        // a pre-spec-019 config (Some(config_dir), no api_key_env) must validate clean for both.
+        let cfg = Config::parse(ONE).expect("parses");
+        assert!(validate(&cfg).is_empty());
+        let codex_toml = ONE.replace("claude", "codex");
+        let codex_cfg = Config::parse(&codex_toml).expect("parses");
+        assert!(validate(&codex_cfg).is_empty());
     }
 }

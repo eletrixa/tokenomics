@@ -3,7 +3,7 @@
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/doctor.rs
 //! Deps:    jiff; runner (ccusage/codex version), providers::claude (adapter/creds/overlay),
-//!          providers::codex (app-server rate-limits probe)
+//!          providers::codex (app-server rate-limits probe), providers::zai (quota probe)
 //! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
 //!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
 //!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8); the
@@ -16,6 +16,9 @@
 //!   its overlay probe skipped, spec 014 §D).
 //! - Per Codex account: config_dir + `sessions/` present; `auth.json` present (existence only);
 //!   `codex --version`; app-server reachability (only if opted-in AND active) (spec 013 §D).
+//! - Per zai account: `api_key_env` NAME + presence (never the value); quota-endpoint reachability
+//!   (only if opted-in AND active); the monthly MCP-tool quota (`TIME_LIMIT`) informational note —
+//!   it has no gauge home, so this is its only surface (spec 019 §D).
 //! - Cross-account (Claude only): `CLAUDE_CONFIG_DIR` round-trip distinctness + shared-`projects/`.
 //! - Ledger plane (spec 017 §E): resolved path + provenance (`"ledger: not configured"` when `Off`);
 //!   past-dated rows (`renews`/`paid_through` already behind `today`); failed-parse rows with reason;
@@ -91,6 +94,9 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
                 }
             }
             Provider::Codex => report_codex(account).await,
+            Provider::Zai => {
+                report_zai(account, cfg.settings.warn_pct, cfg.settings.crit_pct).await;
+            }
         }
     }
 
@@ -370,13 +376,19 @@ fn ledger_join_divergence(
 /// and — only when active AND opted-in — an app-server reachability probe (spec 013 §D). Attribution
 /// is the account's `CODEX_HOME` (its `config_dir`), never the logs.
 async fn report_codex(account: &crate::domain::Account) {
-    let sessions_marker = if account.config_dir.join("sessions").is_dir() {
+    // Validation (spec 019 §A) guarantees a Codex account always carries a config_dir; this is a
+    // defensive early return, never a panic, if that guarantee is ever violated upstream.
+    let Some(config_dir) = account.config_dir.as_deref() else {
+        println!("  sessions/:   n/a (no config_dir)");
+        return;
+    };
+    let sessions_marker = if config_dir.join("sessions").is_dir() {
         "present"
     } else {
         "MISSING (idle until Codex writes a rollout)"
     };
     println!("  sessions/:   {sessions_marker}");
-    let auth_marker = if account.config_dir.join("auth.json").exists() {
+    let auth_marker = if config_dir.join("auth.json").exists() {
         "present"
     } else {
         "MISSING (run `codex login`)"
@@ -408,9 +420,70 @@ async fn codex_version() -> String {
 /// Probe `codex app-server account/rateLimits/read` for an opted-in Codex account (spec 013 §C).
 /// Read-only; reports reachable/error only — the raw response is NEVER dumped (auth could surface).
 async fn report_codex_overlay(account: &crate::domain::Account) {
+    let Some(config_dir) = account.config_dir.as_deref() else {
+        println!("  overlay:     skipped — no config_dir");
+        return;
+    };
     let client = AppServerClient::new(Duration::from_secs(DOCTOR_TIMEOUT_SECS));
-    match client.fetch(&account.config_dir).await {
+    match client.fetch(config_dir).await {
         Ok(_) => println!("  overlay:     reachable (codex app-server answered rateLimits)"),
+        Err(e) => println!("  overlay:     {e}"),
+    }
+}
+
+/// z.ai diagnostics for one account (read-only, spec 019 §D): env-var NAME + presence (never the
+/// value), an endpoint reachability probe when opted-in AND active, and the monthly MCP-quota
+/// (`TIME_LIMIT`) informational note — it has no gauge home, so `doctor` is the only place it
+/// surfaces. Mirrors the Claude/Codex overlay-gate shape (probe only opted-in AND active).
+async fn report_zai(account: &crate::domain::Account, warn_pct: f64, crit_pct: f64) {
+    match account.api_key_env.as_deref() {
+        Some(name) => {
+            let key = crate::providers::zai::resolve_api_key(account);
+            match &key {
+                Ok(_) => println!("  api_key_env: {name} [present]"),
+                // `reason` already names `name` (e.g. "{name} is not set") — printing it again would
+                // just repeat the var name with no new information.
+                Err(_) => println!("  api_key_env: {name} [MISSING]"),
+            }
+            if !account.limits_overlay {
+                // not opted in — no overlay line
+            } else if !account.active {
+                println!("  overlay:     skipped — account inactive");
+            } else {
+                match key {
+                    Ok(key) => report_zai_overlay(&key, &account.id, warn_pct, crit_pct).await,
+                    Err(reason) => println!("  overlay:     skipped — {reason}"),
+                }
+            }
+        }
+        // Validation (spec 019 §A) should already have refused this config; report it rather than
+        // panic if that guarantee is ever violated upstream.
+        None => println!("  api_key_env: MISSING (zai requires api_key_env)"),
+    }
+    println!("  mcp quota:   TIME_LIMIT (monthly MCP-tool quota) is informational only — no gauge");
+}
+
+/// Probe the z.ai quota endpoint for an opted-in, present-key account (single GET), then run the
+/// body through `parse_quota_response` so `doctor` reports what the parser actually extracted.
+/// Read-only; the key is held only for this call and never printed.
+async fn report_zai_overlay(api_key: &str, account_id: &str, warn_pct: f64, crit_pct: f64) {
+    use crate::providers::zai::quota::{parse_quota_response, HttpQuotaEndpoint, QuotaEndpoint};
+    let endpoint = match HttpQuotaEndpoint::new() {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            println!("  overlay:     client error: {e}");
+            return;
+        }
+    };
+    match endpoint.fetch(api_key).await {
+        Ok(bytes) => match parse_quota_response(&bytes, account_id, warn_pct, crit_pct) {
+            Ok(limits) => println!(
+                "  overlay:     reachable (HTTP 200, {} bytes, {} limit(s) parsed)",
+                bytes.len(),
+                limits.len()
+            ),
+            Err(e) => println!("  overlay:     reachable but unparsable: {e}"),
+        },
         Err(e) => println!("  overlay:     {e}"),
     }
 }
@@ -426,7 +499,9 @@ fn report_shared_projects(cfg: &Config) {
         .iter()
         .filter(|a| a.provider == Provider::Claude)
         .filter_map(|a| {
-            std::fs::canonicalize(a.config_dir.join("projects"))
+            // Validation (spec 019 §A) guarantees a Claude account always carries a config_dir.
+            let dir = a.config_dir.as_deref()?;
+            std::fs::canonicalize(dir.join("projects"))
                 .ok()
                 .map(|real| (a.id.clone(), real))
         })
@@ -457,16 +532,25 @@ fn shared_projects_groups(resolved: &[(String, PathBuf)]) -> Vec<Vec<String>> {
 }
 
 fn report_config_dir(account: &crate::domain::Account) {
-    let marker = if account.config_dir.is_dir() {
-        "exists"
-    } else {
-        "MISSING"
-    };
-    println!("  config_dir:  {} [{marker}]", account.config_dir.display());
+    match &account.config_dir {
+        Some(dir) => {
+            let marker = if dir.is_dir() { "exists" } else { "MISSING" };
+            println!("  config_dir:  {} [{marker}]", dir.display());
+        }
+        // Unused-but-optional (zai, spec 019 §A) — not an error; the account's identity is
+        // `api_key_env` instead, reported by `report_zai`.
+        None => println!("  config_dir:  n/a (not used by this provider)"),
+    }
 }
 
 fn report_credentials(account: &crate::domain::Account, now_ms: i64) {
-    match creds::read_token(&account.config_dir) {
+    // Validation (spec 019 §A) guarantees a Claude account always carries a config_dir; this is a
+    // defensive early return, never a panic, if that guarantee is ever violated upstream.
+    let Some(config_dir) = account.config_dir.as_deref() else {
+        println!("  credentials: n/a (no config_dir)");
+        return;
+    };
+    match creds::read_token(config_dir) {
         Ok(token) => {
             let state = if token.is_warm(now_ms) {
                 "warm"
@@ -512,7 +596,11 @@ async fn report_ccusage<R: Runner>(
 
 /// Probe the overlay for an opted-in account (single GET). Read-only; the token is never printed.
 async fn report_overlay(account: &crate::domain::Account, now_ms: i64) {
-    let token = match creds::read_token(&account.config_dir) {
+    let Some(config_dir) = account.config_dir.as_deref() else {
+        println!("  overlay:     skipped — no config_dir");
+        return;
+    };
+    let token = match creds::read_token(config_dir) {
         Ok(token) => token,
         Err(e) => {
             println!("  overlay:     skipped — {e}");

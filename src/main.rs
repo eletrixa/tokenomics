@@ -9,8 +9,8 @@
 //! Key responsibilities:
 //! - Parse `tok` subcommands: (default) tui | init | validate | accounts | once | collector | doctor.
 //! - `init`: write the embedded starter `tokenomics.example.toml` to the config path (never clobbers).
-//! - `once`: collect one snapshot per account (dispatched to the Claude/Codex adapter by provider)
-//!   and print it (human/JSON).
+//! - `once`: collect one snapshot per account (dispatched to the Claude/Codex/Zai adapter by
+//!   provider) and print it (human/JSON).
 //!
 //! Design constraints:
 //! - `unsafe_code = "forbid"` is crate policy (Cargo `[lints]`); never reach for unsafe.
@@ -50,6 +50,8 @@ use providers::claude::overlay::HttpUsageEndpoint;
 use providers::claude::ClaudeAdapter;
 use providers::codex::rate_limits::AppServerClient;
 use providers::codex::CodexAdapter;
+use providers::zai::quota::HttpQuotaEndpoint;
+use providers::zai::ZaiAdapter;
 use providers::{ProviderAdapter, ProviderRegistry};
 use runner::Exec;
 use store::Store;
@@ -189,12 +191,13 @@ fn cmd_accounts() -> ExitCode {
             "overlay:off"
         };
         let inactive = if account.active { "" } else { "  (inactive)" };
+        let config_dir = account
+            .config_dir
+            .as_deref()
+            .map_or_else(|| "-".to_string(), |d| d.display().to_string());
         println!(
             "{}  {}  [{}]  {}  {overlay}{inactive}",
-            account.id,
-            account.label,
-            account.provider,
-            account.config_dir.display()
+            account.id, account.label, account.provider, config_dir
         );
     }
     ExitCode::SUCCESS
@@ -257,15 +260,17 @@ async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
     let invocation = CcusageInvocation::from_override(cfg.settings.ccusage_cmd.as_deref());
     let claude = ClaudeAdapter::new(Exec, invocation, Duration::from_secs(CCUSAGE_TIMEOUT_SECS));
     let codex = CodexAdapter::new();
+    let zai = ZaiAdapter::new();
     let now = Timestamp::now();
     let (warn, crit) = (cfg.settings.warn_pct, cfg.settings.crit_pct);
     let mut records = Vec::with_capacity(cfg.accounts.len());
     for account in cfg.accounts.iter().filter(|a| a.active) {
-        // Both adapters run through the same `collect_record`; Codex snapshots carry no window, so
-        // `derive_session_limit` naturally yields `None` — no derived session for Codex (spec 013).
+        // All adapters run through the same `collect_record`; a windowless snapshot (Codex) or an
+        // always-idle one (zai) naturally yields no derived session limit (specs 013, 019 §C).
         let record = match account.provider {
             Provider::Claude => collect_record(&claude, account, now, warn, crit).await,
             Provider::Codex => collect_record(&codex, account, now, warn, crit).await,
+            Provider::Zai => collect_record(&zai, account, now, warn, crit).await,
         };
         records.push(record);
     }
@@ -384,9 +389,11 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
         let adapter = ProviderRegistry {
             claude,
             codex: CodexAdapter::new(),
+            zai: ZaiAdapter::new(),
         };
         let endpoint = HttpUsageEndpoint::new()?;
         let rate_source = AppServerClient::new(Duration::from_secs(CODEX_APP_SERVER_TIMEOUT_SECS));
+        let zai_endpoint = HttpQuotaEndpoint::new()?;
         let overlay_on = cfg.accounts.iter().filter(|a| a.limits_overlay).count();
         println!(
             "collector: watching {} account(s) every {}s ({overlay_on} with overlay) → {} (Ctrl-C to stop)",
@@ -400,6 +407,7 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
             adapter,
             endpoint,
             rate_source,
+            zai_endpoint,
             store,
             collector::shutdown_signal(),
         )
@@ -557,7 +565,8 @@ mod tests {
             provider: Provider::Claude,
             // A nonexistent dir is fine: `collect_record` isolates the error into the record rather
             // than hanging — the test only cares whether a record is produced at all.
-            config_dir: PathBuf::from("/nonexistent-tokenomics-test-dir"),
+            config_dir: Some(PathBuf::from("/nonexistent-tokenomics-test-dir")),
+            api_key_env: None,
             color: None,
             active,
             limits_overlay: false,
@@ -606,5 +615,25 @@ mod tests {
             records[0].session_limit.is_none(),
             "no derived session limit for Codex"
         );
+    }
+
+    #[tokio::test]
+    async fn collect_once_dispatches_zai_as_always_idle() {
+        // A zai account has no config_dir and no local usage lane this wave (spec 019 §C): `once`
+        // produces a real record with NO error, no snapshot, and no derived session limit.
+        let mut zai = account("zai", true);
+        zai.provider = Provider::Zai;
+        zai.config_dir = None;
+        zai.api_key_env = Some("Z_AI_TEST_KEY_MAIN".to_string());
+        let cfg = Config {
+            settings: config::Settings::default(),
+            accounts: vec![zai],
+        };
+        let records = collect_once(&cfg).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].provider, Provider::Zai);
+        assert!(records[0].error.is_none(), "always idle, never an error");
+        assert!(records[0].snapshot.is_none(), "no usage lane ⇒ no snapshot");
+        assert!(records[0].session_limit.is_none());
     }
 }

@@ -7,14 +7,16 @@
 //!          (claude/ccusage, codex/sessions); Limit via providers/*/ (overlay, codex/rate_limits)
 //!
 //! Key responsibilities:
-//! - `Provider`: the exhaustive provider enum (Claude now; Codex/Gemini/Grok slot in later).
-//! - `Account`: one monitored subscription account, pinned to its own `CLAUDE_CONFIG_DIR`.
+//! - `Provider`: the exhaustive provider enum (Claude, Codex, Zai now; Gemini/Grok slot in later).
+//! - `Account`: one monitored subscription account. Attribution is `config_dir`
+//!   (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`) for claude/codex, or `api_key_env` for zai (spec 019 §A) —
+//!   exactly one is the identity handle per provider, enforced by `config::validate`.
 //! - `UsageSnapshot` / `Window`: one account's normalized token usage + active 5h window.
 //! - `Limit` / `LimitKind` / `Severity` / `Provenance`: a normalized utilization limit + its badges.
 //!
 //! Design constraints:
 //! - `Provider` stays a compiler-checked enum so adding a provider is an exhaustive change.
-//! - Attribution is the `config_dir`, never the logs (logs carry no account identity).
+//! - Attribution is `config_dir` or `api_key_env`, never the logs (logs carry no account identity).
 //! - `cost_notional` is a labeled proxy, NEVER a bill; limits are `utilization_pct` + `resets_at`,
 //!   never "X of Y". `resets_at` is a string rendered verbatim from its source.
 
@@ -32,6 +34,8 @@ pub enum Provider {
     Claude,
     /// OpenAI Codex (ChatGPT subscription; spec 013).
     Codex,
+    /// z.ai GLM coding plan — limits-only, API-key attributed (spec 019).
+    Zai,
     // Future: Gemini, Grok — add a variant + a providers/<x>/ adapter.
 }
 
@@ -41,6 +45,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Zai => "zai",
         }
     }
 
@@ -49,6 +54,7 @@ impl Provider {
         match s {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "zai" => Some(Self::Zai),
             _ => None,
         }
     }
@@ -60,8 +66,11 @@ impl std::fmt::Display for Provider {
     }
 }
 
-/// One monitored subscription account. `config_dir` is the `CLAUDE_CONFIG_DIR` used both to run
-/// ccusage against this account's logs and to read its credentials — the only attribution handle.
+/// One monitored subscription account. `config_dir` is the `CLAUDE_CONFIG_DIR` / `CODEX_HOME` used
+/// both to run the local usage lane and to read credentials — required for `claude`/`codex`, but
+/// `zai` has no directory-scoped login (its identity is `api_key_env` instead), so the field is
+/// optional and per-provider validation (`config::validate`) enforces which one is required (spec
+/// 019 §A).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
@@ -72,14 +81,21 @@ pub struct Account {
     /// The provider behind this account.
     pub provider: Provider,
     /// The account's config dir (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`; tilde-expanded at parse time).
-    pub config_dir: PathBuf,
+    /// Required for `claude`/`codex`; optional (accepted but unused) for `zai` (spec 019 §A).
+    #[serde(default)]
+    pub config_dir: Option<PathBuf>,
+    /// The env-var NAME (never the value) holding the z.ai API key. Required for `zai`, rejected
+    /// for `claude`/`codex` (spec 019 §A). Never logged, printed, or stored — only the name is.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     /// False marks an unsubscribed/paused account: unmonitored, hidden by default (spec 014).
     #[serde(default = "active_default")]
     pub active: bool,
     /// Optional panel accent color (a named ratatui color or `#rrggbb`).
     #[serde(default)]
     pub color: Option<String>,
-    /// Opt-in to the authoritative `/api/oauth/usage` overlay for this account.
+    /// Opt-in to the authoritative limits overlay for this account (`/api/oauth/usage` for Claude,
+    /// `codex app-server` for Codex, the z.ai quota endpoint for zai).
     #[serde(default)]
     pub limits_overlay: bool,
 }

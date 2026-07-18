@@ -7,6 +7,24 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 ## [Unreleased]
 
 ### ADDED
+- **z.ai (GLM coding plan) is now a monitored, limits-only provider (spec 019).** `Provider::Zai`
+  (`"zai"`) round-trips through config/store/display. `Account.config_dir` is now
+  `Option<PathBuf>` and a new `Account.api_key_env: Option<String>` names (never holds) the env var
+  carrying a z.ai key; per-provider validation enforces `config_dir` for `claude`/`codex` and
+  `api_key_env` for `zai` (existing configs parse and validate unchanged). The `zai` usage adapter is
+  always idle this wave (no local GLM usage lane exists yet) — no invented usage, no fabricated cost.
+  `src/providers/zai/quota.rs` adds the quota-response types, a real `HttpQuotaEndpoint` (bearer-auth
+  GET, mirrors the Claude overlay's HTTP posture), and `parse_quota_response`, which maps the
+  `TOKENS_LIMIT` entries to `Session` (`resets_at = ""`, no fabricated countdown) and `WeeklyAll`
+  (verbatim RFC 3339 from the endpoint's epoch-ms), skips `TIME_LIMIT` and unknown entries, and errors
+  on malformed bodies or both expected entries missing. `tok doctor` reports `api_key_env` presence
+  (name only, never the value), a quota-endpoint reachability probe when opted-in, and an
+  informational note for the monthly MCP-tool quota. `tok accounts` / `tok once --json` stay
+  byte-identical (golden-snapshot enforced). The TUI renders a zai account with the existing
+  provider-agnostic row grammar — session % with no countdown, weekly % with a countdown, no
+  usage/cost row — and the spec-017 ledger clause / spec-018 verified pill unchanged for a matching
+  id. Collector integration (`spawn_zai_overlay_fetches` / `apply_zai_overlay_outcome`) is wired into
+  the daemon loop's `JoinSet`.
 - **Subscription dates from the ledger — a third, read-through-only data plane (spec 017).** A
   git-versioned subscription ledger (external TOML, `id`/`status`/`purchased`/`renews`/
   `cancelled_on`/`paid_through`) already tracks which Max/Codex accounts are active vs. cancelled —

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 
 use crate::domain::{Account, UsageSnapshot};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::providers::ProviderAdapter;
 use crate::runner::Runner;
 
@@ -51,7 +51,15 @@ impl<R: Runner> ClaudeAdapter<R> {
 #[async_trait]
 impl<R: Runner> ProviderAdapter for ClaudeAdapter<R> {
     async fn collect(&self, account: &Account, now: Timestamp) -> AppResult<Option<UsageSnapshot>> {
-        let spec = ccusage_command_spec(&self.invocation, &account.config_dir, self.timeout);
+        // Validation (spec 019 §A) guarantees a claude account always carries a config_dir; this is
+        // a defensive early return, never a panic, if that guarantee is ever violated upstream.
+        let Some(config_dir) = account.config_dir.as_deref() else {
+            return Err(AppError::Credentials(format!(
+                "account '{}': claude requires config_dir",
+                account.id
+            )));
+        };
+        let spec = ccusage_command_spec(&self.invocation, config_dir, self.timeout);
         let bytes = self.runner.run(&spec).await?;
         let parsed = parse_ccusage_blocks(&bytes)?;
         Ok(reduce_snapshot(&parsed, &account.id, account.provider, now))
@@ -72,7 +80,8 @@ mod tests {
             id: "work".to_string(),
             label: "Work".to_string(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/home/user/.claude-work"),
+            config_dir: Some(PathBuf::from("/home/user/.claude-work")),
+            api_key_env: None,
             color: None,
             active: true,
             limits_overlay: false,

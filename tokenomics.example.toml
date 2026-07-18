@@ -22,3 +22,12 @@ limits_overlay = false    # opt-in, OFF by default — see the README overlay no
 # label = "Codex"
 # provider = "codex"
 # config_dir = "~/.codex"
+
+# A third provider — z.ai (GLM coding plan) has no local usage lane yet, so it's limits-only.
+# Uncomment and adjust to monitor a z.ai subscription too:
+# [[account]]
+# id = "zai-lite"
+# label = "z.ai GLM"
+# provider = "zai"
+# api_key_env = "Z_AI_CODING_KEY"  # NAME of the env var holding your z.ai API key — never the key itself
+# limits_overlay = true            # zai has no local usage lane; opt in to see any gauges at all

@@ -1170,7 +1170,8 @@ mod tests {
             id: "personal".to_string(),
             label: "Personal".to_string(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/tmp"),
+            config_dir: Some(PathBuf::from("/tmp")),
+            api_key_env: None,
             color: Some("cyan".to_string()),
             active: true,
             limits_overlay: false,
@@ -1232,6 +1233,101 @@ mod tests {
         assert_eq!(usage.cost_notional, Some(1.7));
         assert_eq!(usage.provenance, Some(Provenance::Derived));
         assert_eq!(usage.tokens_per_minute, None);
+    }
+
+    // ── spec 019 §D (AC5): a zai account renders session % with no countdown, weekly % with a
+    // countdown, and no usage/cost row (it has no local usage lane this wave). The rendering path
+    // itself is provider-agnostic (session/weekly gauges keyed off `LimitKind`, the usage row keyed
+    // off `Option<UsageSnapshot>`) — this pins that the existing generic path already covers a new
+    // provider correctly, with zero zai-specific TUI code.
+
+    #[test]
+    fn zai_account_renders_session_without_countdown_and_weekly_with_countdown_and_no_usage_row() {
+        let zai_account = Account {
+            id: "zai-lite".to_string(),
+            label: "z.ai GLM Lite".to_string(),
+            provider: Provider::Zai,
+            config_dir: None,
+            api_key_env: Some("Z_AI_CODING_KEY".to_string()),
+            color: None,
+            active: true,
+            limits_overlay: true,
+        };
+        let session = Limit {
+            account_id: "zai-lite".to_string(),
+            provider: Provider::Zai,
+            kind: LimitKind::Session,
+            scope: None,
+            utilization_pct: 42.0,
+            resets_at: String::new(), // the rolling 5h window has no reset instant (spec 019 §B)
+            severity: Severity::Ok,
+            source: Provenance::Authoritative,
+        };
+        let weekly = Limit {
+            account_id: "zai-lite".to_string(),
+            provider: Provider::Zai,
+            kind: LimitKind::WeeklyAll,
+            scope: None,
+            utilization_pct: 81.0,
+            resets_at: "2026-07-11T00:00:00Z".to_string(),
+            severity: Severity::Warn,
+            source: Provenance::Authoritative,
+        };
+        let now: Timestamp = "2026-07-04T10:00:00Z".parse().unwrap();
+        let limits = [session, weekly];
+        // Spec 019 §D: the spec-017 ledger clause + spec-018 verified pill are provider-agnostic —
+        // a matching zai-lite ledger row must render its clause and pill exactly like any account.
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.id = "zai-lite".to_string();
+        sub.purchased = Some(jiff::civil::date(2026, 7, 1));
+        sub.renews = Some(jiff::civil::date(2026, 8, 1));
+        sub.verified = Some(jiff::civil::date(2026, 7, 4));
+        let data = AccountData {
+            snapshot: None, // always idle this wave (spec 019 §C) — no usage lane
+            limits: &limits,
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: std::slice::from_ref(&sub),
+            today: jiff::civil::date(2026, 7, 4),
+        };
+        let row = build_account_view(&zai_account, data, now, true);
+
+        assert_eq!(row.title, "z.ai GLM Lite [zai]");
+        assert!(
+            row.sub
+                .full
+                .as_deref()
+                .is_some_and(|s| s.contains("renews")),
+            "the ledger clause renders unchanged for a zai id: {:?}",
+            row.sub.full
+        );
+        assert!(
+            row.sub.full.as_deref().is_some_and(|s| s.contains('✓')),
+            "the verified pill renders unchanged for a zai id: {:?}",
+            row.sub.full
+        );
+        let session_gauge = row.session.expect("session gauge");
+        assert!((session_gauge.ratio - 0.42).abs() < 1e-9);
+        assert_eq!(
+            session_gauge.reset, None,
+            "an empty resets_at must render as no countdown, never a fabricated one"
+        );
+        assert_eq!(session_gauge.label(), "42% ok", "no ' · resets' tail");
+
+        let weekly_gauge = row.weekly.expect("weekly gauge");
+        assert!((weekly_gauge.ratio - 0.81).abs() < 1e-9);
+        assert!(
+            weekly_gauge.reset.is_some(),
+            "the weekly gauge has a real resets_at — it must carry a countdown"
+        );
+
+        let usage = account_usage(None, &limits, None);
+        assert_eq!(
+            usage.total_tokens, None,
+            "no usage row — always idle this wave"
+        );
+        assert_eq!(usage.cost_notional, None, "never a fabricated cost");
     }
 
     #[test]
@@ -2013,7 +2109,8 @@ mod tests {
             id: "personal".to_string(),
             label: "Personal".to_string(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/tmp"),
+            config_dir: Some(PathBuf::from("/tmp")),
+            api_key_env: None,
             color: None,
             active: false,
             limits_overlay: false,
@@ -2051,7 +2148,8 @@ mod tests {
             id: "personal".to_string(),
             label: "Personal".to_string(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/tmp"),
+            config_dir: Some(PathBuf::from("/tmp")),
+            api_key_env: None,
             color: None,
             active: true,
             limits_overlay: false,
@@ -2088,7 +2186,8 @@ mod tests {
             id: "claude-rob-7".to_string(),
             label: "Rob".to_string(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/tmp"),
+            config_dir: Some(PathBuf::from("/tmp")),
+            api_key_env: None,
             color: None,
             active: true,
             limits_overlay: false,

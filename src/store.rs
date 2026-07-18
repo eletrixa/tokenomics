@@ -244,7 +244,12 @@ impl Store {
                     account.id,
                     account.label,
                     account.provider.as_str(),
-                    account.config_dir.display().to_string(),
+                    // No config_dir (zai, spec 019 §A) persists as an empty string — this column is
+                    // write-only diagnostics text, never decoded back into an `Account`.
+                    account
+                        .config_dir
+                        .as_deref()
+                        .map_or_else(String::new, |d| d.display().to_string()),
                     account.color,
                     account.limits_overlay,
                 ],
@@ -752,7 +757,8 @@ mod tests {
             id: "acct".to_string(),
             label: "Acct".to_string(),
             provider: Provider::Claude,
-            config_dir: PathBuf::from("/home/x/.claude"),
+            config_dir: Some(PathBuf::from("/home/x/.claude")),
+            api_key_env: None,
             color: Some("cyan".to_string()),
             active: true,
             limits_overlay: false,

@@ -1,6 +1,6 @@
 # Spec 019 — z.ai (GLM coding plan) provider: limits-only adapter
 
-Status: **Active**
+Status: **Done**
 
 Plan: `plans/002-multi-provider/` (research `01-zai.md`, synthesis `10-adapter-plan.md` §1 —
 verdict GREEN, build first). The quota endpoint was live-probed 2026-07-19 against Robert's real
