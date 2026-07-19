@@ -101,6 +101,7 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
                 report_zai(account, cfg.settings.warn_pct, cfg.settings.crit_pct).await;
             }
             Provider::Gemini => report_gemini(account).await,
+            Provider::Grok => report_grok(account).await,
         }
     }
 
@@ -530,6 +531,46 @@ async fn gemini_version() -> String {
 fn gemini_overlay_ignored_note(limits_overlay: bool) -> Option<String> {
     limits_overlay.then(|| {
         "overlay:     ignored — gemini has no limits/quota surface to opt into (spec 020 §C)"
+            .to_string()
+    })
+}
+
+/// Read-only diagnostics for a Grok account (spec 021 §D): the CLI version, whether the account's
+/// `logs/unified.jsonl` exists (existence only — content never inspected), and the ignored-overlay
+/// note when set. No network, no quota surface (spec 021 §C).
+async fn report_grok(account: &crate::domain::Account) {
+    println!("  grok:        {}", grok_version().await);
+    let log_marker = match account.config_dir.as_deref() {
+        Some(dir) if dir.join("logs").join("unified.jsonl").exists() => "present",
+        Some(_) => "MISSING (run `grok` and complete a turn)",
+        None => "n/a (no config_dir)",
+    };
+    println!("  usage log:   {log_marker}");
+    if let Some(note) = grok_overlay_ignored_note(account.limits_overlay) {
+        println!("  {note}");
+    }
+}
+
+/// Best-effort `grok --version` string (read-only, argv subprocess, bounded timeout).
+async fn grok_version() -> String {
+    let spec = CommandSpec {
+        program: "grok".to_string(),
+        args: vec!["--version".to_string()],
+        env: Vec::new(),
+        timeout: Duration::from_secs(DOCTOR_TIMEOUT_SECS),
+    };
+    match Exec.run(&spec).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+        Err(e) => format!("unavailable ({e})"),
+    }
+}
+
+/// Pure: the note printed when a Grok account has `limits_overlay = true` — accepted by config
+/// (spec 021 §A) but ignored, since no scriptable subscription-quota surface exists for Grok Build
+/// (spec 021 §C). `None` when unset, so an un-opted-in account's report stays silent about it.
+fn grok_overlay_ignored_note(limits_overlay: bool) -> Option<String> {
+    limits_overlay.then(|| {
+        "overlay:     ignored — grok has no subscription limits/quota surface to opt into (spec 021 §C)"
             .to_string()
     })
 }

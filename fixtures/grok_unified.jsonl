@@ -1,0 +1,6 @@
+{"ts":"2026-07-19T08:28:37.143Z","src":"shell","pid":65101,"lvl":"info","msg":"AuthManager::new","ctx":{"scope":"https://auth.x.ai::synthetic"}}
+{"ts":"2026-07-19T08:30:29.081Z","src":"shell","pid":69255,"lvl":"info","msg":"billing: fetched credits config","ctx":{"creditUsagePercent":2.0,"subscriptionTier":"SuperGrok Heavy"}}
+{"ts":"2026-07-19T08:39:27.401Z","src":"shell","pid":89810,"lvl":"info","sid":"synthetic-session-1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"model_elapsed_ms":4074,"prompt_tokens":42316,"cached_prompt_tokens":5504,"completion_tokens":92,"reasoning_tokens":89,"tokens_per_sec":22.6}}
+{not valid json at all
+{"ts":"2026-07-19T08:39:30.000Z","src":"shell","pid":89810,"lvl":"info","sid":"synthetic-session-1","msg":"shell.turn.inference_done","ctx":{"loop_index":0,"prompt_tokens":0,"cached_prompt_tokens":0,"completion_tokens":0,"reasoning_tokens":0}}
+{"ts":"2026-07-19T08:40:10.212Z","src":"shell","pid":89810,"lvl":"info","sid":"synthetic-session-1","msg":"shell.turn.inference_done","ctx":{"loop_index":2,"prompt_tokens":1000,"cached_prompt_tokens":200,"completion_tokens":50,"reasoning_tokens":40,"tokens_per_sec":18.1}}

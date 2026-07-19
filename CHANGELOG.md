@@ -6,7 +6,38 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ## [Unreleased]
 
+### FIXED
+- **Collector no longer starves the last account when the fleet grows past the concurrency bound.**
+  `MAX_INFLIGHT` was 8 while the live fleet reached 9 active accounts; because `spawn_local_collects`
+  iterates accounts in config order and stops once the cap is in flight, the 9th account (the
+  newly-added grok) was never spawned — every tick the first 8 filled the slots and cleared before it
+  was reached, so it never produced a snapshot. Raised the bound to 16 (comfortably above the account
+  count) and documented that it must stay above the active-account count; only Claude accounts spawn a
+  real subprocess, so effective heavy concurrency stays well under the cap.
+
 ### ADDED
+- **Grok Build (xAI) is now a monitored, usage-only provider (spec 021).** `Provider::Grok`
+  (`"grok"`) round-trips through config/store/display. `config_dir` (the `GROK_HOME` dir, default
+  `~/.grok`) is required, same as claude/codex/gemini; `api_key_env` is rejected (an `XAI_API_KEY`
+  PAYG setup is not a subscription). `providers/grok/logs.rs` parses Grok Build's append-only
+  `logs/unified.jsonl`, keeping only `shell.turn.inference_done` lines (auth/marketplace/billing/
+  session-lifecycle lines skipped by `msg`; malformed and all-zero lines skipped per-line) and
+  reduces the in-5h-window events into a `UsageSnapshot` with real token counts (`input =
+  prompt_tokens − cached_prompt_tokens`, `cache_read = cached_prompt_tokens`, `output =
+  completion_tokens`, `total = prompt + completion`) and `cost_notional = None` (no public
+  subscription pricing basis — never fabricated). No dedup: each agentic `loop_index` inference is a
+  distinct billable call. **`reasoning_tokens` is a subset of `completion_tokens` (verified over 617
+  real events) and is never added to output** — the research doc's "reasoning is additive" was wrong
+  and would have double-counted. `GrokAdapter` reads the single log with mtime pruning on the
+  blocking pool; a missing/stale log is idle, not an error. No limits/quota code exists for Grok this
+  wave — both gauges render `n/a (no limits surface)` regardless of `limits_overlay` (the local
+  `billing: fetched credits config` line carries on-demand *credit* %, not the SuperGrok message
+  quota, so it is deliberately not surfaced as a gauge). `tok doctor` reports a `grok --version`
+  probe, `logs/unified.jsonl` existence (content never inspected), and a note when `limits_overlay`
+  is set despite having no surface to opt into. `tok accounts` / `tok once --json` stay
+  byte-identical (golden-snapshot enforced). The TUI renders a grok account with the existing
+  provider-agnostic row grammar (tokens, no cost line, both gauges n/a) and the spec-017 ledger
+  clause / spec-018 verified pill unchanged for a matching id.
 - **Gemini CLI is now a monitored, usage-only provider (spec 020).** `Provider::Gemini`
   (`"gemini"`) round-trips through config/store/display. `config_dir` (the `GEMINI_CLI_HOME` dir,
   default `~/.gemini`) is required, same as claude/codex; `api_key_env` is rejected (a PAYG API-key

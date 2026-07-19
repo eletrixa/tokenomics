@@ -760,11 +760,11 @@ pub fn build_account_view(
     // that is the "stall flag hasn't tripped" condition from spec 015 §C.
     let overlay_silent_since_ms =
         overlay_ms.filter(|&ms| now.as_millisecond().saturating_sub(ms) > OVERLAY_STALL_MS);
-    // Gemini has no limits/quota surface at all (spec 020 §C) — `limits_overlay` is accepted but
-    // IGNORED, so neither "enable overlay" (nothing to enable) nor "waiting for overlay" (nothing
-    // will ever arrive) is honest, however the flag is set. Every other provider keeps the
-    // overlay-state hint below.
-    let weekly_hint = if account.provider == Provider::Gemini {
+    // Gemini and Grok have no limits/quota surface at all (spec 020 §C, 021 §C) — `limits_overlay`
+    // is accepted but IGNORED, so neither "enable overlay" (nothing to enable) nor "waiting for
+    // overlay" (nothing will ever arrive) is honest, however the flag is set. Every other provider
+    // keeps the overlay-state hint below.
+    let weekly_hint = if matches!(account.provider, Provider::Gemini | Provider::Grok) {
         "n/a (no limits surface)".to_string()
     } else if !account.limits_overlay {
         "n/a (enable overlay)".to_string()

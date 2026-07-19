@@ -40,3 +40,12 @@ limits_overlay = false    # opt-in, OFF by default — see the README overlay no
 # label = "Gemini"
 # provider = "gemini"
 # config_dir = "~/.gemini"  # this account's GEMINI_CLI_HOME — attribution comes from the dir
+
+# A fifth provider — Grok Build CLI logs inference events under GROK_HOME. Usage-only: no
+# scriptable limits surface exists, so both gauges always show n/a (never a fabricated pool %).
+# Uncomment and adjust to monitor a SuperGrok subscription too:
+# [[account]]
+# id = "grok-heavy"
+# label = "Grok"
+# provider = "grok"
+# config_dir = "~/.grok"  # this account's GROK_HOME — attribution comes from the dir

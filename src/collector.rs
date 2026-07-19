@@ -61,7 +61,16 @@ use crate::providers::ProviderAdapter;
 use crate::store::{Store, TokenStatus};
 
 /// Max concurrent in-flight collects across all accounts (bounded concurrency).
-const MAX_INFLIGHT: usize = 8;
+///
+/// MUST stay above the number of active accounts: `spawn_local_collects` iterates accounts in
+/// config order and breaks once this many are in flight, so a bound below the account count
+/// permanently starves the tail accounts (they are never reached before the cap trips, and the
+/// earlier accounts clear + re-fill every tick). Only ~the Claude accounts spawn a real subprocess
+/// (ccusage); codex/gemini/grok are filesystem reads and zai is a cheap idle — so the effective
+/// heavy-collect concurrency is far below this cap regardless.
+/// ponytail: a flat bound above the account count; round-robin the spawn start cursor if a fleet
+/// ever exceeds this many accounts.
+const MAX_INFLIGHT: usize = 16;
 /// Cap for the overlay 429 backoff.
 const OVERLAY_BACKOFF_CAP_SECS: u64 = 900;
 /// Per-account, per-window alert cooldown (so re-crossings don't spam notifications).

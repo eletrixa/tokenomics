@@ -51,6 +51,7 @@ use providers::claude::ClaudeAdapter;
 use providers::codex::rate_limits::AppServerClient;
 use providers::codex::CodexAdapter;
 use providers::gemini::GeminiAdapter;
+use providers::grok::GrokAdapter;
 use providers::zai::quota::HttpQuotaEndpoint;
 use providers::zai::ZaiAdapter;
 use providers::{ProviderAdapter, ProviderRegistry};
@@ -263,6 +264,7 @@ async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
     let codex = CodexAdapter::new();
     let zai = ZaiAdapter::new();
     let gemini = GeminiAdapter::new();
+    let grok = GrokAdapter::new();
     let now = Timestamp::now();
     let (warn, crit) = (cfg.settings.warn_pct, cfg.settings.crit_pct);
     let mut records = Vec::with_capacity(cfg.accounts.len());
@@ -275,6 +277,7 @@ async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
             Provider::Codex => collect_record(&codex, account, now, warn, crit).await,
             Provider::Zai => collect_record(&zai, account, now, warn, crit).await,
             Provider::Gemini => collect_record(&gemini, account, now, warn, crit).await,
+            Provider::Grok => collect_record(&grok, account, now, warn, crit).await,
         };
         records.push(record);
     }
@@ -395,6 +398,7 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
             codex: CodexAdapter::new(),
             zai: ZaiAdapter::new(),
             gemini: GeminiAdapter::new(),
+            grok: GrokAdapter::new(),
         };
         let endpoint = HttpUsageEndpoint::new()?;
         let rate_source = AppServerClient::new(Duration::from_secs(CODEX_APP_SERVER_TIMEOUT_SECS));

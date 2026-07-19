@@ -234,14 +234,14 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
     findings
 }
 
-/// Per-provider account-field validation (spec 019 §A, spec 020 §A): `claude`/`codex`/`gemini`
-/// require `config_dir` and reject `api_key_env`; `zai` requires `api_key_env` (a non-empty
+/// Per-provider account-field validation (spec 019 §A, 020 §A, 021 §A): `claude`/`codex`/`gemini`/
+/// `grok` require `config_dir` and reject `api_key_env`; `zai` requires `api_key_env` (a non-empty
 /// env-var NAME) and leaves `config_dir` optional (accepted but unused this wave). Pure — no I/O,
 /// no env-var reads.
 fn validate_provider_fields(account: &Account) -> Vec<Finding> {
     let mut findings = Vec::new();
     match account.provider {
-        Provider::Claude | Provider::Codex | Provider::Gemini => {
+        Provider::Claude | Provider::Codex | Provider::Gemini | Provider::Grok => {
             if account.config_dir.is_none() {
                 findings.push(Finding::error(format!(
                     "account '{}': config_dir is required for provider '{}'",
@@ -272,7 +272,7 @@ fn validate_provider_fields(account: &Account) -> Vec<Finding> {
 }
 
 /// Filesystem checks kept separate so [`validate`] stays pure: each account whose provider
-/// requires a `config_dir` (claude/codex/gemini — see [`validate_provider_fields`]) must have one
+/// requires a `config_dir` (claude/codex/gemini/grok — see [`validate_provider_fields`]) must have one
 /// that exists. A zai account's `config_dir` is accepted but unused this wave (spec 019 §A), so it
 /// is never existence-checked here even when provided — a placeholder value for a future GLM lane
 /// must not hard-fail environment validation for a field nothing reads.
@@ -282,7 +282,7 @@ pub fn validate_environment(cfg: &Config) -> Vec<Finding> {
         .filter(|a| {
             matches!(
                 a.provider,
-                Provider::Claude | Provider::Codex | Provider::Gemini
+                Provider::Claude | Provider::Codex | Provider::Gemini | Provider::Grok
             )
         })
         .filter_map(|a| a.config_dir.as_ref().map(|dir| (a, dir)))
@@ -345,7 +345,7 @@ config_dir = \"/tmp\"
 
     #[test]
     fn rejects_unknown_provider() {
-        let toml = ONE.replace("claude", "grok");
+        let toml = ONE.replace("claude", "megamind");
         assert!(Config::parse(&toml).is_err());
     }
 

@@ -7,7 +7,7 @@
 //!          (claude/ccusage, codex/sessions); Limit via providers/*/ (overlay, codex/rate_limits)
 //!
 //! Key responsibilities:
-//! - `Provider`: the exhaustive provider enum (Claude, Codex, Zai, Gemini now; Grok slots in later).
+//! - `Provider`: the exhaustive provider enum (Claude, Codex, Zai, Gemini, Grok).
 //! - `Account`: one monitored subscription account. Attribution is `config_dir`
 //!   (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GEMINI_CLI_HOME`) for claude/codex/gemini, or `api_key_env`
 //!   for zai (spec 019 §A) — exactly one is the identity handle per provider, enforced by
@@ -39,7 +39,8 @@ pub enum Provider {
     Zai,
     /// Google Gemini CLI — usage-only, `config_dir`-attributed, no limits surface (spec 020).
     Gemini,
-    // Future: Grok — add a variant + a providers/<x>/ adapter.
+    /// xAI Grok Build CLI — usage-only, `config_dir`-attributed, no limits surface (spec 021).
+    Grok,
 }
 
 impl Provider {
@@ -50,6 +51,7 @@ impl Provider {
             Self::Codex => "codex",
             Self::Zai => "zai",
             Self::Gemini => "gemini",
+            Self::Grok => "grok",
         }
     }
 
@@ -60,6 +62,7 @@ impl Provider {
             "codex" => Some(Self::Codex),
             "zai" => Some(Self::Zai),
             "gemini" => Some(Self::Gemini),
+            "grok" => Some(Self::Grok),
             _ => None,
         }
     }

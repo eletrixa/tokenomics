@@ -26,11 +26,13 @@ use crate::runner::Runner;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod grok;
 pub mod zai;
 
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use gemini::GeminiAdapter;
+use grok::GrokAdapter;
 use zai::ZaiAdapter;
 
 /// One provider's collection behavior. `collect` returns `None` when the account is idle
@@ -55,6 +57,8 @@ pub struct ProviderRegistry<R: Runner> {
     pub zai: ZaiAdapter,
     /// The Gemini usage adapter (chats-JSONL under each account's `GEMINI_CLI_HOME`, spec 020 §B).
     pub gemini: GeminiAdapter,
+    /// The Grok usage adapter (unified.jsonl under each account's `GROK_HOME`, spec 021 §B).
+    pub grok: GrokAdapter,
 }
 
 #[async_trait]
@@ -65,6 +69,7 @@ impl<R: Runner> ProviderAdapter for ProviderRegistry<R> {
             Provider::Codex => self.codex.collect(account, now).await,
             Provider::Zai => self.zai.collect(account, now).await,
             Provider::Gemini => self.gemini.collect(account, now).await,
+            Provider::Grok => self.grok.collect(account, now).await,
         }
     }
 }

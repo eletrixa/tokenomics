@@ -27,10 +27,11 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 018 | [verified-pill](018-verified-pill.md) | `✓ <date>` pill on the clause when the ledger row was agent-verified against the provider billing UI within the current period | Done |
 | 019 | [zai-provider](019-zai-provider.md) | z.ai GLM adapter: limits-only authoritative quota overlay (`api_key_env` identity, session %/no-reset + weekly %/reset), honest idle usage | Done |
 | 020 | [gemini-provider](020-gemini-provider.md) | Gemini adapter: usage-only from local chats JSON[L] (fan-out glob, mtime-pruned), both gauges honestly n/a, no cost | Done |
+| 021 | [grok-provider](021-grok-provider.md) | Grok Build adapter: usage-only from `logs/unified.jsonl` (`inference_done` events, no dedup, reasoning ⊆ completion), both gauges n/a, no cost | Done |
 
 Scope now: **Claude** (6 accounts) + **Codex** (spec 013) + **z.ai** (spec 019, limits-only) +
-**Gemini** (spec 020, usage-only — activates on a gemini-cli login). **Grok** is blocked pending a
-SuperGrok purchase + real log fixtures (`plans/002-multi-provider/03-grok.md`).
+**Gemini** (spec 020, usage-only — activates on a gemini-cli login) + **Grok Build** (spec 021,
+usage-only — SuperGrok Heavy bought 2026-07-19, real `~/.grok/logs/unified.jsonl` fixtures).
 
 ## Future spec candidates (from the 2026-07-15 discovery/premortem pass)
 
