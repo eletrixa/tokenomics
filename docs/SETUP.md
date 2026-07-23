@@ -86,13 +86,22 @@ label = "z.ai GLM"
 provider = "zai"
 api_key_env = "Z_AI_CODING_KEY"
 limits_overlay = true
+
+# Kimi (Moonshot AI coding plan) — no local usage lane; identity is the NAME of an env var holding
+# your API key (never the key itself). Limits-only, and dormant until you have a subscription key.
+[[account]]
+id = "kimi-k2"
+label = "Kimi K2"
+provider = "kimi"
+api_key_env = "KIMI_API_KEY"
+limits_overlay = true
 ```
 
 Field rules `tok validate` enforces:
 
 - `claude` / `codex` / `gemini` / `grok` require `config_dir` and reject `api_key_env`.
-- `zai` requires `api_key_env` (the **name** of an env var, e.g. `Z_AI_CODING_KEY`, not the key) and
-  ignores `config_dir`.
+- `zai` / `kimi` require `api_key_env` (the **name** of an env var, e.g. `Z_AI_CODING_KEY`, not the
+  key) and ignore `config_dir`.
 - Optional per-account keys: `color` (a named ratatui color or `#rrggbb`) and `active = false` (keep
   an account configured but off the board).
 - A leading `~` in `config_dir` expands against `$HOME`.
@@ -193,6 +202,8 @@ Step 1 — detect what I have installed. Check which of these config dirs exist 
   - Gemini CLI:   ~/.gemini            (env GEMINI_CLI_HOME)
   - Grok CLI:     ~/.grok              (env GROK_HOME)
   - z.ai (GLM):   no dir — identity is the NAME of an env var holding the API key
+  - Kimi:         no dir — identity is the NAME of an env var holding the API key; limits-only,
+                  dormant until you have a subscription key
 If I run more than one Claude account from separate dirs (e.g. ~/.claude-work), ask for each path.
 
 Step 2 — interview me, one short question at a time:
@@ -214,13 +225,13 @@ Step 3 — write `~/.config/tokenomics/tokenomics.toml`:
     [[account]]
     id = "claude-personal"
     label = "Personal"
-    provider = "claude"       # claude | codex | gemini | grok | zai
+    provider = "claude"       # claude | codex | gemini | grok | zai | kimi
     config_dir = "~/.claude"  # required for claude/codex/gemini/grok; attribution is this dir
     limits_overlay = false    # keep OFF unless I explicitly opt in
 
   Rules you must honor:
   - claude/codex/gemini/grok: `config_dir` is REQUIRED, `api_key_env` is NOT allowed.
-  - zai: `api_key_env = "<ENV_VAR_NAME>"` is REQUIRED, no `config_dir`; it only shows gauges with
+  - zai/kimi: `api_key_env = "<ENV_VAR_NAME>"` is REQUIRED, no `config_dir`; it only shows gauges with
     `limits_overlay = true`.
   - Optional per-account: `color` (named or #rrggbb) and `active = false`.
 
@@ -247,7 +258,8 @@ Step 5 — verify:
 - **`tok validate` fails** — read the `✗` lines; each names the account and the problem (missing
   `config_dir`, `api_key_env` on the wrong provider, `crit_pct` not above `warn_pct`, a duplicate id).
 - **`tok validate` says a `config_dir` does not exist** — the path is wrong or the CLI isn't set up
-  there. Fix the `config_dir`, or drop the account. (z.ai has no `config_dir` and is never checked.)
+  there. Fix the `config_dir`, or drop the account. (z.ai/kimi have no `config_dir` and are never
+  checked.)
 - **Board shows n/a gauges for Gemini** — expected: Gemini is usage-only, with no scriptable limits
   surface. `tok` shows `n/a` rather than a fabricated quota. Grok's weekly gauge fills in after the
   grok CLI has run at least once in the current period (it reads the CLI's own billing log); only

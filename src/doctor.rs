@@ -4,7 +4,8 @@
 //! Module:  src/doctor.rs
 //! Deps:    jiff; runner (ccusage/codex/gemini/grok version), providers::claude
 //!          (adapter/creds/overlay), providers::codex (app-server rate-limits probe),
-//!          providers::zai (quota probe), providers::grok::billing (weekly-quota parse)
+//!          providers::zai (quota probe), providers::kimi (quota probe),
+//!          providers::grok::billing (weekly-quota parse)
 //! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
 //!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
 //!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8); the
@@ -20,6 +21,8 @@
 //! - Per zai account: `api_key_env` NAME + presence (never the value); quota-endpoint reachability
 //!   (only if opted-in AND active); the monthly MCP-tool quota (`TIME_LIMIT`) informational note —
 //!   it has no gauge home, so this is its only surface (spec 019 §D).
+//! - Per Kimi account: `api_key_env` NAME + presence (never the value); quota-endpoint reachability
+//!   (only if opted-in AND active) (spec 023 §D).
 //! - Per Gemini account: `gemini --version` (argv subprocess, timeout, output never parsed beyond
 //!   success); `oauth_creds.json` existence ONLY (content never read); a note when `limits_overlay`
 //!   is set even though Gemini has no limits surface to opt into (spec 020 §D).
@@ -107,6 +110,9 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
             }
             Provider::Gemini => report_gemini(account).await,
             Provider::Grok => report_grok(account).await,
+            Provider::Kimi => {
+                report_kimi(account, cfg.settings.warn_pct, cfg.settings.crit_pct).await;
+            }
         }
     }
 
@@ -478,6 +484,61 @@ async fn report_zai(account: &crate::domain::Account, warn_pct: f64, crit_pct: f
 /// Read-only; the key is held only for this call and never printed.
 async fn report_zai_overlay(api_key: &str, account_id: &str, warn_pct: f64, crit_pct: f64) {
     use crate::providers::zai::quota::{parse_quota_response, HttpQuotaEndpoint, QuotaEndpoint};
+    let endpoint = match HttpQuotaEndpoint::new() {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            println!("  overlay:     client error: {e}");
+            return;
+        }
+    };
+    match endpoint.fetch(api_key).await {
+        Ok(bytes) => match parse_quota_response(&bytes, account_id, warn_pct, crit_pct) {
+            Ok(limits) => println!(
+                "  overlay:     reachable (HTTP 200, {} bytes, {} limit(s) parsed)",
+                bytes.len(),
+                limits.len()
+            ),
+            Err(e) => println!("  overlay:     reachable but unparsable: {e}"),
+        },
+        Err(e) => println!("  overlay:     {e}"),
+    }
+}
+
+/// Kimi diagnostics for one account (read-only, spec 023 §D): env-var NAME + presence (never the
+/// value), and an endpoint reachability probe when opted-in AND active. Mirrors the Claude/Codex
+/// overlay-gate shape (probe only opted-in AND active).
+async fn report_kimi(account: &crate::domain::Account, warn_pct: f64, crit_pct: f64) {
+    match account.api_key_env.as_deref() {
+        Some(name) => {
+            let key = crate::providers::kimi::resolve_api_key(account);
+            match &key {
+                Ok(_) => println!("  api_key_env: {name} [present]"),
+                // `reason` already names `name` (e.g. "{name} is not set") — printing it again would
+                // just repeat the var name with no new information.
+                Err(_) => println!("  api_key_env: {name} [MISSING]"),
+            }
+            if !account.limits_overlay {
+                // not opted in — no overlay line
+            } else if !account.active {
+                println!("  overlay:     skipped — account inactive");
+            } else {
+                match key {
+                    Ok(key) => report_kimi_overlay(&key, &account.id, warn_pct, crit_pct).await,
+                    Err(reason) => println!("  overlay:     skipped — {reason}"),
+                }
+            }
+        }
+        // Validation (spec 023 §A) should already have refused this config; report it rather than
+        // panic if that guarantee is ever violated upstream.
+        None => println!("  api_key_env: MISSING (kimi requires api_key_env)"),
+    }
+}
+
+/// Probe the Kimi quota endpoint for an opted-in, present-key account (single GET), then run the
+/// body through `parse_quota_response` so `doctor` reports what the parser actually extracted.
+/// Read-only; the key is held only for this call and never printed.
+async fn report_kimi_overlay(api_key: &str, account_id: &str, warn_pct: f64, crit_pct: f64) {
+    use crate::providers::kimi::quota::{parse_quota_response, HttpQuotaEndpoint, QuotaEndpoint};
     let endpoint = match HttpQuotaEndpoint::new() {
         Ok(endpoint) => endpoint,
         Err(e) => {

@@ -7,15 +7,16 @@
 //!          concurrent-overlay + loop-not-blocked timing, an opt-in overlay run, inactive-account
 //!          skip on both cadences (spec 014), a Codex app-server overlay pass + failure backoff (013),
 //!          config hot-reload activation/deactivation + bad-reload resilience (spec 015), a z.ai
-//!          quota overlay pass + opt-in/env-var eligibility gating (spec 019 §D), local limits on
+//!          quota overlay pass + opt-in/env-var eligibility gating (spec 019 §D), a Kimi quota
+//!          overlay pass + opt-in/env-var eligibility gating (spec 023 §D), local limits on
 //!          the idle AND fresh arms + harvest severity re-stamp + alert edge (spec 022 §C)
 //!
 //! Key responsibilities:
 //! - `run_collector`: local-cadence tick → `collect` and `collect_local_limits` → `insert_snapshot`
 //!   plus derived limit plus local limits (spec 022 §C — local limits ride the idle arm too, so a
 //!   quota stays live while usage idles); overlay cadence tick → spawn opt-in Claude
-//!   `/api/oauth/usage`, Codex app-server, and z.ai quota fetches, harvest → authoritative limits
-//!   (degrade to derived on stale/failure); a slow retention sweep prunes old snapshots and
+//!   `/api/oauth/usage`, Codex app-server, z.ai, and Kimi quota fetches, harvest → authoritative
+//!   limits (degrade to derived on stale/failure); a slow retention sweep prunes old snapshots and
 //!   checkpoints the WAL.
 //! - Guards: inflight (never stack a second collect per account), generation (`should_apply`),
 //!   isolation (a failing account keeps last-good and never crashes the loop), bounded concurrency,
@@ -58,6 +59,10 @@ use crate::providers::claude::overlay::{
     next_backoff, parse_oauth_usage, BackoffOutcome, UsageEndpoint,
 };
 use crate::providers::codex::rate_limits::{parse_rate_limits_response, RateLimitsSource};
+use crate::providers::kimi::quota::{
+    parse_quota_response as parse_kimi_quota_response, QuotaEndpoint as KimiQuotaEndpoint,
+};
+use crate::providers::kimi::resolve_api_key as resolve_kimi_api_key;
 use crate::providers::zai::quota::{parse_quota_response, QuotaEndpoint};
 use crate::providers::zai::resolve_api_key;
 use crate::providers::ProviderAdapter;
@@ -69,7 +74,7 @@ use crate::store::{Store, TokenStatus};
 /// config order and breaks once this many are in flight, so a bound below the account count
 /// permanently starves the tail accounts (they are never reached before the cap trips, and the
 /// earlier accounts clear + re-fill every tick). Only ~the Claude accounts spawn a real subprocess
-/// (ccusage); codex/gemini/grok are filesystem reads and zai is a cheap idle — so the effective
+/// (ccusage); codex/gemini/grok are filesystem reads and zai/kimi are cheap idles — so the effective
 /// heavy-collect concurrency is far below this cap regardless.
 /// ponytail: a flat bound above the account count; round-robin the spawn start cursor if a fleet
 /// ever exceeds this many accounts.
@@ -294,16 +299,17 @@ fn apply_config_reload<S: ConfigSource>(
 }
 
 /// Run the collector loop until `shutdown` resolves. Generic over the adapter, the Claude overlay
-/// endpoint, the Codex rate-limits source, the z.ai quota endpoint, and the config source so the
-/// loop is tested with fakes (no process spawn, no network, no filesystem).
+/// endpoint, the Codex rate-limits source, the z.ai quota endpoint, the Kimi quota endpoint, and the
+/// config source so the loop is tested with fakes (no process spawn, no network, no filesystem).
 #[allow(clippy::too_many_arguments)] // one collaborator per provider's overlay lane, threaded explicitly
-pub async fn run_collector<A, E, C, Z, S>(
+pub async fn run_collector<A, E, C, Z, K, S>(
     cfg: &Config,
     mut config_source: S,
     adapter: A,
     endpoint: E,
     rate_source: C,
     zai_endpoint: Z,
+    kimi_endpoint: K,
     store: Store,
     shutdown: impl Future<Output = ()>,
 ) -> AppResult<()>
@@ -312,6 +318,7 @@ where
     E: UsageEndpoint + 'static,
     C: RateLimitsSource + 'static,
     Z: QuotaEndpoint + 'static,
+    K: KimiQuotaEndpoint + 'static,
     S: ConfigSource,
 {
     let mut cfg = cfg.clone();
@@ -335,6 +342,7 @@ where
     let endpoint = Arc::new(endpoint);
     let rate_source = Arc::new(rate_source);
     let zai_endpoint = Arc::new(zai_endpoint);
+    let kimi_endpoint = Arc::new(kimi_endpoint);
     let mut local = cadence_interval(cfg.settings.poll_local_secs);
     let mut overlay = cadence_interval(cfg.settings.poll_overlay_secs);
     let mut retention = tokio::time::interval(Duration::from_secs(RETENTION_SWEEP_SECS));
@@ -354,6 +362,9 @@ where
     // The z.ai quota overlay runs on the same cadence, off the loop task, harvested on its own arm —
     // the zai twin of `codex_overlay_tasks` (spec 019 §D).
     let mut zai_overlay_tasks: JoinSet<ZaiOverlayOutcome> = JoinSet::new();
+    // The Kimi quota overlay rides the same cadence, off the loop task, harvested on its own arm —
+    // the kimi twin of `zai_overlay_tasks` (spec 023 §D).
+    let mut kimi_overlay_tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
 
     tokio::pin!(shutdown);
     loop {
@@ -388,44 +399,61 @@ where
                 // Only the network/subprocess fetches are spawned here (they touch no Store); token
                 // reads + token-state writes + backoff bookkeeping stay on the loop task. Each fetch
                 // is individually time-boxed, so a slow account can't stall the loop or shutdown.
-                spawn_overlay_fetches(&cfg, &endpoint, &store, &mut overlay_state, &mut overlay_tasks);
-                spawn_codex_overlay_fetches(&cfg, &rate_source, &mut overlay_state, &mut codex_overlay_tasks);
-                spawn_zai_overlay_fetches(&cfg, &zai_endpoint, &mut overlay_state, &mut zai_overlay_tasks);
+                spawn_all_overlay_fetches(
+                    &cfg, &endpoint, &store, &rate_source, &zai_endpoint, &kimi_endpoint,
+                    &mut overlay_state, &mut overlay_tasks, &mut codex_overlay_tasks,
+                    &mut zai_overlay_tasks, &mut kimi_overlay_tasks,
+                );
             }
-            Some(joined) = overlay_tasks.join_next() => {
-                match joined {
-                    // Parse + merge + persist + backoff on the loop task — single writer preserved.
-                    Ok(outcome) => {
-                        apply_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome);
-                    }
-                    Err(join_err) => eprintln!("collector: overlay task join error: {join_err}"),
-                }
-            }
-            Some(joined) = codex_overlay_tasks.join_next() => {
-                match joined {
-                    Ok(outcome) => {
-                        apply_codex_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome);
-                    }
-                    Err(join_err) => {
-                        eprintln!("collector: codex overlay task join error: {join_err}");
-                    }
-                }
-            }
-            Some(joined) = zai_overlay_tasks.join_next() => {
-                match joined {
-                    Ok(outcome) => {
-                        apply_zai_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome);
-                    }
-                    Err(join_err) => {
-                        eprintln!("collector: zai overlay task join error: {join_err}");
-                    }
-                }
-            }
+            // Parse + merge + persist + backoff on the loop task — single writer preserved.
+            Some(joined) = overlay_tasks.join_next() => match joined {
+                Ok(outcome) => apply_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome),
+                Err(join_err) => eprintln!("collector: overlay task join error: {join_err}"),
+            },
+            Some(joined) = codex_overlay_tasks.join_next() => match joined {
+                Ok(outcome) => apply_codex_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome),
+                Err(join_err) => eprintln!("collector: codex overlay task join error: {join_err}"),
+            },
+            Some(joined) = zai_overlay_tasks.join_next() => match joined {
+                Ok(outcome) => apply_zai_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome),
+                Err(join_err) => eprintln!("collector: zai overlay task join error: {join_err}"),
+            },
+            Some(joined) = kimi_overlay_tasks.join_next() => match joined {
+                Ok(outcome) => apply_kimi_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome),
+                Err(join_err) => eprintln!("collector: kimi overlay task join error: {join_err}"),
+            },
             _ = retention.tick() => sweep_retention(&store),
             () = &mut shutdown => break,
         }
     }
     Ok(())
+}
+
+/// Spawn this tick's overlay fetches across every provider lane (Claude, Codex, z.ai, Kimi) — one
+/// call site so `run_collector`'s `overlay.tick()` arm stays a single statement.
+#[allow(clippy::too_many_arguments)] // one collaborator per provider's overlay lane, threaded explicitly
+fn spawn_all_overlay_fetches<E, C, Z, K>(
+    cfg: &Config,
+    endpoint: &Arc<E>,
+    store: &Store,
+    rate_source: &Arc<C>,
+    zai_endpoint: &Arc<Z>,
+    kimi_endpoint: &Arc<K>,
+    overlay_state: &mut OverlayState,
+    overlay_tasks: &mut JoinSet<OverlayOutcome>,
+    codex_overlay_tasks: &mut JoinSet<CodexOverlayOutcome>,
+    zai_overlay_tasks: &mut JoinSet<ZaiOverlayOutcome>,
+    kimi_overlay_tasks: &mut JoinSet<KimiOverlayOutcome>,
+) where
+    E: UsageEndpoint + 'static,
+    C: RateLimitsSource + 'static,
+    Z: QuotaEndpoint + 'static,
+    K: KimiQuotaEndpoint + 'static,
+{
+    spawn_overlay_fetches(cfg, endpoint, store, overlay_state, overlay_tasks);
+    spawn_codex_overlay_fetches(cfg, rate_source, overlay_state, codex_overlay_tasks);
+    spawn_zai_overlay_fetches(cfg, zai_endpoint, overlay_state, zai_overlay_tasks);
+    spawn_kimi_overlay_fetches(cfg, kimi_endpoint, overlay_state, kimi_overlay_tasks);
 }
 
 /// Spawn one local collect per active, not-already-inflight account (bounded by `MAX_INFLIGHT`),
@@ -1058,6 +1086,130 @@ fn apply_zai_overlay_outcome(
     }
 }
 
+// ── spec 023 §D: Kimi overlay integration ──────────────────────────────────────────────────────
+// Wired into `run_collector`'s `select!` loop as its 5th `JoinSet` arm, mirroring the zai twin
+// above: same cadence (`poll_overlay_secs`), same per-account backoff/cooldown/TTL-demotion
+// machinery (`OverlayState`, `apply_authoritative_limits`).
+
+/// One Kimi quota fetch handed back for harvesting — the kimi twin of [`ZaiOverlayOutcome`].
+#[derive(Debug)]
+struct KimiOverlayOutcome {
+    /// The account this fetch was for.
+    account: Account,
+    /// The backoff interval in effect when the fetch was spawned (drives [`next_backoff`] on harvest).
+    backoff_current: u64,
+    /// The raw quota body on success, or the typed error (429 → backoff, other → logged).
+    result: AppResult<Vec<u8>>,
+}
+
+/// Spawn one Kimi quota fetch per eligible opted-in kimi account, run OFF the loop task (single-
+/// writer preserved) — identical to `spawn_zai_overlay_fetches`. Eligible = active, opted-in,
+/// provider Kimi, not cooling down from a prior failure, AND its named env var resolves to a
+/// non-empty value — an account missing that is skipped with a logged reason; no store write (Kimi
+/// carries no token-warmth state to persist).
+fn spawn_kimi_overlay_fetches<K: KimiQuotaEndpoint + 'static>(
+    cfg: &Config,
+    endpoint: &Arc<K>,
+    state: &mut OverlayState,
+    tasks: &mut JoinSet<KimiOverlayOutcome>,
+) {
+    let base = cfg.settings.poll_overlay_secs.max(1);
+    for account in cfg
+        .accounts
+        .iter()
+        .filter(|a| a.active && a.limits_overlay && a.provider == Provider::Kimi)
+    {
+        if let Some(ticks) = state.cooldown_ticks.get_mut(&account.id) {
+            if *ticks > 0 {
+                *ticks -= 1;
+                continue; // still backing off from a prior failure
+            }
+        }
+        let key = match resolve_kimi_api_key(account) {
+            Ok(key) => key,
+            Err(reason) => {
+                eprintln!(
+                    "collector: [{}] kimi overlay skipped — {reason}",
+                    account.id
+                );
+                continue;
+            }
+        };
+        let backoff_current = state.backoff_secs.get(&account.id).copied().unwrap_or(base);
+        let endpoint = Arc::clone(endpoint);
+        let account = account.clone();
+        let cap = Duration::from_secs(OVERLAY_TICK_BUDGET_SECS);
+        // The key is moved into the task (used for the request, never logged).
+        tasks.spawn(async move {
+            let result = match tokio::time::timeout(cap, endpoint.fetch(&key)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(AppError::Overlay(
+                    "kimi quota fetch exceeded budget".to_string(),
+                )),
+            };
+            KimiOverlayOutcome {
+                account,
+                backoff_current,
+                result,
+            }
+        });
+    }
+}
+
+/// Harvest one Kimi quota fetch on the loop task: parse → authoritative limits → merge + persist
+/// (degrading to derived on error), and advance the 429 backoff / cooldown — identical to
+/// `apply_zai_overlay_outcome`. Single writer — the only Kimi-overlay `Store` writes.
+fn apply_kimi_overlay_outcome(
+    cfg: &Config,
+    store: &Store,
+    state: &mut OverlayState,
+    alerts: &mut AlertTracker,
+    outcome: KimiOverlayOutcome,
+) {
+    // Harvest guard: drop a fetch that landed after a reload removed/deactivated this account (§A).
+    if !present_and_active(cfg, &outcome.account.id) {
+        return;
+    }
+    let base = cfg.settings.poll_overlay_secs.max(1);
+    let KimiOverlayOutcome {
+        account,
+        backoff_current,
+        result,
+    } = outcome;
+    let now = Timestamp::now();
+    let parsed = result.and_then(|body| {
+        parse_kimi_quota_response(
+            &body,
+            &account.id,
+            cfg.settings.warn_pct,
+            cfg.settings.crit_pct,
+        )
+    });
+    match parsed {
+        Ok(authoritative) if !authoritative.is_empty() => {
+            apply_authoritative_limits(
+                cfg,
+                store,
+                &account.id,
+                authoritative,
+                now,
+                alerts,
+                "kimi overlay",
+            );
+            state.note_success(&account.id, backoff_current, base);
+        }
+        // Defensive-only: `parse_kimi_quota_response` returns `Err` (not `Ok(vec![])`) when neither
+        // expected window entry is present, so this arm is unreachable given its current contract —
+        // kept only as a guard against that contract changing underfoot.
+        Ok(_) => {}
+        Err(e) => {
+            state.note_throttled(&account.id, backoff_current, base);
+            let _ = store.mark_overlay_failing(&account.id, now.as_millisecond());
+            eprintln!("collector: [{}] kimi overlay fetch failed: {e}", account.id);
+        }
+    }
+}
+
 /// Whether `account_id` is still present AND active in the current config — the harvest-guard
 /// membership check (spec 015 §A). A result for an account a reload removed or deactivated is dropped
 /// so the collector never stamps fresh data onto a just-gone account.
@@ -1302,6 +1454,9 @@ mod tests {
     use crate::domain::{Provenance, Provider};
     use crate::providers::claude::overlay::{Canned, CannedEndpoint};
     use crate::providers::codex::rate_limits::CannedSource;
+    use crate::providers::kimi::quota::{
+        Canned as KimiCanned, CannedEndpoint as KimiCannedEndpoint,
+    };
     use crate::providers::zai::quota::{Canned as ZaiCanned, CannedEndpoint as ZaiCannedEndpoint};
     use async_trait::async_trait;
     use std::path::PathBuf;
@@ -1322,6 +1477,15 @@ mod tests {
     fn idle_zai_endpoint() -> ZaiCannedEndpoint {
         ZaiCannedEndpoint {
             canned: ZaiCanned::Fail,
+        }
+    }
+
+    /// A never-invoked Kimi quota endpoint for the non-kimi collector tests: no kimi account is
+    /// configured, so `spawn_kimi_overlay_fetches` never calls it — only threaded to satisfy
+    /// `run_collector`'s `K` generic.
+    fn idle_kimi_endpoint() -> KimiCannedEndpoint {
+        KimiCannedEndpoint {
+            canned: KimiCanned::Fail,
         }
     }
 
@@ -1566,6 +1730,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1610,6 +1775,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1684,6 +1850,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1743,6 +1910,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1795,6 +1963,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1883,6 +2052,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2005,6 +2175,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2069,6 +2240,7 @@ mod tests {
             endpoint,
             source,
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2134,6 +2306,7 @@ mod tests {
             endpoint,
             source,
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2387,6 +2560,254 @@ mod tests {
         );
     }
 
+    // ── spec 023 §D (AC4) — Kimi overlay integration, exercised directly via spawn/apply (cloned
+    // from the zai block above).
+
+    /// An opted-in kimi account whose `api_key_env` names `env_var`. Its actual presence in the real
+    /// process environment is up to each test (unique names avoid parallel-test collisions).
+    fn kimi_account(id: &str, env_var: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            label: id.to_uppercase(),
+            provider: Provider::Kimi,
+            config_dir: None,
+            api_key_env: Some(env_var.to_string()),
+            color: None,
+            active: true,
+            limits_overlay: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn opted_in_kimi_account_produces_limits_on_the_overlay_pass() {
+        // Encodes the end-to-end shape (spec 023 AC4): an opted-in kimi account with a present key
+        // and a 200 response lands Session + WeeklyAll limits via the real `parse_quota_response`
+        // mapping (`providers::kimi::quota`).
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = Store::open(&store_dir.path().join("t.db")).expect("open store");
+        let env_var = "TOK_TEST_KIMI_KEY_OPTED_IN";
+        std::env::set_var(env_var, "fake-key-never-logged");
+        let cfg = config(vec![kimi_account("kimi-k2", env_var)]);
+        store.upsert_accounts(&cfg.accounts).expect("upsert");
+
+        let endpoint = Arc::new(KimiCannedEndpoint {
+            canned: KimiCanned::Body(
+                br#"{"usages":[
+                    {"limit":"128","used":"96","resetTime":"2026-07-23T15:30:00Z","duration":"300","durationUnit":"TIME_UNIT_MINUTE"},
+                    {"limit":"512","used":"128","resetTime":"2026-07-27T00:00:00Z","duration":"10080","durationUnit":"TIME_UNIT_MINUTE"}
+                ]}"#
+                    .to_vec(),
+            ),
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
+        spawn_kimi_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        while let Some(joined) = tasks.join_next().await {
+            apply_kimi_overlay_outcome(
+                &cfg,
+                &store,
+                &mut state,
+                &mut alerts,
+                joined.expect("join"),
+            );
+        }
+
+        std::env::remove_var(env_var);
+        let limits = store.latest_limits("kimi-k2").expect("query");
+        assert!(
+            !limits.is_empty(),
+            "an opted-in kimi account with a 200 response should produce Session + WeeklyAll limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_opted_in_kimi_account_is_skipped_with_no_fetch() {
+        let mut acct = kimi_account("kimi-k2", "TOK_TEST_KIMI_KEY_NOT_OPTED_IN");
+        acct.limits_overlay = false;
+        std::env::set_var("TOK_TEST_KIMI_KEY_NOT_OPTED_IN", "fake-key-never-logged");
+        let cfg = config(vec![acct]);
+
+        let endpoint = Arc::new(KimiCannedEndpoint {
+            canned: KimiCanned::Fail,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
+        spawn_kimi_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        std::env::remove_var("TOK_TEST_KIMI_KEY_NOT_OPTED_IN");
+        assert_eq!(
+            tasks.len(),
+            0,
+            "an un-opted-in kimi account must never be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_var_missing_kimi_account_is_skipped_with_no_fetch() {
+        // Deliberately never set — the eligibility check must reject an absent/empty env var, not
+        // just an opted-out account.
+        let acct = kimi_account("kimi-k2", "TOK_TEST_KIMI_KEY_DOES_NOT_EXIST");
+        let cfg = config(vec![acct]);
+
+        let endpoint = Arc::new(KimiCannedEndpoint {
+            canned: KimiCanned::Fail,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
+        spawn_kimi_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        assert_eq!(
+            tasks.len(),
+            0,
+            "a kimi account whose env var is unset must never be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kimi_overlay_pass_never_touches_other_provider_accounts() {
+        // claude/zai/codex collection stays byte-identical: `spawn_kimi_overlay_fetches` must only
+        // ever pick up `Provider::Kimi` accounts, even in a mixed fleet.
+        let zai_env = "TOK_TEST_ZAI_KEY_MIXED_KIMI_FLEET";
+        let kimi_env = "TOK_TEST_KIMI_KEY_MIXED_FLEET";
+        std::env::set_var(kimi_env, "fake-key-never-logged");
+        let mut claude_acct = account("claude-acct");
+        claude_acct.limits_overlay = true;
+        let zai_acct = Account {
+            id: "zai-lite".to_string(),
+            label: "ZAI".to_string(),
+            provider: Provider::Zai,
+            config_dir: None,
+            api_key_env: Some(zai_env.to_string()),
+            color: None,
+            active: true,
+            limits_overlay: true,
+        };
+        let cfg = config(vec![
+            claude_acct,
+            zai_acct,
+            kimi_account("kimi-k2", kimi_env),
+        ]);
+
+        let endpoint = Arc::new(KimiCannedEndpoint {
+            canned: KimiCanned::Fail,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
+        spawn_kimi_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        std::env::remove_var(kimi_env);
+        assert_eq!(tasks.len(), 1, "only the kimi account is fetched");
+        let outcome = tasks.join_next().await.expect("one task").expect("join");
+        assert_eq!(outcome.account.id, "kimi-k2");
+    }
+
+    #[tokio::test]
+    async fn kimi_overlay_failure_backs_off_and_demotes_stale_authoritative_to_estimate() {
+        // spec 023 AC3 (the ERROR path, end to end): a failing kimi overlay fetch must (a) advance
+        // backoff/cooldown, (b) mark the account overlay-failing, and (c) — once the failure persists
+        // past the TTL — demote the account's now-stale authoritative limits to `Estimate` on the next
+        // re-evaluation. Same machinery, same posture as the zai twin
+        // (`zai_overlay_failure_backs_off_and_demotes_stale_authoritative_to_estimate`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_KIMI_KEY_FAILURE_BACKOFF";
+        std::env::set_var(env_var, "fake-key-never-logged");
+        let cfg = config(vec![kimi_account("kimi-k2", env_var)]);
+        store.upsert_accounts(&cfg.accounts).expect("upsert");
+
+        // Seed an authoritative set from a "previous" successful overlay pass, recorded long ago.
+        let seeded = "2026-07-04T10:00:00Z".parse::<Timestamp>().unwrap();
+        store
+            .set_limits(
+                "kimi-k2",
+                &[
+                    Limit {
+                        account_id: "kimi-k2".to_string(),
+                        provider: Provider::Kimi,
+                        kind: crate::domain::LimitKind::Session,
+                        scope: None,
+                        utilization_pct: 75.0,
+                        resets_at: "2026-07-04T15:00:00Z".to_string(),
+                        severity: Severity::Ok,
+                        source: Provenance::Authoritative,
+                    },
+                    Limit {
+                        account_id: "kimi-k2".to_string(),
+                        provider: Provider::Kimi,
+                        kind: crate::domain::LimitKind::WeeklyAll,
+                        scope: None,
+                        utilization_pct: 25.0,
+                        resets_at: "2026-07-10T00:00:00Z".to_string(),
+                        severity: Severity::Ok,
+                        source: Provenance::Authoritative,
+                    },
+                ],
+                seeded,
+            )
+            .expect("seed");
+        store
+            .record_overlay_success("kimi-k2", seeded.as_millisecond())
+            .expect("record");
+
+        // Drive one failing fetch through the real spawn + harvest path (a 429, same as an exhausted
+        // key or dead subscription would produce).
+        let endpoint = Arc::new(KimiCannedEndpoint {
+            canned: KimiCanned::RateLimited,
+        });
+        let mut state = OverlayState::default();
+        let mut tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
+        spawn_kimi_overlay_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        while let Some(joined) = tasks.join_next().await {
+            apply_kimi_overlay_outcome(
+                &cfg,
+                &store,
+                &mut state,
+                &mut alerts,
+                joined.expect("join"),
+            );
+        }
+
+        // (a) backoff/cooldown advanced for the account.
+        let base = cfg.settings.poll_overlay_secs.max(1);
+        assert!(
+            state.backoff_secs.get("kimi-k2").copied().unwrap_or(base) > base,
+            "a failed fetch must grow the account's backoff: {:?}",
+            state.backoff_secs
+        );
+        assert!(
+            state.cooldown_ticks.get("kimi-k2").copied().unwrap_or(0) > 0,
+            "a failed fetch must set a cooldown: {:?}",
+            state.cooldown_ticks
+        );
+
+        // (b) the account is marked overlay-failing.
+        assert!(
+            store
+                .overlay_failing_since("kimi-k2")
+                .expect("query")
+                .is_some(),
+            "a failing kimi overlay fetch must pin the failing-since marker"
+        );
+
+        // (c) once the last overlay success ages past the TTL, the next re-evaluation demotes the
+        // stale authoritative set to Estimate (spec 011 §C — provider-agnostic demotion).
+        let ttl = cfg
+            .settings
+            .poll_overlay_secs
+            .saturating_mul(OVERLAY_TTL_FACTOR);
+        let past_ttl = "2026-07-04T10:30:00Z".parse::<Timestamp>().unwrap(); // 30 min > 10 min ttl
+        reevaluate_limits(&store, "kimi-k2", Vec::new(), past_ttl, &mut alerts, ttl);
+
+        let demoted = store.latest_limits("kimi-k2").expect("query");
+        assert!(
+            !demoted.is_empty() && demoted.iter().all(|l| l.source == Provenance::Estimate),
+            "the stale authoritative kimi limits must demote to Estimate past the TTL: {demoted:?}"
+        );
+    }
+
     #[tokio::test]
     async fn reload_activating_an_account_starts_local_and_overlay_and_applies_new_thresholds() {
         // Spec 015 §A / acceptance 1 + 2: an account flipped active=false→true mid-run joins the next
@@ -2422,6 +2843,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2479,6 +2901,7 @@ mod tests {
             endpoint,
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2594,6 +3017,7 @@ mod tests {
             },
             idle_rate_source(),
             idle_zai_endpoint(),
+            idle_kimi_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_mins(1)).await;

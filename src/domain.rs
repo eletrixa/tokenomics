@@ -41,6 +41,8 @@ pub enum Provider {
     Gemini,
     /// xAI Grok Build CLI — usage-only, `config_dir`-attributed, no limits surface (spec 021).
     Grok,
+    /// Kimi (Moonshot AI) coding plan — limits-only, API-key attributed, dormant until a live key (spec 023).
+    Kimi,
 }
 
 impl Provider {
@@ -52,6 +54,7 @@ impl Provider {
             Self::Zai => "zai",
             Self::Gemini => "gemini",
             Self::Grok => "grok",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -63,6 +66,7 @@ impl Provider {
             "zai" => Some(Self::Zai),
             "gemini" => Some(Self::Gemini),
             "grok" => Some(Self::Grok),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }

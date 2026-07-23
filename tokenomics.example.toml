@@ -51,3 +51,13 @@ limits_overlay = false    # opt-in, OFF by default — see the README overlay no
 # label = "Grok"
 # provider = "grok"
 # config_dir = "~/.grok"  # this account's GROK_HOME — attribution comes from the dir
+
+# A sixth provider — Kimi (Moonshot AI coding plan) has no local usage lane, so it's limits-only.
+# Signups are currently paused: with the named env var unset the account stays dormant (skipped
+# with a logged reason). Uncomment and adjust once you hold a Kimi subscription key (sk-kimi-…):
+# [[account]]
+# id = "kimi-k2"
+# label = "Kimi"
+# provider = "kimi"
+# api_key_env = "KIMI_CODING_KEY"  # NAME of the env var holding your Kimi subscription key — never the key itself
+# limits_overlay = true            # kimi has no local usage lane; opt in to see any gauges at all

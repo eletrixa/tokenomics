@@ -22,6 +22,23 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   real subprocess, so effective heavy concurrency stays well under the cap.
 
 ### ADDED
+- **Kimi (Moonshot AI coding plan) is now a monitored, limits-only provider (spec 023) —
+  fixture-tested and shipping dormant until a live subscription key exists (signups paused).**
+  `Provider::Kimi` (`"kimi"`) round-trips config/store/display; identity is `api_key_env`
+  (an env-var NAME, never a value), `config_dir` optional-unused — the zai contract exactly.
+  `providers/kimi/quota.rs` parses `GET https://api.kimi.com/coding/v1/usages`
+  (community-captured shape, unverified against a live key): the string-typed `limit`/`used`
+  numerics are parsed and the utilization % **derived** as used/limit (zero/negative/non-finite/
+  non-numeric/missing numerics skip the entry, never a confident 0%), the rolling-5h entry
+  (`duration "300"` minutes) maps to `Session` **with its real `resetTime` countdown** — unlike
+  z.ai, Kimi provides a reset instant for the rolling window, so it renders honestly — and the
+  weekly entry (`"10080"`, unverified discriminator) to `WeeklyAll`; unknown entries skipped;
+  both-windows-missing ⇒ error. Rides the existing overlay cadence/backoff/TTL-demotion as an
+  additional select-loop arm; 429 → the shared `RateLimited` backoff (the
+  `exceeded_current_quota_error` envelope is documented, not parsed). Usage lane honestly idle
+  (no invented usage or cost). An account whose env var is unset is skipped with a logged reason
+  — the shipping default. PAYG balance (api.moonshot.ai, dollars) is a declared non-goal.
+  Goldens byte-identical.
 - **`docs/SETUP.md` — a full setup walkthrough.** Manual quickstart (per-provider `[[account]]`
   snippets and validation rules), the subscription ledger explained with a complete example
   (schema, exact-id join, `ledger_path` / `TOKENOMICS_LEDGER` wiring), a paste-in Claude Code

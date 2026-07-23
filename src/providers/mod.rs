@@ -2,9 +2,9 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/providers/mod.rs
-//! Deps:    async-trait, jiff; claude/codex/zai/gemini/grok adapters; runner (Runner seam)
+//! Deps:    async-trait, jiff; claude/codex/zai/gemini/grok/kimi adapters; runner (Runner seam)
 //! Tested:  via providers/claude (ClaudeAdapter::collect) + providers/codex + providers/zai +
-//!          providers/gemini + providers/grok inline tests
+//!          providers/gemini + providers/grok + providers/kimi inline tests
 //!
 //! Key responsibilities:
 //! - `ProviderAdapter`: collect a normalized snapshot for one account, plus `collect_local_limits`
@@ -28,12 +28,14 @@ pub mod claude;
 pub mod codex;
 pub mod gemini;
 pub mod grok;
+pub mod kimi;
 pub mod zai;
 
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use gemini::GeminiAdapter;
 use grok::GrokAdapter;
+use kimi::KimiAdapter;
 use zai::ZaiAdapter;
 
 /// One provider's collection behavior. `collect` returns `None` when the account is idle
@@ -73,6 +75,8 @@ pub struct ProviderRegistry<R: Runner> {
     pub gemini: GeminiAdapter,
     /// The Grok usage adapter (unified.jsonl under each account's `GROK_HOME`, spec 021 §B).
     pub grok: GrokAdapter,
+    /// The Kimi usage adapter (always idle — limits-only, spec 023).
+    pub kimi: KimiAdapter,
 }
 
 #[async_trait]
@@ -84,6 +88,7 @@ impl<R: Runner> ProviderAdapter for ProviderRegistry<R> {
             Provider::Zai => self.zai.collect(account, now).await,
             Provider::Gemini => self.gemini.collect(account, now).await,
             Provider::Grok => self.grok.collect(account, now).await,
+            Provider::Kimi => self.kimi.collect(account, now).await,
         }
     }
 
@@ -102,7 +107,11 @@ impl<R: Runner> ProviderAdapter for ProviderRegistry<R> {
                     .collect_local_limits(account, now, warn_pct, crit_pct)
                     .await
             }
-            Provider::Claude | Provider::Codex | Provider::Zai | Provider::Gemini => Ok(Vec::new()),
+            Provider::Claude
+            | Provider::Codex
+            | Provider::Zai
+            | Provider::Gemini
+            | Provider::Kimi => Ok(Vec::new()),
         }
     }
 }

@@ -9,8 +9,8 @@
 //! Key responsibilities:
 //! - Parse `tok` subcommands: (default) tui | init | validate | accounts | once | collector | doctor.
 //! - `init`: write the embedded starter `tokenomics.example.toml` to the config path (never clobbers).
-//! - `once`: collect one snapshot per account (dispatched to the Claude/Codex/Zai/Gemini adapter
-//!   by provider) and print it (human/JSON).
+//! - `once`: collect one snapshot per account (dispatched to the Claude/Codex/Zai/Gemini/Grok/Kimi
+//!   adapter by provider) and print it (human/JSON).
 //!
 //! Design constraints:
 //! - `unsafe_code = "forbid"` is crate policy (Cargo `[lints]`); never reach for unsafe.
@@ -52,6 +52,8 @@ use providers::codex::rate_limits::AppServerClient;
 use providers::codex::CodexAdapter;
 use providers::gemini::GeminiAdapter;
 use providers::grok::GrokAdapter;
+use providers::kimi::quota::HttpQuotaEndpoint as KimiHttpQuotaEndpoint;
+use providers::kimi::KimiAdapter;
 use providers::zai::quota::HttpQuotaEndpoint;
 use providers::zai::ZaiAdapter;
 use providers::{ProviderAdapter, ProviderRegistry};
@@ -265,6 +267,7 @@ async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
     let zai = ZaiAdapter::new();
     let gemini = GeminiAdapter::new();
     let grok = GrokAdapter::new();
+    let kimi = KimiAdapter::new();
     let now = Timestamp::now();
     let (warn, crit) = (cfg.settings.warn_pct, cfg.settings.crit_pct);
     let mut records = Vec::with_capacity(cfg.accounts.len());
@@ -278,6 +281,7 @@ async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
             Provider::Zai => collect_record(&zai, account, now, warn, crit).await,
             Provider::Gemini => collect_record(&gemini, account, now, warn, crit).await,
             Provider::Grok => collect_record(&grok, account, now, warn, crit).await,
+            Provider::Kimi => collect_record(&kimi, account, now, warn, crit).await,
         };
         records.push(record);
     }
@@ -399,10 +403,12 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
             zai: ZaiAdapter::new(),
             gemini: GeminiAdapter::new(),
             grok: GrokAdapter::new(),
+            kimi: KimiAdapter::new(),
         };
         let endpoint = HttpUsageEndpoint::new()?;
         let rate_source = AppServerClient::new(Duration::from_secs(CODEX_APP_SERVER_TIMEOUT_SECS));
         let zai_endpoint = HttpQuotaEndpoint::new()?;
+        let kimi_endpoint = KimiHttpQuotaEndpoint::new()?;
         let overlay_on = cfg.accounts.iter().filter(|a| a.limits_overlay).count();
         println!(
             "collector: watching {} account(s) every {}s ({overlay_on} with overlay) → {} (Ctrl-C to stop)",
@@ -417,6 +423,7 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
             endpoint,
             rate_source,
             zai_endpoint,
+            kimi_endpoint,
             store,
             collector::shutdown_signal(),
         )
@@ -641,6 +648,26 @@ mod tests {
         let records = collect_once(&cfg).await;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].provider, Provider::Zai);
+        assert!(records[0].error.is_none(), "always idle, never an error");
+        assert!(records[0].snapshot.is_none(), "no usage lane ⇒ no snapshot");
+        assert!(records[0].session_limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_once_dispatches_kimi_as_always_idle() {
+        // A kimi account has no config_dir and no local usage lane at all (spec 023 §C): `once`
+        // produces a real record with NO error, no snapshot, and no derived session limit.
+        let mut kimi = account("kimi", true);
+        kimi.provider = Provider::Kimi;
+        kimi.config_dir = None;
+        kimi.api_key_env = Some("KIMI_TEST_KEY_MAIN".to_string());
+        let cfg = Config {
+            settings: config::Settings::default(),
+            accounts: vec![kimi],
+        };
+        let records = collect_once(&cfg).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].provider, Provider::Kimi);
         assert!(records[0].error.is_none(), "always idle, never an error");
         assert!(records[0].snapshot.is_none(), "no usage lane ⇒ no snapshot");
         assert!(records[0].session_limit.is_none());

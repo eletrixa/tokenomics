@@ -234,10 +234,10 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
     findings
 }
 
-/// Per-provider account-field validation (spec 019 §A, 020 §A, 021 §A): `claude`/`codex`/`gemini`/
-/// `grok` require `config_dir` and reject `api_key_env`; `zai` requires `api_key_env` (a non-empty
-/// env-var NAME) and leaves `config_dir` optional (accepted but unused this wave). Pure — no I/O,
-/// no env-var reads.
+/// Per-provider account-field validation (spec 019 §A, 020 §A, 021 §A, 023 §A): `claude`/`codex`/
+/// `gemini`/`grok` require `config_dir` and reject `api_key_env`; `zai`/`kimi` require `api_key_env`
+/// (a non-empty env-var NAME) and leave `config_dir` optional (accepted but unused this wave). Pure
+/// — no I/O, no env-var reads.
 fn validate_provider_fields(account: &Account) -> Vec<Finding> {
     let mut findings = Vec::new();
     match account.provider {
@@ -255,15 +255,15 @@ fn validate_provider_fields(account: &Account) -> Vec<Finding> {
                 )));
             }
         }
-        Provider::Zai => {
+        Provider::Zai | Provider::Kimi => {
             let missing = account
                 .api_key_env
                 .as_deref()
                 .is_none_or(|v| v.trim().is_empty());
             if missing {
                 findings.push(Finding::error(format!(
-                    "account '{}': api_key_env is required for provider 'zai'",
-                    account.id
+                    "account '{}': api_key_env is required for provider '{}'",
+                    account.id, account.provider
                 )));
             }
         }
@@ -618,6 +618,76 @@ api_key_env = \"SOME_KEY\"
         let codex_toml = ONE.replace("claude", "codex");
         let codex_cfg = Config::parse(&codex_toml).expect("parses");
         assert!(validate(&codex_cfg).is_empty());
+    }
+
+    // ── spec 023 §A (AC1): "kimi" round-trips; config_dir optional-unused, api_key_env required ──
+
+    const KIMI: &str = "\
+[[account]]
+id = \"kimi-k2\"
+label = \"Kimi K2\"
+provider = \"kimi\"
+api_key_env = \"KIMI_CODING_KEY\"
+";
+
+    #[test]
+    fn kimi_round_trips_provider_id() {
+        assert_eq!(Provider::parse("kimi"), Some(Provider::Kimi));
+        assert_eq!(Provider::Kimi.as_str(), "kimi");
+    }
+
+    #[test]
+    fn kimi_account_parses_with_no_config_dir_and_a_named_api_key_env() {
+        let cfg = Config::parse(KIMI).expect("parses");
+        assert_eq!(cfg.accounts[0].provider, Provider::Kimi);
+        assert_eq!(cfg.accounts[0].config_dir, None);
+        assert_eq!(
+            cfg.accounts[0].api_key_env.as_deref(),
+            Some("KIMI_CODING_KEY")
+        );
+        assert!(
+            validate(&cfg).is_empty(),
+            "a well-formed kimi account must validate clean: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn kimi_account_without_api_key_env_fails_validation_naming_the_account() {
+        let toml = "\
+[[account]]
+id = \"kimi-k2\"
+label = \"Kimi K2\"
+provider = \"kimi\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("kimi-k2") && m.contains("api_key_env")),
+            "must name the account and the missing field: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn kimi_account_with_empty_api_key_env_fails_validation() {
+        let toml = format!("{}\n", KIMI.replace("KIMI_CODING_KEY", "   "));
+        let cfg = Config::parse(&toml).expect("parses");
+        assert!(validate(&cfg)
+            .iter()
+            .any(|f| f.message.contains("api_key_env")));
+    }
+
+    #[test]
+    fn kimi_account_accepts_an_optional_unused_config_dir() {
+        let toml = format!("{KIMI}config_dir = \"/nonexistent\"\n");
+        let cfg = Config::parse(&toml).expect("parses");
+        assert_eq!(
+            cfg.accounts[0].config_dir.as_deref(),
+            Some(Path::new("/nonexistent"))
+        );
+        assert!(validate(&cfg).is_empty());
+        assert!(validate_environment(&cfg).is_empty());
     }
 
     // ── spec 020 §A (AC1): "gemini" round-trips; config_dir required, api_key_env rejected,

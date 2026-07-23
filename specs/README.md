@@ -29,10 +29,12 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 020 | [gemini-provider](020-gemini-provider.md) | Gemini adapter: usage-only from local chats JSON[L] (fan-out glob, mtime-pruned), both gauges honestly n/a, no cost | Done |
 | 021 | [grok-provider](021-grok-provider.md) | Grok Build adapter: usage-only from `logs/unified.jsonl` (`inference_done` events, no dedup, reasoning ⊆ completion), both gauges n/a, no cost | Done |
 | 022 | [grok-weekly-quota](022-grok-weekly-quota.md) | Grok weekly quota gauge from local `billing: fetched credits config` lines (supersedes 021 §C — `creditUsagePercent` IS the sub quota); additive `collect_local_limits` seam; quota rides idle ticks | Done |
+| 023 | [kimi-provider](023-kimi-provider.md) | Kimi adapter: limits-only quota overlay (`api_key_env` identity, derived % from string numerics, session %/reset + weekly %/reset), dormant until a live subscription key | Active |
 
 Scope now: **Claude** (6 accounts) + **Codex** (spec 013) + **z.ai** (spec 019, limits-only) +
 **Gemini** (spec 020, usage-only — activates on a gemini-cli login) + **Grok Build** (spec 021,
-usage-only — SuperGrok Heavy bought 2026-07-19, real `~/.grok/logs/unified.jsonl` fixtures).
+usage-only — SuperGrok Heavy bought 2026-07-19, real `~/.grok/logs/unified.jsonl` fixtures) +
+Kimi (spec 023, limits-only — dormant, signups paused).
 
 ## Future spec candidates (from the 2026-07-15 discovery/premortem pass)
 

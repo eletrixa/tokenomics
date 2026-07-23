@@ -1340,6 +1340,82 @@ mod tests {
         assert_eq!(usage.cost_notional, None, "never a fabricated cost");
     }
 
+    // ── spec 023 §D (AC5): a kimi account renders session % WITH a countdown (unlike zai — Kimi
+    // provides a real 5h reset instant), weekly % with a countdown, and no usage/cost row. Same
+    // provider-agnostic rendering path as the zai test above proves the generic path already covers
+    // this shape correctly, with zero kimi-specific TUI code.
+
+    #[test]
+    fn kimi_account_renders_session_with_countdown_and_weekly_with_countdown_and_no_usage_row() {
+        let kimi_account = Account {
+            id: "kimi-k2".to_string(),
+            label: "Kimi".to_string(),
+            provider: Provider::Kimi,
+            config_dir: None,
+            api_key_env: Some("KIMI_CODING_KEY".to_string()),
+            color: None,
+            active: true,
+            limits_overlay: true,
+        };
+        let session = Limit {
+            account_id: "kimi-k2".to_string(),
+            provider: Provider::Kimi,
+            kind: LimitKind::Session,
+            scope: None,
+            utilization_pct: 75.0,
+            // Kimi provides a real reset instant for the rolling window (spec 023 §B) — the honest
+            // divergence from zai's `resets_at = ""`.
+            resets_at: "2026-07-23T15:30:00Z".to_string(),
+            severity: Severity::Warn,
+            source: Provenance::Authoritative,
+        };
+        let weekly = Limit {
+            account_id: "kimi-k2".to_string(),
+            provider: Provider::Kimi,
+            kind: LimitKind::WeeklyAll,
+            scope: None,
+            utilization_pct: 25.0,
+            resets_at: "2026-07-27T00:00:00Z".to_string(),
+            severity: Severity::Ok,
+            source: Provenance::Authoritative,
+        };
+        let now: Timestamp = "2026-07-23T10:00:00Z".parse().unwrap();
+        let limits = [session, weekly];
+        let data = AccountData {
+            snapshot: None, // no usage lane at all (spec 023 §C)
+            limits: &limits,
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::date(2026, 7, 23),
+        };
+        let row = build_account_view(&kimi_account, data, now, true);
+
+        assert_eq!(row.title, "Kimi [kimi]");
+
+        let session_gauge = row.session.expect("session gauge");
+        assert!((session_gauge.ratio - 0.75).abs() < 1e-9);
+        assert!(
+            session_gauge.reset.is_some(),
+            "Kimi provides a real 5h reset instant — the honest divergence from zai"
+        );
+
+        let weekly_gauge = row.weekly.expect("weekly gauge");
+        assert!((weekly_gauge.ratio - 0.25).abs() < 1e-9);
+        assert!(
+            weekly_gauge.reset.is_some(),
+            "the weekly gauge has a real resets_at — it must carry a countdown"
+        );
+
+        let usage = account_usage(None, &limits, None);
+        assert_eq!(
+            usage.total_tokens, None,
+            "no usage row — no local usage lane at all"
+        );
+        assert_eq!(usage.cost_notional, None, "never a fabricated cost");
+    }
+
     // ── spec 020 §D (AC5): a gemini account renders its tokens (no cost line) with BOTH gauges
     // honestly `n/a` — no derived anything, no invented limit. Same provider-agnostic rendering
     // path as the zai test above proves the generic path already covers this shape correctly.
