@@ -2,8 +2,9 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/doctor.rs
-//! Deps:    jiff; runner (ccusage/codex/gemini version), providers::claude (adapter/creds/overlay),
-//!          providers::codex (app-server rate-limits probe), providers::zai (quota probe)
+//! Deps:    jiff; runner (ccusage/codex/gemini/grok version), providers::claude
+//!          (adapter/creds/overlay), providers::codex (app-server rate-limits probe),
+//!          providers::zai (quota probe), providers::grok::billing (weekly-quota parse)
 //! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
 //!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
 //!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8); the
@@ -22,6 +23,10 @@
 //! - Per Gemini account: `gemini --version` (argv subprocess, timeout, output never parsed beyond
 //!   success); `oauth_creds.json` existence ONLY (content never read); a note when `limits_overlay`
 //!   is set even though Gemini has no limits surface to opt into (spec 020 §D).
+//! - Per Grok account: `grok --version`; `logs/unified.jsonl` presence; the weekly-quota state
+//!   parsed from its billing lines — live / expired / absent (spec 022 §D — the one local-log
+//!   CONTENT inspection this report makes, amending 021 §D's existence-only rule); the
+//!   ignored-`limits_overlay` note (the quota lane is local and always on).
 //! - Cross-account (Claude only): `CLAUDE_CONFIG_DIR` round-trip distinctness + shared-`projects/`.
 //! - Ledger plane (spec 017 §E): resolved path + provenance (`"ledger: not configured"` when `Off`);
 //!   past-dated rows (`renews`/`paid_through` already behind `today`); failed-parse rows with reason;
@@ -535,19 +540,47 @@ fn gemini_overlay_ignored_note(limits_overlay: bool) -> Option<String> {
     })
 }
 
-/// Read-only diagnostics for a Grok account (spec 021 §D): the CLI version, whether the account's
-/// `logs/unified.jsonl` exists (existence only — content never inspected), and the ignored-overlay
-/// note when set. No network, no quota surface (spec 021 §C).
+/// Read-only diagnostics for a Grok account (spec 021 §D, amended by 022 §D): the CLI version,
+/// whether the account's `logs/unified.jsonl` exists, the weekly-quota state parsed from its
+/// billing lines (the one content inspection this report makes), and the ignored-overlay note when
+/// set. No network.
 async fn report_grok(account: &crate::domain::Account) {
     println!("  grok:        {}", grok_version().await);
-    let log_marker = match account.config_dir.as_deref() {
-        Some(dir) if dir.join("logs").join("unified.jsonl").exists() => "present",
+    let log_path = account
+        .config_dir
+        .as_deref()
+        .map(|dir| dir.join("logs").join("unified.jsonl"));
+    let log_marker = match &log_path {
+        Some(path) if path.exists() => "present",
         Some(_) => "MISSING (run `grok` and complete a turn)",
         None => "n/a (no config_dir)",
     };
     println!("  usage log:   {log_marker}");
+    let quota = log_path
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| crate::providers::grok::billing::newest_billing_quota(&bytes));
+    println!(
+        "  weekly quota: {}",
+        grok_quota_note(quota.as_ref(), Timestamp::now())
+    );
     if let Some(note) = grok_overlay_ignored_note(account.limits_overlay) {
         println!("  {note}");
+    }
+}
+
+/// Pure: the weekly-quota report line for one parsed billing state (spec 022 §D) — live, expired
+/// (the newest line's period lapsed with no fresh CLI run), or absent entirely.
+fn grok_quota_note(
+    quota: Option<&crate::providers::grok::billing::BillingQuota>,
+    now: Timestamp,
+) -> String {
+    match quota {
+        None => "no billing line found (run `grok`; quota appears after a session)".to_string(),
+        Some(q) if q.period_end <= now => format!(
+            "{}% — period ended {} [expired; run `grok` to refresh]",
+            q.percent, q.period_end_raw
+        ),
+        Some(q) => format!("{}% used, resets {} [live]", q.percent, q.period_end_raw),
     }
 }
 
@@ -566,11 +599,12 @@ async fn grok_version() -> String {
 }
 
 /// Pure: the note printed when a Grok account has `limits_overlay = true` — accepted by config
-/// (spec 021 §A) but ignored, since no scriptable subscription-quota surface exists for Grok Build
-/// (spec 021 §C). `None` when unset, so an un-opted-in account's report stays silent about it.
+/// (spec 021 §A) but ignored: grok's weekly quota is read from the LOCAL billing log, always on,
+/// with no network overlay to opt into (spec 022 §C). `None` when unset, so an un-opted-in
+/// account's report stays silent about it.
 fn grok_overlay_ignored_note(limits_overlay: bool) -> Option<String> {
     limits_overlay.then(|| {
-        "overlay:     ignored — grok has no subscription limits/quota surface to opt into (spec 021 §C)"
+        "overlay:     ignored — grok's weekly quota comes from the local billing log; there is no network overlay (spec 022 §C)"
             .to_string()
     })
 }
@@ -753,6 +787,34 @@ mod tests {
 
     fn pair(id: &str, path: &str) -> (String, PathBuf) {
         (id.to_string(), PathBuf::from(path))
+    }
+
+    // ── spec 022 §D (AC6): the grok weekly-quota report line per billing state ─────────────────
+
+    #[test]
+    fn grok_quota_note_covers_absent_live_and_expired_states() {
+        use crate::providers::grok::billing::BillingQuota;
+        let now: Timestamp = "2026-07-20T00:00:00Z".parse().unwrap();
+        let quota = BillingQuota {
+            timestamp: "2026-07-19T15:00:00Z".parse().unwrap(),
+            percent: 12.5,
+            period_end_raw: "2026-07-26T00:00:00+00:00".to_string(),
+            period_end: "2026-07-26T00:00:00Z".parse().unwrap(),
+        };
+
+        assert_eq!(
+            grok_quota_note(None, now),
+            "no billing line found (run `grok`; quota appears after a session)"
+        );
+        assert_eq!(
+            grok_quota_note(Some(&quota), now),
+            "12.5% used, resets 2026-07-26T00:00:00+00:00 [live]"
+        );
+        let after: Timestamp = "2026-07-27T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            grok_quota_note(Some(&quota), after),
+            "12.5% — period ended 2026-07-26T00:00:00+00:00 [expired; run `grok` to refresh]"
+        );
     }
 
     #[test]

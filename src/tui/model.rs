@@ -760,12 +760,16 @@ pub fn build_account_view(
     // that is the "stall flag hasn't tripped" condition from spec 015 §C.
     let overlay_silent_since_ms =
         overlay_ms.filter(|&ms| now.as_millisecond().saturating_sub(ms) > OVERLAY_STALL_MS);
-    // Gemini and Grok have no limits/quota surface at all (spec 020 §C, 021 §C) — `limits_overlay`
-    // is accepted but IGNORED, so neither "enable overlay" (nothing to enable) nor "waiting for
-    // overlay" (nothing will ever arrive) is honest, however the flag is set. Every other provider
-    // keeps the overlay-state hint below.
-    let weekly_hint = if matches!(account.provider, Provider::Gemini | Provider::Grok) {
+    // Gemini has no limits/quota surface at all (spec 020 §C) — `limits_overlay` is accepted but
+    // IGNORED, so neither "enable overlay" (nothing to enable) nor "waiting for overlay" (nothing
+    // will ever arrive) is honest, however the flag is set. Grok's weekly quota comes from its
+    // LOCAL billing log (spec 022 §D — overlay equally ignored): when no row exists the honest
+    // reason is that the grok CLI hasn't logged a quota line for a live period yet. Every other
+    // provider keeps the overlay-state hint below.
+    let weekly_hint = if account.provider == Provider::Gemini {
         "n/a (no limits surface)".to_string()
+    } else if account.provider == Provider::Grok {
+        "n/a (awaiting grok billing log)".to_string()
     } else if !account.limits_overlay {
         "n/a (enable overlay)".to_string()
     } else if token_status == Some(TokenStatus::Stale) {
@@ -1453,6 +1457,68 @@ mod tests {
         assert_eq!(
             row.weekly_hint, "n/a (no limits surface)",
             "the ignored flag must never produce a 'waiting for overlay' that waits forever"
+        );
+    }
+
+    // ── spec 022 §D (AC5): grok's weekly gauge renders from a stored row; the hint is grok-honest.
+
+    fn grok_account() -> Account {
+        Account {
+            id: "grok-main".to_string(),
+            label: "Grok".to_string(),
+            provider: Provider::Grok,
+            config_dir: Some(PathBuf::from("/home/example/.grok")),
+            api_key_env: None,
+            color: None,
+            active: true,
+            limits_overlay: false,
+        }
+    }
+
+    #[test]
+    fn a_grok_account_without_a_weekly_row_hints_at_the_billing_log_not_the_overlay() {
+        let now: Timestamp = "2026-07-20T10:00:00Z".parse().unwrap();
+        let data = AccountData {
+            snapshot: None,
+            limits: &[],
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::date(2026, 7, 20),
+        };
+        let row = build_account_view(&grok_account(), data, now, true);
+        assert!(row.weekly.is_none());
+        assert_eq!(
+            row.weekly_hint, "n/a (awaiting grok billing log)",
+            "grok's missing weekly must name its local source, never the (ignored) overlay"
+        );
+    }
+
+    #[test]
+    fn a_grok_weekly_quota_row_renders_the_gauge_through_the_shared_machinery() {
+        let now: Timestamp = "2026-07-20T10:00:00Z".parse().unwrap();
+        let mut weekly = authoritative(LimitKind::WeeklyAll, None, 12.5, Severity::Ok);
+        weekly.account_id = "grok-main".to_string();
+        weekly.provider = Provider::Grok;
+        weekly.resets_at = "2026-07-26T00:00:00+00:00".to_string();
+        let limits = vec![weekly];
+        let data = AccountData {
+            snapshot: None,
+            limits: &limits,
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::date(2026, 7, 20),
+        };
+        let row = build_account_view(&grok_account(), data, now, true);
+        let gauge = row
+            .weekly
+            .expect("a stored WeeklyAll row must render the gauge");
+        assert!(
+            (gauge.ratio - 0.125).abs() < 1e-9,
+            "the gauge must carry the quota percent verbatim: {gauge:?}"
         );
     }
 

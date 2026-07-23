@@ -41,8 +41,10 @@ limits_overlay = false    # opt-in, OFF by default — see the README overlay no
 # provider = "gemini"
 # config_dir = "~/.gemini"  # this account's GEMINI_CLI_HOME — attribution comes from the dir
 
-# A fifth provider — Grok Build CLI logs inference events under GROK_HOME. Usage-only: no
-# scriptable limits surface exists, so both gauges always show n/a (never a fabricated pool %).
+# A fifth provider — Grok Build CLI logs inference events under GROK_HOME. Usage comes from
+# inference events; the WEEKLY gauge comes from the same log's billing lines (the CLI's own
+# weekly-quota %, spec 022) — local reads only, no network, nothing to opt into. The session
+# gauge stays n/a (Grok exposes no session-window surface).
 # Uncomment and adjust to monitor a SuperGrok subscription too:
 # [[account]]
 # id = "grok-heavy"

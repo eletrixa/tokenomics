@@ -28,6 +28,7 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 019 | [zai-provider](019-zai-provider.md) | z.ai GLM adapter: limits-only authoritative quota overlay (`api_key_env` identity, session %/no-reset + weekly %/reset), honest idle usage | Done |
 | 020 | [gemini-provider](020-gemini-provider.md) | Gemini adapter: usage-only from local chats JSON[L] (fan-out glob, mtime-pruned), both gauges honestly n/a, no cost | Done |
 | 021 | [grok-provider](021-grok-provider.md) | Grok Build adapter: usage-only from `logs/unified.jsonl` (`inference_done` events, no dedup, reasoning ⊆ completion), both gauges n/a, no cost | Done |
+| 022 | [grok-weekly-quota](022-grok-weekly-quota.md) | Grok weekly quota gauge from local `billing: fetched credits config` lines (supersedes 021 §C — `creditUsagePercent` IS the sub quota); additive `collect_local_limits` seam; quota rides idle ticks | Done |
 
 Scope now: **Claude** (6 accounts) + **Codex** (spec 013) + **z.ai** (spec 019, limits-only) +
 **Gemini** (spec 020, usage-only — activates on a gemini-cli login) + **Grok Build** (spec 021,

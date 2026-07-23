@@ -9,12 +9,15 @@
 //! - `GrokAdapter`: implement `ProviderAdapter::collect` over the account's `GROK_HOME`
 //!   (`config_dir`), reading the single append-only `logs/unified.jsonl` — unlike Gemini's
 //!   fan-out across N project-hash dirs, a Grok account's usage is one global log (spec 021 §B).
+//! - `collect_local_limits`: the weekly subscription quota from the same log's billing lines
+//!   (spec 022 §B) — read WITHOUT the usage lane's mtime prune (an old line still carries a live
+//!   period; the pct cannot move without a CLI run, and a CLI run appends a fresh line).
 //!
 //! Design constraints:
 //! - Attribution is the account's `config_dir` (its `GROK_HOME`), never the logs.
-//! - No limits/overlay plane exists for Grok's subscription quota (spec 021 §C) — this adapter only
-//!   ever produces a usage snapshot or idle; it never fetches anything over the network.
+//! - Both lanes are local file I/O — this adapter never fetches anything over the network.
 
+pub mod billing;
 pub mod logs;
 
 use std::time::{Duration, SystemTime};
@@ -22,10 +25,11 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use jiff::Timestamp;
 
-use crate::domain::{Account, UsageSnapshot};
+use crate::domain::{Account, Limit, UsageSnapshot};
 use crate::error::{AppError, AppResult};
 use crate::providers::ProviderAdapter;
 
+use billing::parse_weekly_quota;
 use logs::{parse_inference_events, reduce_grok_snapshot};
 
 /// Cheap mtime prune bound for the log read: the reduce window (5h) plus slack for clock skew /
@@ -76,6 +80,34 @@ impl ProviderAdapter for GrokAdapter {
             let bytes = std::fs::read(&log_path).ok()?;
             let events = parse_inference_events(&bytes);
             reduce_grok_snapshot(&events, &account_id, now)
+        })
+        .await
+        .map_err(|e| AppError::SessionsScan(e.to_string()))
+    }
+
+    async fn collect_local_limits(
+        &self,
+        account: &Account,
+        now: Timestamp,
+        warn_pct: f64,
+        crit_pct: f64,
+    ) -> AppResult<Vec<Limit>> {
+        // Same defensive guard as `collect` — validation guarantees a config_dir for grok.
+        let Some(config_dir) = account.config_dir.as_deref() else {
+            return Err(AppError::SessionsScan(format!(
+                "account '{}': grok requires config_dir",
+                account.id
+            )));
+        };
+        let log_path = config_dir.join("logs").join("unified.jsonl");
+        let account_id = account.id.clone();
+        // No mtime prune here (spec 022 §B): unlike usage, a days-old billing line is still the
+        // truth for an unexpired period. Missing file ⇒ no limits (fresh install), never an error.
+        tokio::task::spawn_blocking(move || {
+            let Ok(bytes) = std::fs::read(&log_path) else {
+                return Vec::new();
+            };
+            parse_weekly_quota(&bytes, &account_id, now, warn_pct, crit_pct)
         })
         .await
         .map_err(|e| AppError::SessionsScan(e.to_string()))
@@ -176,6 +208,64 @@ mod tests {
             snap.is_none(),
             "a log pruned by mtime must never contribute, even with an in-window event inside it"
         );
+    }
+
+    // ── spec 022 §B: the local weekly-quota limits lane ────────────────────────────────────────
+
+    /// One synthetic real-shape billing line (invented values, never real log content).
+    fn quota_line(timestamp: &str, percent: f64, end: &str) -> String {
+        format!(
+            r#"{{"ts":"{timestamp}","src":"shell","pid":1,"lvl":"info","msg":"billing: fetched credits config","ctx":{{"config":{{"creditUsagePercent":{percent},"currentPeriod":{{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-19T00:00:00+00:00","end":"{end}"}}}},"subscriptionTier":"SuperGrok Heavy"}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_log_yields_no_local_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = GrokAdapter::new()
+            .collect_local_limits(
+                &account(dir.path().to_path_buf()),
+                Timestamp::now(),
+                60.0,
+                85.0,
+            )
+            .await
+            .expect("collect_local_limits ok");
+        assert!(limits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_local_limits_yields_the_weekly_quota_even_from_a_stale_mtime_file() {
+        let now: Timestamp = "2026-07-20T00:00:00Z".parse().expect("valid ts");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_log(
+            dir.path(),
+            &format!(
+                "{}\n{}\n",
+                quota_line("2026-07-19T15:00:00Z", 12.5, "2026-07-26T00:00:00+00:00"),
+                event_line(
+                    "2026-07-19T15:00:01Z".parse().expect("valid ts"),
+                    100,
+                    0,
+                    10
+                ),
+            ),
+        );
+        // Backdate the file far beyond the usage lane's mtime prune — the limits lane must still
+        // read it (spec 022 §B: no mtime prune; an old line still carries a live period).
+        let file = std::fs::File::open(&path).expect("reopen for mtime");
+        file.set_modified(SystemTime::now() - Duration::from_hours(72))
+            .expect("backdate mtime");
+
+        let limits = GrokAdapter::new()
+            .collect_local_limits(&account(dir.path().to_path_buf()), now, 60.0, 85.0)
+            .await
+            .expect("collect_local_limits ok");
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].kind, crate::domain::LimitKind::WeeklyAll);
+        assert_eq!(limits[0].source, crate::domain::Provenance::Authoritative);
+        assert!((limits[0].utilization_pct - 12.5).abs() < f64::EPSILON);
+        assert_eq!(limits[0].resets_at, "2026-07-26T00:00:00+00:00");
     }
 
     #[tokio::test]

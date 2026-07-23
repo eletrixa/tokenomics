@@ -1,6 +1,8 @@
 # Spec 021 — Grok provider: usage-only adapter
 
-Status: **Done**
+Status: **Done** — §C's no-limits ruling is **superseded by spec 022**: live evidence showed
+`creditUsagePercent` IS the weekly subscription quota (not on-demand credit), so the limits lane
+now exists, fed from the local billing log.
 
 Plan: `plans/002-multi-provider/03-grok.md` (research — verdict RED at research time: "don't build,
 buys a permanently-n/a limits column"). **Re-scoped to GREEN-usage-only 2026-07-19** once Robert

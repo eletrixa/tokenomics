@@ -7,13 +7,16 @@
 //!          concurrent-overlay + loop-not-blocked timing, an opt-in overlay run, inactive-account
 //!          skip on both cadences (spec 014), a Codex app-server overlay pass + failure backoff (013),
 //!          config hot-reload activation/deactivation + bad-reload resilience (spec 015), a z.ai
-//!          quota overlay pass + opt-in/env-var eligibility gating (spec 019 §D)
+//!          quota overlay pass + opt-in/env-var eligibility gating (spec 019 §D), local limits on
+//!          the idle AND fresh arms + harvest severity re-stamp + alert edge (spec 022 §C)
 //!
 //! Key responsibilities:
-//! - `run_collector`: local-cadence tick → `collect` → `insert_snapshot` + derived limit; overlay
-//!   cadence tick → spawn opt-in Claude `/api/oauth/usage`, Codex app-server, and z.ai quota fetches,
-//!   harvest → authoritative limits (degrade to derived on stale/failure); a slow retention sweep
-//!   prunes old snapshots + checkpoints the WAL.
+//! - `run_collector`: local-cadence tick → `collect` and `collect_local_limits` → `insert_snapshot`
+//!   plus derived limit plus local limits (spec 022 §C — local limits ride the idle arm too, so a
+//!   quota stays live while usage idles); overlay cadence tick → spawn opt-in Claude
+//!   `/api/oauth/usage`, Codex app-server, and z.ai quota fetches, harvest → authoritative limits
+//!   (degrade to derived on stale/failure); a slow retention sweep prunes old snapshots and
+//!   checkpoints the WAL.
 //! - Guards: inflight (never stack a second collect per account), generation (`should_apply`),
 //!   isolation (a failing account keeps last-good and never crashes the loop), bounded concurrency,
 //!   `MissedTickBehavior::Skip` (resume cadence from now after a suspend, not a catch-up burst).
@@ -103,6 +106,10 @@ struct CollectOutcome {
     generation: u64,
     now: Timestamp,
     result: AppResult<Option<UsageSnapshot>>,
+    /// Limits knowable from local data alone (spec 022 §B/§C) — e.g. grok's weekly quota. Carried
+    /// on BOTH the fresh and idle arms: a quota stays live while no inference runs, so it must not
+    /// decay just because usage went idle. Empty for providers without a local limits lane.
+    local_limits: Vec<Limit>,
 }
 
 /// A source of hot-reloaded configs, polled on each local tick (spec 015 §A). Injectable so the loop
@@ -431,6 +438,8 @@ fn spawn_local_collects<A: ProviderAdapter + Send + Sync + 'static>(
     generation: &mut u64,
     tasks: &mut JoinSet<CollectOutcome>,
 ) {
+    let warn = cfg.settings.warn_pct;
+    let crit = cfg.settings.crit_pct;
     for account in cfg.accounts.iter().filter(|a| a.active) {
         if inflight.len() >= MAX_INFLIGHT {
             break;
@@ -445,11 +454,25 @@ fn spawn_local_collects<A: ProviderAdapter + Send + Sync + 'static>(
         let account = account.clone();
         tasks.spawn(async move {
             let result = adapter.collect(&account, now).await;
+            // A limits-lane failure degrades to "no local limits" — it must never take the usage
+            // snapshot down with it (per-account isolation, spec 022 §C). Severity is re-stamped
+            // at harvest from the CURRENT config, so spawn-time thresholds carry no reload lag.
+            let local_limits = match adapter
+                .collect_local_limits(&account, now, warn, crit)
+                .await
+            {
+                Ok(limits) => limits,
+                Err(e) => {
+                    eprintln!("collector: [{}] local limits failed: {e}", account.id);
+                    Vec::new()
+                }
+            };
             CollectOutcome {
                 account,
                 generation,
                 now,
                 result,
+                local_limits,
             }
         });
     }
@@ -1057,6 +1080,7 @@ fn apply_outcome(
         generation,
         now,
         result,
+        mut local_limits,
     } = outcome;
     // Always clear the inflight guard first, even for a dropped account, so a later reactivation is
     // not blocked by a leaked in-flight marker.
@@ -1080,44 +1104,84 @@ fn apply_outcome(
         .poll_overlay_secs
         .saturating_mul(OVERLAY_TTL_FACTOR);
 
+    // Re-stamp local-limit severity from the CURRENT thresholds, so a hot-reloaded warn/crit takes
+    // effect at harvest exactly as it does for the derived session limit (spec 015 §A discipline).
+    for limit in &mut local_limits {
+        limit.severity = crate::format::severity_for(limit.utilization_pct, warn, crit);
+    }
+
     match result {
         Ok(Some(snapshot)) => {
-            if let Err(e) =
-                persist_snapshot(store, &snapshot, now, warn, crit, alerts, overlay_ttl_secs)
-            {
+            if let Err(e) = persist_snapshot(
+                store,
+                &snapshot,
+                local_limits,
+                now,
+                warn,
+                crit,
+                alerts,
+                overlay_ttl_secs,
+            ) {
                 eprintln!("collector: [{}] store write failed: {e}", account.id);
             }
         }
         // Idle (no active block) or failed: keep last-good usage, but STILL re-evaluate the stored
         // limits — otherwise the stale-authoritative demotion (spec 011 §C) only ever fires when
         // fresh data lands, and exactly the accounts that need it (idle, logged-out) freeze at
-        // their last crit forever (spec 012 §B).
-        Ok(None) => reevaluate_limits(store, &account.id, now, alerts, overlay_ttl_secs),
+        // their last crit forever (spec 012 §B). Local limits ride along even when usage is idle:
+        // grok's weekly quota stays live while no inference runs (spec 022 §C).
+        Ok(None) => reevaluate_limits(
+            store,
+            &account.id,
+            local_limits,
+            now,
+            alerts,
+            overlay_ttl_secs,
+        ),
         Err(e) => {
             eprintln!("collector: [{}] collect failed: {e}", account.id); // isolation
-            reevaluate_limits(store, &account.id, now, alerts, overlay_ttl_secs);
+            reevaluate_limits(
+                store,
+                &account.id,
+                local_limits,
+                now,
+                alerts,
+                overlay_ttl_secs,
+            );
         }
     }
 }
 
-/// Re-run the shared merge point with no new evidence, so the stale-authoritative demotion applies
-/// to idle / failing accounts too. Best-effort: a failure is logged, never fatal.
+/// Re-run the shared merge point — with any local limits as the only new evidence — so the
+/// stale-authoritative demotion applies to idle / failing accounts too, while a live local quota
+/// (spec 022 §C) keeps re-winning its slot. Best-effort: a failure is logged, never fatal.
 fn reevaluate_limits(
     store: &Store,
     account_id: &str,
+    local_limits: Vec<Limit>,
     now: Timestamp,
     alerts: &mut AlertTracker,
     overlay_ttl_secs: u64,
 ) {
-    if let Err(e) = apply_limits(store, account_id, Vec::new(), now, alerts, overlay_ttl_secs) {
+    if let Err(e) = apply_limits(
+        store,
+        account_id,
+        local_limits,
+        now,
+        alerts,
+        overlay_ttl_secs,
+    ) {
         eprintln!("collector: [{account_id}] limit re-evaluation failed: {e}");
     }
 }
 
-/// Persist a snapshot and its derived session limit (via the shared merge+alert write path).
+/// Persist a snapshot and its derived session limit plus any local limits (via the shared
+/// merge+alert write path).
+#[allow(clippy::too_many_arguments)]
 fn persist_snapshot(
     store: &Store,
     snapshot: &UsageSnapshot,
+    local_limits: Vec<Limit>,
     now: Timestamp,
     warn: f64,
     crit: f64,
@@ -1129,6 +1193,7 @@ fn persist_snapshot(
     // authoritative demotion applies on every outcome, not only when a derived limit exists.
     let new_limits: Vec<Limit> = derive_session_limit(snapshot, now, warn, crit)
         .into_iter()
+        .chain(local_limits)
         .collect();
     apply_limits(
         store,
@@ -2313,7 +2378,7 @@ mod tests {
             .poll_overlay_secs
             .saturating_mul(OVERLAY_TTL_FACTOR);
         let past_ttl = "2026-07-04T10:30:00Z".parse::<Timestamp>().unwrap(); // 30 min > 10 min ttl
-        reevaluate_limits(&store, "zai-lite", past_ttl, &mut alerts, ttl);
+        reevaluate_limits(&store, "zai-lite", Vec::new(), past_ttl, &mut alerts, ttl);
 
         let demoted = store.latest_limits("zai-lite").expect("query");
         assert!(
@@ -2694,6 +2759,7 @@ config_dir = \"/tmp\"
             result: FakeAdapter
                 .collect(&account("acct"), Timestamp::now())
                 .await,
+            local_limits: Vec::new(),
         };
         apply_outcome(
             &cfg,
@@ -2711,6 +2777,215 @@ config_dir = \"/tmp\"
         assert!(
             !inflight.contains("acct"),
             "the inflight guard must still be cleared for the dropped account"
+        );
+    }
+
+    // ── spec 022 §C (AC4): local limits ride the idle arm and keep re-winning their slot ────────
+
+    /// One grok-style local weekly-quota limit (spec 022 §A shape).
+    fn grok_weekly(pct: f64) -> Limit {
+        Limit {
+            account_id: "grok-acct".to_string(),
+            provider: Provider::Grok,
+            kind: LimitKind::WeeklyAll,
+            scope: None,
+            utilization_pct: pct,
+            resets_at: "2026-07-26T00:00:00+00:00".to_string(),
+            severity: Severity::Ok,
+            source: Provenance::Authoritative,
+        }
+    }
+
+    fn grok_outcome(generation: u64, local_limits: Vec<Limit>) -> CollectOutcome {
+        let mut acct = account("grok-acct");
+        acct.provider = Provider::Grok;
+        CollectOutcome {
+            account: acct,
+            generation,
+            now: Timestamp::now(),
+            result: Ok(None), // grok is usage-idle most of the time (no inference in 5h)
+            local_limits,
+        }
+    }
+
+    #[test]
+    fn idle_outcomes_persist_and_refresh_local_limits_then_demote_when_they_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let mut acct = account("grok-acct");
+        acct.provider = Provider::Grok;
+        store.upsert_accounts(&[acct.clone()]).expect("upsert");
+        let cfg = config(vec![acct]);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        let mut inflight: HashSet<String> = HashSet::new();
+        let mut latest_gen: HashMap<String, u64> = HashMap::new();
+
+        // Tick 1: idle usage + a live weekly quota ⇒ the row lands Authoritative.
+        apply_outcome(
+            &cfg,
+            &store,
+            grok_outcome(1, vec![grok_weekly(12.5)]),
+            &mut inflight,
+            &mut latest_gen,
+            &mut alerts,
+        );
+        let limits = store.latest_limits("grok-acct").expect("q");
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].kind, LimitKind::WeeklyAll);
+        assert_eq!(limits[0].source, Provenance::Authoritative);
+        assert!((limits[0].utilization_pct - 12.5).abs() < f64::EPSILON);
+
+        // Tick 2: still idle, quota moved ⇒ the fresh row re-wins the slot as Authoritative even
+        // though no overlay success was ever stamped (incoming authoritative outranks the stored,
+        // TTL-demoted copy in the merge).
+        apply_outcome(
+            &cfg,
+            &store,
+            grok_outcome(2, vec![grok_weekly(14.0)]),
+            &mut inflight,
+            &mut latest_gen,
+            &mut alerts,
+        );
+        let limits = store.latest_limits("grok-acct").expect("q");
+        assert_eq!(limits[0].source, Provenance::Authoritative);
+        assert!((limits[0].utilization_pct - 14.0).abs() < f64::EPSILON);
+
+        // Tick 3: the lane stops producing (period expired / file gone) ⇒ the stored row demotes
+        // to Estimate — frozen percent, live countdown — instead of alarming as fresh forever.
+        apply_outcome(
+            &cfg,
+            &store,
+            grok_outcome(3, Vec::new()),
+            &mut inflight,
+            &mut latest_gen,
+            &mut alerts,
+        );
+        let limits = store.latest_limits("grok-acct").expect("q");
+        assert_eq!(limits[0].source, Provenance::Estimate);
+        assert!((limits[0].utilization_pct - 14.0).abs() < f64::EPSILON);
+    }
+
+    // ── spec 022 §C (AC4, fresh arm): a snapshot outcome merges derived session ++ local limits,
+    // the harvest re-stamps local-limit severity from CURRENT thresholds, and a crit crossing
+    // fires the alert edge exactly as an overlay limit would.
+
+    #[tokio::test]
+    async fn a_fresh_snapshot_outcome_merges_derived_session_with_restamped_local_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        store.upsert_accounts(&[account("acct")]).expect("upsert");
+        let cfg = config(vec![account("acct")]);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        let mut inflight: HashSet<String> = HashSet::new();
+        let mut latest_gen: HashMap<String, u64> = HashMap::new();
+
+        let now = Timestamp::now();
+        let snapshot = UsageSnapshot {
+            account_id: "acct".to_string(),
+            provider: Provider::Claude,
+            collected_at: now,
+            input: 1,
+            output: 1,
+            cache_read: 1,
+            cache_creation: 1,
+            total_tokens: 4,
+            cost_notional: Some(0.1),
+            // An active window ⇒ derive_session_limit yields a real derived Session row, so the
+            // fresh arm exercises the FULL chain: derived session ++ local limits (AC4).
+            window: Some(crate::domain::Window {
+                start: now - Duration::from_hours(1),
+                end: now + Duration::from_hours(4),
+                remaining_minutes: Some(240),
+                tokens_per_minute: 1.0,
+                cost_per_hour: 0.01,
+            }),
+        };
+        // The incoming local limit is at 92% but DELIBERATELY stamped Ok (as if built against
+        // stale spawn-time thresholds): the harvest must re-stamp it Crit from the current config
+        // (warn 75 / crit 90) — dropping either the re-stamp loop or the `.chain(local_limits)`
+        // fails this test.
+        let mut quota = grok_weekly(92.0);
+        quota.account_id = "acct".to_string();
+        let outcome = CollectOutcome {
+            account: account("acct"),
+            generation: 1,
+            now,
+            result: Ok(Some(snapshot)),
+            local_limits: vec![quota],
+        };
+        apply_outcome(
+            &cfg,
+            &store,
+            outcome,
+            &mut inflight,
+            &mut latest_gen,
+            &mut alerts,
+        );
+
+        let limits = store.latest_limits("acct").expect("q");
+        let session = limits
+            .iter()
+            .find(|l| l.kind == LimitKind::Session)
+            .expect("the derived session row must land alongside the local limit");
+        assert_eq!(session.source, Provenance::Derived);
+        let weekly = limits
+            .iter()
+            .find(|l| l.kind == LimitKind::WeeklyAll)
+            .expect("the local weekly quota must land alongside the derived session");
+        assert!((weekly.utilization_pct - 92.0).abs() < f64::EPSILON);
+        assert_eq!(
+            weekly.severity,
+            Severity::Crit,
+            "harvest must re-stamp severity from CURRENT thresholds, not trust the spawn-time stamp"
+        );
+        // The Ok→Crit crossing must have fired the alert edge inside apply_outcome: a manual
+        // re-fire of the same key is now inside the cooldown window, so it returns None.
+        assert!(
+            alerts
+                .on_transition(
+                    ("acct".to_string(), LimitKind::WeeklyAll, None),
+                    Severity::Ok,
+                    Severity::Crit,
+                    Instant::now(),
+                )
+                .is_none(),
+            "the crit crossing must already have fired (cooldown stamped) during the harvest"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_arm_quota_crit_crossing_restamps_and_fires_the_alert_edge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let mut acct = account("grok-acct");
+        acct.provider = Provider::Grok;
+        store.upsert_accounts(&[acct.clone()]).expect("upsert");
+        let cfg = config(vec![acct]);
+        let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
+        let mut inflight: HashSet<String> = HashSet::new();
+        let mut latest_gen: HashMap<String, u64> = HashMap::new();
+
+        // Idle usage, quota at 92% stamped Ok ⇒ the idle arm must re-stamp Crit and alert.
+        apply_outcome(
+            &cfg,
+            &store,
+            grok_outcome(1, vec![grok_weekly(92.0)]),
+            &mut inflight,
+            &mut latest_gen,
+            &mut alerts,
+        );
+        let limits = store.latest_limits("grok-acct").expect("q");
+        assert_eq!(limits[0].severity, Severity::Crit);
+        assert!(
+            alerts
+                .on_transition(
+                    ("grok-acct".to_string(), LimitKind::WeeklyAll, None),
+                    Severity::Ok,
+                    Severity::Crit,
+                    Instant::now(),
+                )
+                .is_none(),
+            "the idle-arm crit crossing must already have fired (cooldown stamped)"
         );
     }
 }

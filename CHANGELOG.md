@@ -16,6 +16,24 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   real subprocess, so effective heavy concurrency stays well under the cap.
 
 ### ADDED
+- **`docs/SETUP.md` — a full setup walkthrough.** Manual quickstart (per-provider `[[account]]`
+  snippets and validation rules), the subscription ledger explained with a complete example
+  (schema, exact-id join, `ledger_path` / `TOKENOMICS_LEDGER` wiring), a paste-in Claude Code
+  prompt that interviews you and writes both config files (never touching a secret), and a
+  troubleshooting list. Linked from the README quick start.
+- **Grok's weekly subscription quota now renders as a live authoritative gauge (spec 022).** Live
+  evidence overturned spec 021 §C: the `billing: fetched credits config` lines in
+  `~/.grok/logs/unified.jsonl` carry `creditUsagePercent` — the weekly *subscription* quota
+  utilization (the on-demand fields are identically zero for a pure subscription), with a weekly
+  `currentPeriod` whose `end` is the reset instant. `providers/grok/billing.rs` parses the
+  newest-by-`ts` usable line (missing-pct / malformed / drifted lines skipped per-line; a lapsed
+  period is never rendered as live) into a `WeeklyAll` `Authoritative` limit — local file read,
+  no network, no opt-in (`limits_overlay` stays ignored). The provider seam gains an additive
+  `collect_local_limits` (default: none), and the collector carries local limits on both the fresh
+  and idle arms, so the quota stays live while no inference runs and degrades to a frozen
+  `Estimate` (then dormant) when the lane stops producing. `tok doctor` reports the quota state
+  (live / expired / no billing line); the TUI weekly hint for grok now reads
+  `n/a (awaiting grok billing log)`.
 - **Grok Build (xAI) is now a monitored, usage-only provider (spec 021).** `Provider::Grok`
   (`"grok"`) round-trips through config/store/display. `config_dir` (the `GROK_HOME` dir, default
   `~/.grok`) is required, same as claude/codex/gemini; `api_key_env` is rejected (an `XAI_API_KEY`
