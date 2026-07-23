@@ -199,7 +199,7 @@ git commit -m "plans: archive NNN-name"
 ---
 plan: NNN-my-thing
 status: draft
-owner: Robert
+owner: the maintainer
 created: 2026-05-16
 type: cleanup
 ---
@@ -223,7 +223,7 @@ type: cleanup
 ---
 plan: NNN-my-thing
 status: draft
-owner: Robert
+owner: the maintainer
 created: 2026-05-16
 type: feature
 ---

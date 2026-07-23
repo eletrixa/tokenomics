@@ -5,8 +5,8 @@ Status: **Done** — §C's no-limits ruling is **superseded by spec 022**: live 
 now exists, fed from the local billing log.
 
 Plan: `plans/002-multi-provider/03-grok.md` (research — verdict RED at research time: "don't build,
-buys a permanently-n/a limits column"). **Re-scoped to GREEN-usage-only 2026-07-19** once Robert
-bought SuperGrok Heavy and real `~/.grok/logs/unified.jsonl` existed on the machine: the local usage
+buys a permanently-n/a limits column"). **Re-scoped to GREEN-usage-only 2026-07-19** once the
+maintainer acquired SuperGrok Heavy and real `~/.grok/logs/unified.jsonl` existed on the machine: the local usage
 lane is real and ToS-safe (a direct analog of Codex spec 013 / Gemini spec 020), so v1 ships the
 usage plane and leaves limits honestly `n/a`. Real file shapes were verified against the live
 `~/.grok/logs/unified.jsonl` on 2026-07-19 (617 real `shell.turn.inference_done` events) — see §B.

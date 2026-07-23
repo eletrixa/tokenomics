@@ -2,9 +2,9 @@
 
 Status: **Done**
 
-Follow-up to spec 017 (Robert, 2026-07-18): the ledger now carries `verified = <date>` — the date
+Follow-up to spec 017 (2026-07-18): the ledger now carries `verified = <date>` — the date
 an agent last confirmed the row against the provider's billing web UI (Tier-0 read-only run,
-evidence in an external driver repo). Render it, because the load-bearing question is "is this **renewal
+evidence in the source-of-record repo). Render it, because the load-bearing question is "is this **renewal
 date** confirmed from the provider's web, so I know when to cancel" — a human-typed date and a
 web-verified date must look different on the board.
 

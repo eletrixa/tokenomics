@@ -3,12 +3,12 @@
 Status: **Done**
 
 Plan: `plans/002-multi-provider/` (research `01-zai.md`, synthesis `10-adapter-plan.md` §1 —
-verdict GREEN, build first). The quota endpoint was live-probed 2026-07-19 against Robert's real
+verdict GREEN, build first). The quota endpoint was live-probed 2026-07-19 against a real
 Lite-plan key: HTTP 200, `data.level = "lite"`.
 
 ## Motivation
 
-Robert has a paid z.ai GLM coding subscription (`zai-glm` in the ledger) that is invisible on the
+The maintainer has a paid z.ai GLM coding subscription (`zai-glm` in the ledger) that is invisible on the
 board. z.ai exposes an authoritative quota endpoint (one HTTP GET — simpler than both existing
 overlays: no subprocess, no OAuth refresh). No local usage lane exists today (GLM runs through an
 ephemeral-HOME wrapper), so v1 is **limits-only and honestly idle** — real gauges, no invented

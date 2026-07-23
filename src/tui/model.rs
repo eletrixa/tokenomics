@@ -1371,7 +1371,7 @@ mod tests {
         let now: Timestamp = "2026-07-19T10:49:00Z".parse().unwrap();
         // Spec 020 §D: the spec-017 ledger clause + spec-018 verified pill are provider-agnostic —
         // a matching gemini-personal ledger row must render its clause and pill exactly like any
-        // account, even though Gemini has no ledger row until Robert actually buys AI Pro/Ultra.
+        // account, even though Gemini has no ledger row until the operator actually buys AI Pro/Ultra.
         let mut sub = ledger_sub(SubStatus::Active);
         sub.id = "gemini-personal".to_string();
         sub.purchased = Some(jiff::civil::date(2026, 7, 1));

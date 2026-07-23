@@ -60,7 +60,7 @@ activates once a Google-account-OAuth gemini-cli login exists on this machine.
 ### C. No limits lane
 
 - No overlay code, no new `LimitKind` (`Daily` explicitly deferred — a derived
-  midnight-Pacific counter is out of scope until Robert wants a `Derived`-badged approximation).
+  midnight-Pacific counter is out of scope until the maintainer requests a `Derived`-badged approximation).
 - Both gauges render `n/a` — exactly the un-opted-in Codex render. A daily request ceiling must
   never be dressed up as a Session gauge.
 
