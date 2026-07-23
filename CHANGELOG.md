@@ -6,6 +6,12 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ## [Unreleased]
 
+### CHANGED
+- **Dependency refresh (supersedes dependabot PRs #1–#5).** rusqlite 0.32.1 → 0.40.1 (the store now
+  converts token counts at the u64↔i64 boundary explicitly — saturating, never wrapping — since
+  rusqlite dropped its blanket `u64` SQL conversions), tokio → 1.53.1, jiff → 0.2.34, toml →
+  1.1.3, CI `actions/checkout` v4 → v7. No behavior change.
+
 ### FIXED
 - **Collector no longer starves the last account when the fleet grows past the concurrency bound.**
   `MAX_INFLIGHT` was 8 while the live fleet reached 9 active accounts; because `spawn_local_collects`

@@ -47,7 +47,7 @@ jiff = { version = "0.2.15", features = ["serde"] }       # W2: reset countdowns
 notify-rust = "4.11.7"                                    # W8: best-effort desktop notifications
 ratatui = "0.30.2"                                        # W6: TUI widgets (Gauge/Sparkline/Layout)
 reqwest = { version = "0.12.16", default-features = false, features = ["rustls-tls"] } # W7: opt-in overlay (HTTPS via rustls)
-rusqlite = { version = "0.32.1", features = ["bundled"] } # W4: local store (bundled SQLite, WAL)
+rusqlite = { version = "0.40.1", features = ["bundled"] } # W4: local store (bundled SQLite, WAL)
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"                                    # W2: parse ccusage `blocks --json`
 thiserror = "2.0.18"

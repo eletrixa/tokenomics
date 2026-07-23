@@ -18,6 +18,9 @@
 //! Design constraints:
 //! - Timestamps persist as epoch-milliseconds (INTEGER, sortable); `resets_at` is stored verbatim.
 //! - Never panics on a busy DB — `busy_timeout` is set and every failure is a typed `AppError`.
+//! - Token counts are `u64` in the domain but SQLite integers are `i64` (rusqlite 0.40 dropped the
+//!   blanket `u64` conversions): `tokens_to_db` / `tokens_from_db` saturate at the boundary — a
+//!   count beyond i64::MAX (impossible in practice) clamps rather than errors or wraps.
 //! - `set_limits` replaces an account's limit set atomically (callers merge by provenance first).
 //! - `token_state` stores freshness only — never a token value.
 
@@ -270,11 +273,11 @@ impl Store {
             params![
                 snapshot.account_id,
                 snapshot.collected_at.as_millisecond(),
-                snapshot.input,
-                snapshot.output,
-                snapshot.cache_read,
-                snapshot.cache_creation,
-                snapshot.total_tokens,
+                tokens_to_db(snapshot.input),
+                tokens_to_db(snapshot.output),
+                tokens_to_db(snapshot.cache_read),
+                tokens_to_db(snapshot.cache_creation),
+                tokens_to_db(snapshot.total_tokens),
                 snapshot.cost_notional,
                 window.map(|w| w.start.as_millisecond()),
                 window.map(|w| w.end.as_millisecond()),
@@ -549,7 +552,9 @@ impl Store {
              WHERE account_id = ?1 ORDER BY collected_at DESC, id DESC LIMIT ?2",
         )?;
         let limit = i64::try_from(n).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![account_id, limit], |row| row.get::<_, u64>(0))?;
+        let rows = stmt.query_map(params![account_id, limit], |row| {
+            row.get::<_, i64>(0).map(tokens_from_db)
+        })?;
         let mut points = Vec::new();
         for row in rows {
             points.push(row?);
@@ -624,6 +629,18 @@ impl Store {
     }
 }
 
+/// A domain token count as a storable SQLite integer: saturating at `i64::MAX` (unreachable for
+/// real token counts; rusqlite 0.40 dropped the blanket `u64: ToSql`).
+fn tokens_to_db(tokens: u64) -> i64 {
+    i64::try_from(tokens).unwrap_or(i64::MAX)
+}
+
+/// A stored SQLite integer back as a domain token count: a negative value (foreign/corrupt row)
+/// clamps to 0 (rusqlite 0.40 dropped the blanket `u64: FromSql`).
+fn tokens_from_db(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
 /// Decode a snapshots row into a `UsageSnapshot` (inner result carries a data-decode failure).
 fn row_to_snapshot(
     account_id: &str,
@@ -631,11 +648,11 @@ fn row_to_snapshot(
 ) -> rusqlite::Result<AppResult<UsageSnapshot>> {
     let provider_text: String = row.get(0)?;
     let collected_ms: i64 = row.get(1)?;
-    let input: u64 = row.get(2)?;
-    let output: u64 = row.get(3)?;
-    let cache_read: u64 = row.get(4)?;
-    let cache_creation: u64 = row.get(5)?;
-    let total_tokens: u64 = row.get(6)?;
+    let input = tokens_from_db(row.get(2)?);
+    let output = tokens_from_db(row.get(3)?);
+    let cache_read = tokens_from_db(row.get(4)?);
+    let cache_creation = tokens_from_db(row.get(5)?);
+    let total_tokens = tokens_from_db(row.get(6)?);
     let cost_notional: Option<f64> = row.get(7)?;
     let win_start: Option<i64> = row.get(8)?;
     let win_end: Option<i64> = row.get(9)?;
