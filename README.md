@@ -46,6 +46,10 @@ tok               # launch the dashboard
 Other commands: `tok validate` (check the config), `tok accounts` (list what's configured),
 `tok once --json` (one snapshot per account as JSON), `tok doctor` (diagnostics).
 
+For a step-by-step walkthrough — per-provider account snippets, the optional subscription-dates
+ledger, and a paste-in Claude Code prompt that writes both config files for you — see
+[`docs/SETUP.md`](docs/SETUP.md).
+
 Paths are cwd-independent: config at `~/.config/tokenomics/tokenomics.toml`, store at
 `~/.local/share/tokenomics/tokenomics.db`. Override either with `$TOKENOMICS_CONFIG` /
 `$TOKENOMICS_DB` for local development.
