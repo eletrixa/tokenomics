@@ -37,6 +37,12 @@ version: 1.0
 | [rust/api-guidelines](rust/api-guidelines.md) | idiomatic public APIs |
 | [rust/anti-patterns](rust/anti-patterns.md) | what not to do |
 
+## Design
+
+| Rule | What |
+|---|---|
+| [tui-design](tui-design.md) | TUI visual design house style — color budget, tables, gauges, states, density (evidence-cited from k9s/lazygit/btop/Charm/ratatui ecosystem) |
+
 ## Clean code (all languages)
 
 [clean-code/](clean-code/) — DRY, SOLID, deep-modules, design-twice, obvious-design,

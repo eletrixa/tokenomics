@@ -12,6 +12,7 @@ Find the rule for what you're doing right now.
 |---|---|
 | Create/modify any `.rs` file | [file-headers](file-headers.md) + [rust/strict-lints](rust/strict-lints.md) |
 | Draw a widget / touch the TUI | [rust/ratatui-architecture](rust/ratatui-architecture.md) |
+| Style/design a widget (colors, tables, gauges, states) | [tui-design](tui-design.md) |
 | Shell out to `systemctl`/`ss`/`journalctl`/health | [rust/subprocess-safety](rust/subprocess-safety.md) |
 | Spawn a task / use channels / `select!` | [rust/async-tokio](rust/async-tokio.md) |
 | Return or map an error | [rust/error-handling](rust/error-handling.md) |
