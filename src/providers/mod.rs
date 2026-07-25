@@ -4,13 +4,16 @@
 //! Module:  src/providers/mod.rs
 //! Deps:    async-trait, jiff; claude/codex/zai/gemini/grok/kimi adapters; runner (Runner seam)
 //! Tested:  via providers/claude (ClaudeAdapter::collect) + providers/codex + providers/zai +
-//!          providers/gemini + providers/grok + providers/kimi inline tests
+//!          providers/gemini + providers/grok + providers/kimi inline tests, plus inline
+//!          `#[cfg(test)]` here for `resolve_api_key`
 //!
 //! Key responsibilities:
 //! - `ProviderAdapter`: collect a normalized snapshot for one account, plus `collect_local_limits`
 //!   — limits knowable from local data alone, default none (spec 022 §B; only grok overrides it).
 //! - `ProviderRegistry`: dispatch both methods to the right adapter by `account.provider`, so the
 //!   collector loop stays generic over ONE `ProviderAdapter` (spec 013 §D).
+//! - `resolve_api_key`: env-var NAME → trimmed value, or `None` when absent/unset/empty — the one
+//!   canonical implementation shared by zai, kimi, and the API billing lane (spec 024 §D hoist).
 //!
 //! Design constraints:
 //! - A new provider slots in by adding a `providers/<x>/` module implementing this trait plus a
@@ -113,5 +116,56 @@ impl<R: Runner> ProviderAdapter for ProviderRegistry<R> {
             | Provider::Gemini
             | Provider::Kimi => Ok(Vec::new()),
         }
+    }
+}
+
+/// Resolve an API key from the environment variable named `env_name`: the trimmed value, or `None`
+/// when the var is absent, unset, or empty after trimming. The single canonical implementation
+/// shared by `zai::resolve_api_key`, `kimi::resolve_api_key` (both wrap this for their
+/// `Account`-shaped callers), and the collector's API billing lane, which has no `Account` to wrap
+/// — only an env-var NAME (spec 024 §D).
+pub(crate) fn resolve_api_key(env_name: &str) -> Option<String> {
+    let value = std::env::var(env_name).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── spec 024 §D hoist: `resolve_api_key` — each test uses its own env-var name (parallel-safe,
+    // mirrors the zai/kimi discipline this fn was hoisted from) ──
+
+    #[test]
+    fn resolve_api_key_reads_and_trims_the_named_env_var() {
+        std::env::set_var(
+            "TOK_TEST_PROVIDERS_KEY_PRESENT",
+            "  fake-key-never-logged\n",
+        );
+        assert_eq!(
+            resolve_api_key("TOK_TEST_PROVIDERS_KEY_PRESENT").as_deref(),
+            Some("fake-key-never-logged")
+        );
+        std::env::remove_var("TOK_TEST_PROVIDERS_KEY_PRESENT");
+    }
+
+    #[test]
+    fn resolve_api_key_is_none_when_unset() {
+        assert_eq!(
+            resolve_api_key("TOK_TEST_PROVIDERS_KEY_UNSET_DOES_NOT_EXIST"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_is_none_when_empty() {
+        std::env::set_var("TOK_TEST_PROVIDERS_KEY_EMPTY", "   ");
+        assert_eq!(resolve_api_key("TOK_TEST_PROVIDERS_KEY_EMPTY"), None);
+        std::env::remove_var("TOK_TEST_PROVIDERS_KEY_EMPTY");
     }
 }

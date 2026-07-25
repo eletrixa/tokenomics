@@ -2,7 +2,8 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/tui/mod.rs
-//! Deps:    ratatui (init/restore + panic hook), crossterm (EventStream), tokio, jiff; store (read)
+//! Deps:    ratatui (init/restore + panic hook), crossterm (EventStream), tokio, jiff; store (read);
+//!          billing::manual (ApiManual read-through plane)
 //! Tested:  the seams are tested in keys/model/view; this loop is the thin I/O shell. `read_rows`'s
 //!          `active`/`show_inactive` filtering + fleet exclusion get an inline `#[cfg(test)]`
 //!          (spec 014) since that wiring lives only here.
@@ -18,6 +19,13 @@
 //!   plane via the injectable `LedgerSource` seam — display-only, so unlike the config swap it never
 //!   changes which accounts exist or are polled. The path resolves once at startup (a foreign-repo
 //!   file, not expected to move mid-session — see `run`).
+//! - Poll the manual API-billing TOML on the same tick, right after the ledger (spec 024/025): a
+//!   fourth, TUI-only, read-through plane via the injectable `ApiManualSource` seam. Its path also
+//!   resolves once at startup, same parity as the ledger's — a foreign, hand-edited file, not
+//!   expected to move mid-session; `[[api]]` config entries themselves still hot-reload via `cfg`.
+//!   Each read pass also re-reads the store's live `api_billing` rows and assembles both into the
+//!   pure `build_api_view` so `Dashboard.api` is one consistent snapshot per tick, never mixed
+//!   across reads.
 //!
 //! Design constraints:
 //! - Reader only: the collector process writes the store; the TUI reads it (CLAUDE.md data planes).
@@ -35,6 +43,10 @@ use futures::StreamExt;
 use jiff::Timestamp;
 use ratatui::DefaultTerminal;
 
+use crate::billing::manual::{
+    self, ApiManual, ApiManualProvenance, ApiManualRow, FileApiManualSource,
+};
+use crate::billing::ApiAccount;
 use crate::collector::{ConfigSource, FileConfigSource};
 use crate::config::Config;
 use crate::domain::Account;
@@ -42,11 +54,11 @@ use crate::error::{AppError, AppResult};
 use crate::ledger::{
     self, find as ledger_find, FileLedgerSource, Ledger, LedgerProvenance, Subscription,
 };
-use crate::store::Store;
+use crate::store::{ApiBillingRow, Store};
 
 use model::{
-    account_usage, build_account_view, build_fleet_view, collector_alert, error_view, AccountData,
-    AccountUsage, AccountView, App, Dashboard, Msg,
+    account_usage, build_account_view, build_api_view, build_fleet_view, collector_alert,
+    error_view, AccountData, AccountUsage, AccountView, ApiData, App, Dashboard, Msg,
 };
 
 /// Redraw/store-read cadence (a modest tick, not a busy redraw).
@@ -81,20 +93,45 @@ pub async fn run(cfg: &Config, store_path: &Path) -> AppResult<()> {
     )
     .map(FileLedgerSource::new);
 
+    // The manual API-billing plane (spec 024/025) resolves its path once at startup too — same
+    // parity as the ledger above (a foreign, hand-edited file; `[[api]]` entries still hot-reload
+    // via `cfg`, only the manual file's own location doesn't move mid-session).
+    let mut api_manual = ApiManual::new();
+    let mut api_manual_source = manual::resolve_path(
+        std::env::var(manual::API_MANUAL_ENV).ok().as_deref(),
+        cfg.settings.api_manual_path.as_deref(),
+    )
+    .map(FileApiManualSource::new);
+
     let mut terminal = ratatui::try_init()
         .map_err(|e| AppError::Terminal(format!("cannot start the TUI: {e}")))?;
+    let planes = Planes {
+        ledger: &mut ledger,
+        ledger_source: ledger_source.as_mut(),
+        api_manual: &mut api_manual,
+        api_manual_source: api_manual_source.as_mut(),
+    };
     let result = event_loop(
         &mut terminal,
         &mut app,
         &mut cfg,
         config_source,
         &reader,
-        &mut ledger,
-        ledger_source.as_mut(),
+        planes,
     )
     .await;
     let _ = ratatui::try_restore();
     result
+}
+
+/// Bundles the ledger + manual-billing pollers so `event_loop` stays under clippy's
+/// argument-count lint (the read-only counterpart, [`PlanesRead`], bundles what one tick's polls
+/// produce for `read_rows`; this bundles the mutable pollers themselves).
+struct Planes<'a> {
+    ledger: &'a mut Ledger,
+    ledger_source: Option<&'a mut FileLedgerSource>,
+    api_manual: &'a mut ApiManual,
+    api_manual_source: Option<&'a mut FileApiManualSource>,
 }
 
 /// Poll the ledger source (spec 017 §B) — a no-op when the plane is unconfigured (`source` is
@@ -104,6 +141,15 @@ pub async fn run(cfg: &Config, store_path: &Path) -> AppResult<()> {
 fn poll_ledger(ledger: &mut Ledger, source: Option<&mut FileLedgerSource>) {
     if let Some(source) = source {
         ledger.poll(source);
+    }
+}
+
+/// Poll the manual API-billing source (spec 024/025) — a no-op when the plane is unconfigured
+/// (`source` is `None`, i.e. `Off` forever, per [`ApiManual::new`]'s own doc). Mirrors
+/// [`poll_ledger`]'s one-line call-site split.
+fn poll_api_manual(api_manual: &mut ApiManual, source: Option<&mut FileApiManualSource>) {
+    if let Some(source) = source {
+        api_manual.poll(source);
     }
 }
 
@@ -123,16 +169,22 @@ async fn event_loop<S: ConfigSource>(
     cfg: &mut Config,
     mut config_source: S,
     reader: &Store,
-    ledger: &mut Ledger,
-    mut ledger_source: Option<&mut FileLedgerSource>,
+    planes: Planes<'_>,
 ) -> AppResult<()> {
+    let Planes {
+        ledger,
+        mut ledger_source,
+        api_manual,
+        mut api_manual_source,
+    } = planes;
+
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     // After a suspend/stall, resume the redraw cadence "from now" rather than firing a burst of
     // backlogged ticks (spec 011 §F).
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    refresh(app, cfg, reader, ledger);
+    refresh(app, cfg, reader, ledger, api_manual);
     loop {
         terminal
             .draw(|f| view::render(f, app))
@@ -151,18 +203,20 @@ async fn event_loop<S: ConfigSource>(
             _ = tick.tick() => {
                 // Hot-reload BEFORE the store read, so an added/(re)activated account or a changed
                 // threshold reaches this tick's board (spec 015 §A2); the ledger polls the same tick
-                // (spec 017 §B) — display-only, so it never changes which accounts are read below.
+                // (spec 017 §B), then the manual API-billing plane right after it (spec 024/025) —
+                // both display-only, so neither ever changes which accounts are read below.
                 apply_tui_reload(cfg, &mut config_source);
                 poll_ledger(ledger, ledger_source.as_deref_mut());
+                poll_api_manual(api_manual, api_manual_source.as_deref_mut());
                 app.update(Msg::Tick);
-                refresh(app, cfg, reader, ledger);
+                refresh(app, cfg, reader, ledger, api_manual);
             }
             _ = tokio::signal::ctrl_c() => app.should_quit = true,
         }
 
         if app.reload_requested {
             app.reload_requested = false;
-            refresh(app, cfg, reader, ledger);
+            refresh(app, cfg, reader, ledger, api_manual);
         }
         if app.should_quit {
             break;
@@ -172,8 +226,12 @@ async fn event_loop<S: ConfigSource>(
 }
 
 /// Re-read the store into `app` — the one place `read_rows` feeds `Msg::Data`, so the three call
-/// sites (initial load, the redraw tick, and a `r`/`i` refresh) can't drift out of sync.
-fn refresh(app: &mut App, cfg: &Config, reader: &Store, ledger: &Ledger) {
+/// sites (initial load, the redraw tick, and a `r`/`i` refresh) can't drift out of sync. Also the
+/// one place the store's live `api_billing` rows are read (spec 025 §B): a failed read degrades to
+/// an empty vec — the same silent-degrade the aggregate-burn read above it already uses — rather
+/// than losing the whole tick's board over one query.
+fn refresh(app: &mut App, cfg: &Config, reader: &Store, ledger: &Ledger, api_manual: &ApiManual) {
+    let api_live = reader.latest_api_billing().unwrap_or_default();
     let rows = read_rows(
         cfg,
         reader,
@@ -181,20 +239,27 @@ fn refresh(app: &mut App, cfg: &Config, reader: &Store, ledger: &Ledger) {
         app.show_inactive,
         &app.rows,
         app.collector_alert.as_deref(),
-        LedgerRead {
-            rows: ledger.rows(),
-            provenance: ledger.provenance(),
+        PlanesRead {
+            ledger_rows: ledger.rows(),
+            ledger_provenance: ledger.provenance(),
+            api_live: &api_live,
+            manual_rows: api_manual.rows(),
+            manual_provenance: api_manual.provenance(),
         },
     );
     app.update(Msg::Data(Box::new(rows)));
 }
 
-/// One ledger read (spec 017 §D), bundled so `read_rows` stays under clippy's argument-count lint —
-/// mirrors [`AccountData`]'s own bundling for the same reason.
+/// One tick's read-through-plane snapshot — the ledger (spec 017 §D) plus the API billing overview's
+/// live store rows and manual TOML rows (spec 025 §B) — bundled so `read_rows` stays under clippy's
+/// argument-count lint (mirrors [`AccountData`]'s own bundling for the same reason).
 #[derive(Debug, Clone, Copy)]
-struct LedgerRead<'a> {
-    rows: &'a [Subscription],
-    provenance: LedgerProvenance,
+struct PlanesRead<'a> {
+    ledger_rows: &'a [Subscription],
+    ledger_provenance: LedgerProvenance,
+    api_live: &'a [ApiBillingRow],
+    manual_rows: &'a [ApiManualRow],
+    manual_provenance: ApiManualProvenance,
 }
 
 /// Read the latest per-account rows plus the fleet-wide aggregate burn series from the store.
@@ -213,12 +278,15 @@ fn read_rows(
     show_inactive: bool,
     previous: &[AccountView],
     previous_alert: Option<&str>,
-    ledger: LedgerRead<'_>,
+    planes: PlanesRead<'_>,
 ) -> Dashboard {
-    let LedgerRead {
-        rows: ledger_rows,
-        provenance: ledger_provenance,
-    } = ledger;
+    let PlanesRead {
+        ledger_rows,
+        ledger_provenance,
+        api_live,
+        manual_rows,
+        manual_provenance,
+    } = planes;
     let now = Timestamp::now();
     // "Today" for the ledger's day-count math (spec 017 §D: "calendar-day differences in local
     // time") — the system timezone, mirroring `doctor::run_doctor`'s
@@ -284,12 +352,40 @@ fn read_rows(
         cfg.settings.poll_local_secs,
         previous_alert,
     );
+    // The API billing plane (spec 025 §B) only assembles when configured — any `[[api]]` entry, or
+    // a manual-only divergent id — so an unconfigured board never grows an empty section. The
+    // env-key presence probe is the one place this module touches `std::env` for it; `build_api_view`
+    // itself stays pure.
+    let api = api_plane_configured(&cfg.api, manual_rows).then(|| {
+        let key_present = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty());
+        build_api_view(
+            &ApiData {
+                accounts: &cfg.api,
+                live: api_live,
+                manual: manual_rows,
+                manual_provenance,
+                key_present: &key_present,
+                poll_billing_secs: cfg.settings.poll_billing_secs,
+            },
+            now,
+            use_color,
+        )
+    });
     Dashboard {
         rows,
         aggregate_burn,
         fleet,
         collector_alert,
+        api,
     }
+}
+
+/// Whether the API billing plane has anything to show this tick: any `[[api]]` config entry
+/// configures it (even before its first live/manual figure lands — spec 025 §B renders its empty
+/// state), or a manual-only divergent id does. Pure — unit-tested; keeps the "assemble or not" call
+/// in `read_rows` a one-line predicate.
+fn api_plane_configured(accounts: &[ApiAccount], manual_rows: &[ApiManualRow]) -> bool {
+    !accounts.is_empty() || !manual_rows.is_empty()
 }
 
 /// Decide the collector-liveness banner for one store read, degrading a transient read error to the
@@ -337,6 +433,7 @@ fn read_account_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::billing::{ApiFigureKind, ApiProvider};
     use crate::config::Settings;
     use crate::domain::{Limit, LimitKind, Provenance, Provider, Severity, UsageSnapshot};
     use std::path::PathBuf;
@@ -412,9 +509,12 @@ mod tests {
             false,
             &[],
             None,
-            LedgerRead {
-                rows: &[],
-                provenance: LedgerProvenance::Off,
+            PlanesRead {
+                ledger_rows: &[],
+                ledger_provenance: LedgerProvenance::Off,
+                api_live: &[],
+                manual_rows: &[],
+                manual_provenance: ApiManualProvenance::Off,
             },
         );
         assert_eq!(before.rows.len(), 1, "only 'a' before the reload");
@@ -427,9 +527,12 @@ mod tests {
             false,
             &before.rows,
             None,
-            LedgerRead {
-                rows: &[],
-                provenance: LedgerProvenance::Off,
+            PlanesRead {
+                ledger_rows: &[],
+                ledger_provenance: LedgerProvenance::Off,
+                api_live: &[],
+                manual_rows: &[],
+                manual_provenance: ApiManualProvenance::Off,
             },
         );
         assert_eq!(after.rows.len(), 2, "the swapped-in 'b' reaches the board");
@@ -500,9 +603,12 @@ mod tests {
             false,
             &[],
             None,
-            LedgerRead {
-                rows: &[],
-                provenance: LedgerProvenance::Off,
+            PlanesRead {
+                ledger_rows: &[],
+                ledger_provenance: LedgerProvenance::Off,
+                api_live: &[],
+                manual_rows: &[],
+                manual_provenance: ApiManualProvenance::Off,
             },
         );
         assert_eq!(hidden.rows.len(), 1, "only the active account is visible");
@@ -519,9 +625,12 @@ mod tests {
             true,
             &hidden.rows,
             None,
-            LedgerRead {
-                rows: &[],
-                provenance: LedgerProvenance::Off,
+            PlanesRead {
+                ledger_rows: &[],
+                ledger_provenance: LedgerProvenance::Off,
+                api_live: &[],
+                manual_rows: &[],
+                manual_provenance: ApiManualProvenance::Off,
             },
         );
         assert_eq!(shown.rows.len(), 2, "both accounts now visible");
@@ -566,5 +675,41 @@ mod tests {
             None,
         )
         .is_none());
+    }
+
+    fn api_account(id: &str) -> ApiAccount {
+        ApiAccount {
+            id: id.to_string(),
+            label: None,
+            provider: ApiProvider::Anthropic,
+            api_key_env: None,
+            active: true,
+        }
+    }
+
+    fn manual_row(id: &str) -> ApiManualRow {
+        ApiManualRow {
+            id: id.to_string(),
+            figure: ApiFigureKind::Balance,
+            amount_minor: 100,
+            currency: "USD".to_string(),
+            as_of: "2026-01-01".to_string(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn api_plane_configured_needs_an_api_account_or_a_manual_row() {
+        // Spec 025 §B: the plane only assembles (and the section appears) when there's a `[[api]]`
+        // entry to show, or a manual-only divergent id — never for a board with neither.
+        assert!(!api_plane_configured(&[], &[]), "neither ⇒ unconfigured");
+        assert!(
+            api_plane_configured(&[api_account("a")], &[]),
+            "a config entry alone configures it"
+        );
+        assert!(
+            api_plane_configured(&[], &[manual_row("divergent")]),
+            "a manual-only row alone configures it"
+        );
     }
 }

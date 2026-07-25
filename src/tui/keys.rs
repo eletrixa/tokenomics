@@ -3,7 +3,7 @@
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/tui/keys.rs
 //! Deps:    crossterm (event types)
-//! Tested:  inline `#[cfg(test)]`
+//! Tested:  inline `#[cfg(test)]` — documented keymap incl. `o` → `ToggleApi` (spec 025 §A)
 //!
 //! Design constraints:
 //! - Pure: a key event maps to at most one `Action`. No I/O.
@@ -25,6 +25,8 @@ pub enum Action {
     Help,
     /// Toggle showing inactive (unsubscribed) accounts.
     ToggleInactive,
+    /// Toggle the API billing (real-dollar) overview section (spec 025 §A).
+    ToggleApi,
 }
 
 /// Map a key event to an action, or `None`. Ignores key-release events (Windows sends them).
@@ -44,6 +46,7 @@ pub fn map(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('i') => Action::ToggleInactive,
+        KeyCode::Char('o') => Action::ToggleApi,
         _ => return None,
     };
     Some(action)
@@ -68,6 +71,7 @@ mod tests {
         assert_eq!(map(key(KeyCode::Char('r'))), Some(Action::Refresh));
         assert_eq!(map(key(KeyCode::Char('?'))), Some(Action::Help));
         assert_eq!(map(key(KeyCode::Char('i'))), Some(Action::ToggleInactive));
+        assert_eq!(map(key(KeyCode::Char('o'))), Some(Action::ToggleApi));
     }
 
     #[test]

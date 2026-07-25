@@ -96,8 +96,9 @@ with the notional proxy, limits gauges, or subscription dates.
   the planned third-consumer trigger; unset/empty env ⇒ skip with logged reason, the dormant
   state) → per-card task wrapped in `tokio::time::timeout(OVERLAY_TICK_BUDGET_SECS)` → one
   `JoinSet<BillingOutcome>` harvest arm → `apply_billing_outcome`: present-and-active guard,
-  then `set_api_billing` on success; 429 feeds the shared pure `next_backoff` (per-api-id
-  cooldown). Single-writer invariant untouched — only the loop task writes.
+  then `set_api_billing` on success; 429 feeds the shared pure `next_backoff` with a billing-sized cap —
+  `max(4 × poll_billing_secs, OVERLAY_BACKOFF_CAP_SECS)`, since the shared overlay cap can sit
+  below the hourly billing base (per-api-id cooldown). Single-writer invariant untouched — only the loop task writes.
 - Store `SCHEMA_V6` (additive gate, `SCHEMA_VERSION` → 6): table `api_billing`
   `(api_id, figure, amount_minor, currency, polled_at_ms, PRIMARY KEY (api_id, figure))`.
   Writer `set_api_billing(api_id, figures)` — atomic per-id replace, written **only on

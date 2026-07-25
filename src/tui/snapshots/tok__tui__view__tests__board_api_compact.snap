@@ -1,0 +1,25 @@
+---
+source: src/tui/view.rs
+assertion_line: 1758
+expression: "draw(&board_with_api(), 80, 20)"
+---
+TOKENOMICS  ·  3 acct  ·  cost notional (proxy, not a bill)                     
+▲  2 account(s) at or above the warn threshold                                  
+280.54M · $335.95 (notional) · 271.20M/h · usage 8s ago · derived               
+burn · all accts ▁▂▁▄▃▆▅█                                                       
+api · real $ — bills & balances, never notional                                 
+  anthropic  bal $120.00 · owed $0.00 · mtd $42.10 · live 2m ago                
+  openai     mtd $18.50 · manual 2026-06-01 · stale                             
+  moonshot   bal $50.00 · mtd $9.20 · mtd live 3m ago · bal manual 2026-07-20   
+  xai        dormant (XAI_API_KEY unset)                                        
+  shadow-id  mtd $3.00 · manual 2026-07-10                                      
+  vertex     waiting for collector                                              
+▏  Personal ● ok    42% ████████████████████▋░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 1h 11m
+                                                                                
+▊▶ Primary  ▲ warn  76% █████████████████████████████████████▎░░░░░░░░░░░ 1h 11m
+                                                                                
+▏  Research ✖ crit  93% █████████████████████████████████████████████▋░░░ 1h 11m
+                                                                                
+                                                                                
+                                                                                
+↑/↓ (or j/k) move · r refresh · i inactive · ? help · q quit

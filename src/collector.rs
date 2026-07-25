@@ -9,15 +9,19 @@
 //!          config hot-reload activation/deactivation + bad-reload resilience (spec 015), a z.ai
 //!          quota overlay pass + opt-in/env-var eligibility gating (spec 019 §D), a Kimi quota
 //!          overlay pass + opt-in/env-var eligibility gating (spec 023 §D), local limits on
-//!          the idle AND fresh arms + harvest severity re-stamp + alert edge (spec 022 §C)
+//!          the idle AND fresh arms + harvest severity re-stamp + alert edge (spec 022 §C), the API
+//!          billing lane — success/429/failure/dormant/pagination/page-cap + `utc_month_start`
+//!          table (spec 024 §D)
 //!
 //! Key responsibilities:
 //! - `run_collector`: local-cadence tick → `collect` and `collect_local_limits` → `insert_snapshot`
 //!   plus derived limit plus local limits (spec 022 §C — local limits ride the idle arm too, so a
 //!   quota stays live while usage idles); overlay cadence tick → spawn opt-in Claude
 //!   `/api/oauth/usage`, Codex app-server, z.ai, and Kimi quota fetches, harvest → authoritative
-//!   limits (degrade to derived on stale/failure); a slow retention sweep prunes old snapshots and
-//!   checkpoints the WAL.
+//!   limits (degrade to derived on stale/failure); billing cadence tick → spawn `[[api]]` MTD-spend
+//!   / balance fetches (Anthropic/OpenAI/Moonshot; gemini/xai never spawn), harvest → `set_api_billing`
+//!   on success only, so a failed poll leaves last-good rows untouched (spec 024 §D); a slow
+//!   retention sweep prunes old snapshots and checkpoints the WAL.
 //! - Guards: inflight (never stack a second collect per account), generation (`should_apply`),
 //!   isolation (a failing account keeps last-good and never crashes the loop), bounded concurrency,
 //!   `MissedTickBehavior::Skip` (resume cadence from now after a suspend, not a catch-up burst).
@@ -49,6 +53,8 @@ use jiff::Timestamp;
 use tokio::task::JoinSet;
 
 use crate::alerts::{notify_desktop, AlertTracker};
+use crate::billing::http::BillingEndpoint;
+use crate::billing::{ApiFigure, ApiFigureKind, ApiProvider};
 use crate::config::Config;
 use crate::domain::{Account, Limit, LimitKind, Provider, Severity, UsageSnapshot};
 use crate::error::{AppError, AppResult};
@@ -63,6 +69,7 @@ use crate::providers::kimi::quota::{
     parse_quota_response as parse_kimi_quota_response, QuotaEndpoint as KimiQuotaEndpoint,
 };
 use crate::providers::kimi::resolve_api_key as resolve_kimi_api_key;
+use crate::providers::resolve_api_key as resolve_billing_api_key;
 use crate::providers::zai::quota::{parse_quota_response, QuotaEndpoint};
 use crate::providers::zai::resolve_api_key;
 use crate::providers::ProviderAdapter;
@@ -81,6 +88,10 @@ use crate::store::{Store, TokenStatus};
 const MAX_INFLIGHT: usize = 16;
 /// Cap for the overlay 429 backoff.
 const OVERLAY_BACKOFF_CAP_SECS: u64 = 900;
+/// Max pages fetched for one API billing account's MTD cost report in a single poll (Anthropic/
+/// OpenAI). Beyond this, the accumulated sum-so-far is used and a warning is logged — a runaway
+/// cursor loop must never stall the billing lane (spec 024 §D).
+const BILLING_PAGE_CAP: usize = 8;
 /// Per-account, per-window alert cooldown (so re-crossings don't spam notifications).
 const ALERT_COOLDOWN_SECS: u64 = 300;
 /// Hard budget for one overlay pass, so a slow/hung account can't stall the loop or shutdown.
@@ -260,6 +271,7 @@ fn cadence_interval(secs: u64) -> tokio::time::Interval {
 /// account identity + the loaded mtime, and recreate any interval whose cadence actually changed. A
 /// `None` poll — no change, or a bad reload kept last-good — is a no-op, so the loop never restarts.
 /// The pre-swap `cfg` already holds the previous cadence, so no separate tracking state is needed.
+#[allow(clippy::too_many_arguments)] // one cadence interval per lane, threaded explicitly (no shared state)
 fn apply_config_reload<S: ConfigSource>(
     cfg: &mut Config,
     source: &mut S,
@@ -268,12 +280,14 @@ fn apply_config_reload<S: ConfigSource>(
     exe_mtime: Option<i64>,
     local: &mut tokio::time::Interval,
     overlay: &mut tokio::time::Interval,
+    billing: &mut tokio::time::Interval,
 ) {
     let Some(new_cfg) = source.poll() else {
         return;
     };
     let local_secs_changed = new_cfg.settings.poll_local_secs != cfg.settings.poll_local_secs;
     let overlay_secs_changed = new_cfg.settings.poll_overlay_secs != cfg.settings.poll_overlay_secs;
+    let billing_secs_changed = new_cfg.settings.poll_billing_secs != cfg.settings.poll_billing_secs;
     *cfg = new_cfg;
     if let Err(e) = store.upsert_accounts(&cfg.accounts) {
         eprintln!("collector: post-reload upsert_accounts failed: {e}");
@@ -296,13 +310,36 @@ fn apply_config_reload<S: ConfigSource>(
     if overlay_secs_changed {
         *overlay = cadence_interval(cfg.settings.poll_overlay_secs);
     }
+    if billing_secs_changed {
+        *billing = cadence_interval(cfg.settings.poll_billing_secs);
+    }
+}
+
+/// The UTC month start (day 1, 00:00:00) for `now` — the anchor for a billing lane's MTD query
+/// (spec 024 §D). Pure; table-tested including the year/leap-month boundaries.
+fn utc_month_start(now: Timestamp) -> Timestamp {
+    let zoned = now.to_zoned(jiff::tz::TimeZone::UTC);
+    let start_of_month = zoned
+        .with()
+        .day(1)
+        .hour(0)
+        .minute(0)
+        .second(0)
+        .subsec_nanosecond(0)
+        .build();
+    match start_of_month {
+        Ok(z) => z.timestamp(),
+        // Defensive-only: day 1 at midnight UTC is always a valid instant — unreachable in practice.
+        Err(_) => now,
+    }
 }
 
 /// Run the collector loop until `shutdown` resolves. Generic over the adapter, the Claude overlay
-/// endpoint, the Codex rate-limits source, the z.ai quota endpoint, the Kimi quota endpoint, and the
-/// config source so the loop is tested with fakes (no process spawn, no network, no filesystem).
+/// endpoint, the Codex rate-limits source, the z.ai quota endpoint, the Kimi quota endpoint, the
+/// API billing endpoint, and the config source so the loop is tested with fakes (no process spawn,
+/// no network, no filesystem).
 #[allow(clippy::too_many_arguments)] // one collaborator per provider's overlay lane, threaded explicitly
-pub async fn run_collector<A, E, C, Z, K, S>(
+pub async fn run_collector<A, E, C, Z, K, B, S>(
     cfg: &Config,
     mut config_source: S,
     adapter: A,
@@ -310,6 +347,7 @@ pub async fn run_collector<A, E, C, Z, K, S>(
     rate_source: C,
     zai_endpoint: Z,
     kimi_endpoint: K,
+    billing_endpoint: B,
     store: Store,
     shutdown: impl Future<Output = ()>,
 ) -> AppResult<()>
@@ -319,6 +357,7 @@ where
     C: RateLimitsSource + 'static,
     Z: QuotaEndpoint + 'static,
     K: KimiQuotaEndpoint + 'static,
+    B: BillingEndpoint + 'static,
     S: ConfigSource,
 {
     let mut cfg = cfg.clone();
@@ -343,14 +382,17 @@ where
     let rate_source = Arc::new(rate_source);
     let zai_endpoint = Arc::new(zai_endpoint);
     let kimi_endpoint = Arc::new(kimi_endpoint);
+    let billing_endpoint = Arc::new(billing_endpoint);
     let mut local = cadence_interval(cfg.settings.poll_local_secs);
     let mut overlay = cadence_interval(cfg.settings.poll_overlay_secs);
+    let mut billing = cadence_interval(cfg.settings.poll_billing_secs);
     let mut retention = tokio::time::interval(Duration::from_secs(RETENTION_SWEEP_SECS));
     retention.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut inflight: HashSet<String> = HashSet::new();
     let mut latest_gen: HashMap<String, u64> = HashMap::new();
     let mut generation: u64 = 0;
     let mut overlay_state = OverlayState::default();
+    let mut billing_state = BillingState::default();
     let mut alerts = AlertTracker::new(Duration::from_secs(ALERT_COOLDOWN_SECS));
     let mut tasks: JoinSet<CollectOutcome> = JoinSet::new();
     // Overlay network fetches run OFF the loop's critical path (spawned here, harvested below) so an
@@ -365,6 +407,9 @@ where
     // The Kimi quota overlay rides the same cadence, off the loop task, harvested on its own arm —
     // the kimi twin of `zai_overlay_tasks` (spec 023 §D).
     let mut kimi_overlay_tasks: JoinSet<KimiOverlayOutcome> = JoinSet::new();
+    // The API billing lane rides its OWN slower cadence (`poll_billing_secs`), off the loop task,
+    // harvested on its own arm (spec 024 §D).
+    let mut billing_tasks: JoinSet<BillingOutcome> = JoinSet::new();
 
     tokio::pin!(shutdown);
     loop {
@@ -374,7 +419,7 @@ where
                 // a deactivated one is skipped this very pass (spec 015 §A). The whole config swaps.
                 apply_config_reload(
                     &mut cfg, &mut config_source, &store,
-                    exe_path.as_deref(), exe_mtime, &mut local, &mut overlay,
+                    exe_path.as_deref(), exe_mtime, &mut local, &mut overlay, &mut billing,
                 );
                 if let Err(e) = store.heartbeat("collector", std::process::id()) {
                     eprintln!("collector: heartbeat failed: {e}");
@@ -421,6 +466,13 @@ where
             Some(joined) = kimi_overlay_tasks.join_next() => match joined {
                 Ok(outcome) => apply_kimi_overlay_outcome(&cfg, &store, &mut overlay_state, &mut alerts, outcome),
                 Err(join_err) => eprintln!("collector: kimi overlay task join error: {join_err}"),
+            },
+            _ = billing.tick() => {
+                spawn_billing_fetches(&cfg, &billing_endpoint, &mut billing_state, &mut billing_tasks);
+            }
+            Some(joined) = billing_tasks.join_next() => match joined {
+                Ok(outcome) => apply_billing_outcome(&cfg, &store, &mut billing_state, outcome),
+                Err(join_err) => eprintln!("collector: billing task join error: {join_err}"),
             },
             _ = retention.tick() => sweep_retention(&store),
             () = &mut shutdown => break,
@@ -1210,6 +1262,262 @@ fn apply_kimi_overlay_outcome(
     }
 }
 
+// ── spec 024 §D: API billing lane ──────────────────────────────────────────────────────────────
+// A fourth, SLOWER cadence (`poll_billing_secs`) alongside local/overlay: real-dollar MTD spend /
+// balance for `[[api]]` accounts (Anthropic, OpenAI, Moonshot — gemini/xai carry no live endpoint
+// and never spawn, spec 024 §B). Backoff/cooldown bookkeeping mirrors `OverlayState` exactly (own
+// `BillingState`, same `next_backoff` pure fn); the harvest guard mirrors `present_and_active`.
+
+/// Per-api-id billing backoff bookkeeping (429 cooldowns) — the billing twin of [`OverlayState`],
+/// minus the round-robin `rotate` field (billing's slow cadence never needs a per-tick budget).
+#[derive(Debug, Default)]
+struct BillingState {
+    /// Current backoff interval per `[[api]]` id (seconds).
+    backoff_secs: HashMap<String, u64>,
+    /// Remaining billing ticks to skip per `[[api]]` id (after a 429).
+    cooldown_ticks: HashMap<String, u32>,
+}
+
+impl BillingState {
+    /// Billing backoff ceiling: the shared overlay cap was sized for the 5-minute overlay cadence
+    /// and can sit BELOW the hourly billing base (a 429 would then poll FASTER, not slower) — so
+    /// the billing lane caps at four times its own base, floored by the shared cap.
+    fn cap(base: u64) -> u64 {
+        base.saturating_mul(4).max(OVERLAY_BACKOFF_CAP_SECS)
+    }
+
+    /// One successful poll: reset the api id's backoff to `base` and lift any cooldown.
+    fn note_success(&mut self, api_id: &str, backoff_current: u64, base: u64) {
+        let reset = next_backoff(backoff_current, BackoffOutcome::Ok, base, Self::cap(base));
+        self.backoff_secs.insert(api_id.to_string(), reset);
+        self.cooldown_ticks.remove(api_id);
+    }
+
+    /// One throttled (429) poll: grow the api id's backoff and convert it to whole billing ticks
+    /// of cooldown.
+    fn note_throttled(&mut self, api_id: &str, backoff_current: u64, base: u64) {
+        let next = next_backoff(
+            backoff_current,
+            BackoffOutcome::Throttled,
+            base,
+            Self::cap(base),
+        );
+        self.backoff_secs.insert(api_id.to_string(), next);
+        let ticks = next.div_ceil(base).max(1);
+        self.cooldown_ticks
+            .insert(api_id.to_string(), u32::try_from(ticks).unwrap_or(u32::MAX));
+    }
+}
+
+/// One `[[api]]` billing poll handed back to the loop for persistence. The fetch itself touches no
+/// `Store` (single-writer invariant): the loop persists on harvest.
+#[derive(Debug)]
+struct BillingOutcome {
+    /// The `[[api]]` account id this poll was for.
+    api_id: String,
+    /// When the poll completed — stamped into `api_billing.polled_at_ms` on a successful write.
+    polled_at: Timestamp,
+    /// The accumulated figures on success, or the typed error (429 → backoff, other → logged).
+    result: AppResult<Vec<ApiFigure>>,
+}
+
+/// Spawn one billing fetch per eligible active `[[api]]` account, run OFF the loop task (single-
+/// writer preserved). Eligible = active, NOT gemini/xai (no live endpoint exists for them — skipped
+/// silently, by construction non-live, no log noise), not cooling down from a prior 429, AND its
+/// named env var resolves to a non-empty value — a dormant (unset/empty) key is skipped with ONE
+/// logged reason, mirroring the zai/kimi stale-key skip.
+fn spawn_billing_fetches<B: BillingEndpoint + 'static>(
+    cfg: &Config,
+    endpoint: &Arc<B>,
+    state: &mut BillingState,
+    tasks: &mut JoinSet<BillingOutcome>,
+) {
+    let month_start = utc_month_start(Timestamp::now());
+    for api in cfg
+        .api
+        .iter()
+        .filter(|a| a.active && !matches!(a.provider, ApiProvider::Gemini | ApiProvider::Xai))
+    {
+        if let Some(ticks) = state.cooldown_ticks.get_mut(&api.id) {
+            if *ticks > 0 {
+                *ticks -= 1;
+                continue; // still backing off from a prior 429
+            }
+        }
+        // Validation (spec 024 §A) guarantees api_key_env for every pollable provider reaching this
+        // filter; this is a defensive skip, never a panic, if that guarantee is ever violated upstream.
+        let Some(env_name) = api.api_key_env.as_deref() else {
+            eprintln!(
+                "collector: [{}] billing overlay skipped — api_key_env not configured",
+                api.id
+            );
+            continue;
+        };
+        let Some(key) = resolve_billing_api_key(env_name) else {
+            eprintln!(
+                "collector: [{}] billing overlay skipped — {env_name} not set or empty",
+                api.id
+            );
+            continue;
+        };
+        let endpoint = Arc::clone(endpoint);
+        let api_id = api.id.clone();
+        let provider = api.provider;
+        let cap = Duration::from_secs(OVERLAY_TICK_BUDGET_SECS);
+        // The key is moved into the task (used for the requests, never logged).
+        tasks.spawn(async move {
+            let result = match tokio::time::timeout(
+                cap,
+                fetch_billing_figures(endpoint.as_ref(), provider, &key, month_start, &api_id),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => Err(AppError::Overlay(
+                    "billing fetch exceeded budget".to_string(),
+                )),
+            };
+            BillingOutcome {
+                api_id,
+                polled_at: Timestamp::now(),
+                result,
+            }
+        });
+    }
+}
+
+/// Fetch + accumulate one `[[api]]` account's billing figures for `month_start`. Moonshot is a
+/// single balance fetch; Anthropic/OpenAI page through MTD cost via [`paginate_cost_report`]
+/// (capped at [`BILLING_PAGE_CAP`] pages — uses the accumulated sum-so-far if the cap is hit).
+/// Gemini/xai are unreachable here (`spawn_billing_fetches` filters them out before spawning) —
+/// kept only as a defensive guard against that filter changing underfoot.
+async fn fetch_billing_figures<B: BillingEndpoint>(
+    endpoint: &B,
+    provider: ApiProvider,
+    key: &str,
+    month_start: Timestamp,
+    api_id: &str,
+) -> AppResult<Vec<ApiFigure>> {
+    match provider {
+        ApiProvider::Moonshot => {
+            let body = endpoint.fetch(provider, key, month_start, None).await?;
+            Ok(vec![crate::billing::moonshot::parse_balance(&body)?])
+        }
+        ApiProvider::Anthropic => {
+            let cents =
+                paginate_cost_report(endpoint, provider, key, month_start, api_id, |body| {
+                    crate::billing::anthropic::parse_cost_report(body)
+                        .map(|page| (page.cents, page.next_page))
+                })
+                .await?;
+            Ok(vec![mtd_spend_figure(cents)])
+        }
+        ApiProvider::OpenAi => {
+            let cents =
+                paginate_cost_report(endpoint, provider, key, month_start, api_id, |body| {
+                    crate::billing::openai::parse_costs(body)
+                        .map(|page| (page.cents, page.next_page))
+                })
+                .await?;
+            Ok(vec![mtd_spend_figure(cents)])
+        }
+        ApiProvider::Gemini | ApiProvider::Xai => {
+            Err(AppError::Overlay("no billing endpoint".to_string()))
+        }
+    }
+}
+
+/// Page through a cost-report endpoint (Anthropic/OpenAI share this shape), summing cents across
+/// pages via `parse` (each provider's own page parser, mapped to `(cents, next_page)`). Stops at
+/// [`BILLING_PAGE_CAP`] pages — logging once and returning the accumulated sum-so-far — so a
+/// runaway or misbehaving cursor can never stall the billing lane.
+/// One provider page → (cents on this page, next-page cursor when more remain).
+type CostPageParser = fn(&[u8]) -> AppResult<(i64, Option<String>)>;
+
+async fn paginate_cost_report<B: BillingEndpoint>(
+    endpoint: &B,
+    provider: ApiProvider,
+    key: &str,
+    month_start: Timestamp,
+    api_id: &str,
+    parse: CostPageParser,
+) -> AppResult<i64> {
+    let mut cents: i64 = 0;
+    let mut cursor: Option<String> = None;
+    for page in 0..BILLING_PAGE_CAP {
+        let body = endpoint
+            .fetch(provider, key, month_start, cursor.as_deref())
+            .await?;
+        let (page_cents, next_page) = parse(&body)?;
+        cents = cents.saturating_add(page_cents);
+        match next_page {
+            Some(next) => {
+                cursor = Some(next);
+                if page + 1 == BILLING_PAGE_CAP {
+                    eprintln!(
+                        "collector: [{api_id}] billing pagination hit the {BILLING_PAGE_CAP}-page \
+                         cap — using the accumulated total"
+                    );
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(cents)
+}
+
+/// Build the one-figure MTD-spend result Anthropic/OpenAI produce (spec 024 §B).
+fn mtd_spend_figure(cents: i64) -> ApiFigure {
+    ApiFigure {
+        kind: ApiFigureKind::MtdSpend,
+        amount_minor: cents,
+        currency: "USD".to_string(),
+    }
+}
+
+/// Harvest one billing poll on the loop task: persist the figures on success (single writer — the
+/// only billing `Store` write), or advance backoff/cooldown and log on failure. Failed polls NEVER
+/// call `set_api_billing`, so last-good rows simply age in place.
+fn apply_billing_outcome(
+    cfg: &Config,
+    store: &Store,
+    state: &mut BillingState,
+    outcome: BillingOutcome,
+) {
+    // Harvest guard: drop a poll that landed after a reload removed/deactivated this api id (§A).
+    if !present_and_active_api(cfg, &outcome.api_id) {
+        return;
+    }
+    let base = cfg.settings.poll_billing_secs.max(1);
+    let BillingOutcome {
+        api_id,
+        polled_at,
+        result,
+    } = outcome;
+    let backoff_current = state.backoff_secs.get(&api_id).copied().unwrap_or(base);
+    match result {
+        Ok(figures) => match store.set_api_billing(&api_id, &figures, polled_at.as_millisecond()) {
+            Ok(()) => state.note_success(&api_id, backoff_current, base),
+            Err(e) => eprintln!("collector: [{api_id}] billing store write failed: {e}"),
+        },
+        Err(AppError::RateLimited) => {
+            state.note_throttled(&api_id, backoff_current, base);
+            eprintln!(
+                "collector: [{}] billing 429 — backing off ~{}s",
+                api_id,
+                state.backoff_secs.get(&api_id).copied().unwrap_or(base)
+            );
+        }
+        Err(e) => eprintln!("collector: [{api_id}] billing fetch failed: {e}"),
+    }
+}
+
+/// Whether `api_id` is still present AND active in the current config — the billing lane's harvest-
+/// guard membership check, the `[[api]]` twin of [`present_and_active`] (spec 015 §A discipline).
+fn present_and_active_api(cfg: &Config, api_id: &str) -> bool {
+    cfg.api.iter().any(|a| a.id == api_id && a.active)
+}
+
 /// Whether `account_id` is still present AND active in the current config — the harvest-guard
 /// membership check (spec 015 §A). A result for an account a reload removed or deactivated is dropped
 /// so the collector never stamps fresh data onto a just-gone account.
@@ -1450,6 +1758,8 @@ pub async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::billing::http::{Canned as BillingCanned, CannedBillingEndpoint};
+    use crate::billing::ApiAccount;
     use crate::config::Settings;
     use crate::domain::{Provenance, Provider};
     use crate::providers::claude::overlay::{Canned, CannedEndpoint};
@@ -1486,6 +1796,25 @@ mod tests {
     fn idle_kimi_endpoint() -> KimiCannedEndpoint {
         KimiCannedEndpoint {
             canned: KimiCanned::Fail,
+        }
+    }
+
+    /// A never-invoked billing endpoint for the non-billing collector tests: no `[[api]]` account is
+    /// configured, so `spawn_billing_fetches` never calls it — only threaded to satisfy
+    /// `run_collector`'s `B` generic.
+    fn idle_billing_endpoint() -> CannedBillingEndpoint {
+        CannedBillingEndpoint::new(BillingCanned::Fail)
+    }
+
+    /// An `[[api]]` account whose `api_key_env` names `env_var`. Its actual presence in the real
+    /// process environment is up to each test (unique names avoid parallel-test collisions).
+    fn api_account(id: &str, provider: ApiProvider, env_var: &str) -> ApiAccount {
+        ApiAccount {
+            id: id.to_string(),
+            label: None,
+            provider,
+            api_key_env: Some(env_var.to_string()),
+            active: true,
         }
     }
 
@@ -1734,6 +2063,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1779,6 +2109,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1854,6 +2185,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1914,6 +2246,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1967,6 +2300,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2056,6 +2390,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2179,6 +2514,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2244,6 +2580,7 @@ mod tests {
             source,
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2310,6 +2647,7 @@ mod tests {
             source,
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2847,6 +3185,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2905,6 +3244,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3024,6 +3364,7 @@ mod tests {
             idle_rate_source(),
             idle_zai_endpoint(),
             idle_kimi_endpoint(),
+            idle_billing_endpoint(),
             store,
             async {
                 tokio::time::sleep(Duration::from_mins(1)).await;
@@ -3417,5 +3758,408 @@ config_dir = \"/tmp\"
                 .is_none(),
             "the idle-arm crit crossing must already have fired (cooldown stamped)"
         );
+    }
+
+    // ── spec 024 §D — API billing lane ────────────────────────────────────────────────────────
+
+    /// A billing endpoint that returns a queued sequence of outcomes (one per `fetch` call, in
+    /// order) and records every call's cursor — a collector-local double for pagination scenarios
+    /// `CannedBillingEndpoint` can't express (its single `Canned` returns the same body every call).
+    struct QueuedBillingEndpoint {
+        pages: std::sync::Mutex<std::collections::VecDeque<AppResult<Vec<u8>>>>,
+        calls: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl QueuedBillingEndpoint {
+        fn new(pages: Vec<AppResult<Vec<u8>>>) -> Self {
+            Self {
+                pages: std::sync::Mutex::new(pages.into_iter().collect()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_cursors(&self) -> Vec<Option<String>> {
+            self.calls.lock().expect("calls mutex poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl BillingEndpoint for QueuedBillingEndpoint {
+        async fn fetch(
+            &self,
+            _provider: ApiProvider,
+            _api_key: &str,
+            _month_start: Timestamp,
+            cursor: Option<&str>,
+        ) -> AppResult<Vec<u8>> {
+            self.calls
+                .lock()
+                .expect("calls mutex poisoned")
+                .push(cursor.map(str::to_string));
+            self.pages
+                .lock()
+                .expect("pages mutex poisoned")
+                .pop_front()
+                .unwrap_or_else(|| Err(AppError::Overlay("no more queued pages".to_string())))
+        }
+    }
+
+    #[tokio::test]
+    async fn billing_success_path_writes_the_row_and_resets_backoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_BILLING_KEY_SUCCESS";
+        std::env::set_var(env_var, "sk-FAKE-key");
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account(
+            "anthropic-work",
+            ApiProvider::Anthropic,
+            env_var,
+        )];
+
+        let endpoint = Arc::new(CannedBillingEndpoint::new(BillingCanned::Body(
+            br#"{"data":[{"results":[{"amount":"500","currency":"USD"}]}],"has_more":false}"#
+                .to_vec(),
+        )));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        while let Some(joined) = tasks.join_next().await {
+            apply_billing_outcome(&cfg, &store, &mut state, joined.expect("join"));
+        }
+
+        let rows = store.latest_api_billing().expect("query");
+        let row = rows
+            .iter()
+            .find(|r| r.api_id == "anthropic-work")
+            .expect("an opted-in api account with a 200 response must write a row");
+        assert_eq!(row.figure, ApiFigureKind::MtdSpend);
+        assert_eq!(row.amount_minor, 500);
+        assert_eq!(row.currency, "USD");
+
+        let base = cfg.settings.poll_billing_secs.max(1);
+        assert_eq!(
+            state.backoff_secs.get("anthropic-work").copied(),
+            Some(base),
+            "a successful poll must reset backoff to the base cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_429_produces_no_write_and_backs_off_the_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_BILLING_KEY_429";
+        std::env::set_var(env_var, "sk-FAKE-key");
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account("openai-prod", ApiProvider::OpenAi, env_var)];
+
+        let endpoint = Arc::new(CannedBillingEndpoint::new(BillingCanned::RateLimited));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        while let Some(joined) = tasks.join_next().await {
+            apply_billing_outcome(&cfg, &store, &mut state, joined.expect("join"));
+        }
+
+        assert!(
+            store.latest_api_billing().expect("query").is_empty(),
+            "a 429 must never write a row"
+        );
+        let base = cfg.settings.poll_billing_secs.max(1);
+        assert!(
+            state
+                .backoff_secs
+                .get("openai-prod")
+                .copied()
+                .unwrap_or(base)
+                > base,
+            "a 429 must grow the account's backoff: {:?}",
+            state.backoff_secs
+        );
+        assert!(
+            state
+                .cooldown_ticks
+                .get("openai-prod")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "a 429 must set a cooldown"
+        );
+    }
+
+    #[test]
+    fn billing_state_note_throttled_doubles_then_caps_at_the_shared_ceiling() {
+        // The doubling/capping arithmetic itself is `next_backoff`'s contract (fully table-tested in
+        // `providers::claude::overlay`); this proves `BillingState` wires it correctly end to end.
+        let mut state = BillingState::default();
+        let base = 3600;
+        state.note_throttled("acct", base, base);
+        assert_eq!(
+            state.backoff_secs["acct"],
+            base * 2,
+            "first 429 doubles the base"
+        );
+        state.note_throttled("acct", base * 2, base);
+        assert_eq!(
+            state.backoff_secs["acct"],
+            base * 4,
+            "second 429 doubles again"
+        );
+
+        let mut current = base;
+        for _ in 0..10 {
+            state.note_throttled("acct", current, base);
+            current = state.backoff_secs["acct"];
+        }
+        assert_eq!(
+            current,
+            base * 4,
+            "sustained 429s must cap at 4x the billing base, never grow unbounded"
+        );
+        // A small base (config floor) still respects the shared overlay ceiling as its floor.
+        let mut floor_state = BillingState::default();
+        let small_base = 60;
+        let mut small_current = small_base;
+        for _ in 0..10 {
+            floor_state.note_throttled("acct", small_current, small_base);
+            small_current = floor_state.backoff_secs["acct"];
+        }
+        assert_eq!(
+            small_current, OVERLAY_BACKOFF_CAP_SECS,
+            "a tiny base caps at the shared overlay ceiling, not 4x"
+        );
+        assert!(state.cooldown_ticks.get("acct").copied().unwrap_or(0) > 0);
+    }
+
+    #[tokio::test]
+    async fn billing_generic_failure_writes_nothing_and_preserves_last_good() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_BILLING_KEY_FAILURE";
+        std::env::set_var(env_var, "sk-FAKE-key");
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account("moonshot-k2", ApiProvider::Moonshot, env_var)];
+
+        // Seed a prior successful poll's row directly.
+        store
+            .set_api_billing(
+                "moonshot-k2",
+                &[ApiFigure {
+                    kind: ApiFigureKind::Balance,
+                    amount_minor: 4_200,
+                    currency: "USD".to_string(),
+                }],
+                1_000,
+            )
+            .expect("seed");
+
+        let endpoint = Arc::new(CannedBillingEndpoint::new(BillingCanned::Fail));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        while let Some(joined) = tasks.join_next().await {
+            apply_billing_outcome(&cfg, &store, &mut state, joined.expect("join"));
+        }
+
+        let rows = store.latest_api_billing().expect("query");
+        let row = rows
+            .iter()
+            .find(|r| r.api_id == "moonshot-k2")
+            .expect("the last-good row must survive a failed poll");
+        assert_eq!(
+            row.amount_minor, 4_200,
+            "a failed poll must never overwrite last-good"
+        );
+        assert_eq!(
+            row.polled_at_ms, 1_000,
+            "the stamp must be untouched by the failed poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_dormant_account_with_unset_env_spawns_no_task() {
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account(
+            "anthropic-work",
+            ApiProvider::Anthropic,
+            "TOK_TEST_BILLING_KEY_DOES_NOT_EXIST",
+        )];
+
+        let endpoint = Arc::new(CannedBillingEndpoint::new(BillingCanned::Fail));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        assert_eq!(tasks.len(), 0, "an unset env var must never be fetched");
+        assert!(
+            endpoint.recorded().is_empty(),
+            "a dormant account must never touch the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_gemini_and_xai_accounts_are_never_fetched() {
+        std::env::set_var("TOK_TEST_BILLING_KEY_GEMINI_UNUSED", "sk-FAKE-key");
+        std::env::set_var("TOK_TEST_BILLING_KEY_XAI_UNUSED", "sk-FAKE-key");
+        let mut cfg = config(vec![]);
+        cfg.api = vec![
+            api_account(
+                "gemini-studio",
+                ApiProvider::Gemini,
+                "TOK_TEST_BILLING_KEY_GEMINI_UNUSED",
+            ),
+            api_account(
+                "xai-grok",
+                ApiProvider::Xai,
+                "TOK_TEST_BILLING_KEY_XAI_UNUSED",
+            ),
+        ];
+
+        let endpoint = Arc::new(CannedBillingEndpoint::new(BillingCanned::Fail));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+
+        std::env::remove_var("TOK_TEST_BILLING_KEY_GEMINI_UNUSED");
+        std::env::remove_var("TOK_TEST_BILLING_KEY_XAI_UNUSED");
+        assert_eq!(
+            tasks.len(),
+            0,
+            "gemini/xai carry no live billing endpoint — by construction, never spawned"
+        );
+        assert!(endpoint.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn billing_pagination_sums_cents_across_pages_and_threads_the_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_BILLING_KEY_PAGINATION";
+        std::env::set_var(env_var, "sk-FAKE-key");
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account(
+            "anthropic-work",
+            ApiProvider::Anthropic,
+            env_var,
+        )];
+
+        let page1 =
+            br#"{"data":[{"results":[{"amount":"100","currency":"USD"}]}],"has_more":true,"next_page":"p2"}"#
+                .to_vec();
+        let page2 =
+            br#"{"data":[{"results":[{"amount":"50","currency":"USD"}]}],"has_more":false}"#
+                .to_vec();
+        let endpoint = Arc::new(QueuedBillingEndpoint::new(vec![Ok(page1), Ok(page2)]));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        while let Some(joined) = tasks.join_next().await {
+            apply_billing_outcome(&cfg, &store, &mut state, joined.expect("join"));
+        }
+
+        let rows = store.latest_api_billing().expect("query");
+        let row = rows
+            .iter()
+            .find(|r| r.api_id == "anthropic-work")
+            .expect("row present");
+        assert_eq!(
+            row.amount_minor, 150,
+            "100 + 50 cents summed across the two pages"
+        );
+        assert_eq!(
+            endpoint.recorded_cursors(),
+            vec![None, Some("p2".to_string())],
+            "the first page carries no cursor; the second carries the first page's next_page"
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_pagination_stops_at_the_page_cap_using_the_accumulated_sum() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("t.db")).expect("open");
+        let env_var = "TOK_TEST_BILLING_KEY_PAGE_CAP";
+        std::env::set_var(env_var, "sk-FAKE-key");
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account(
+            "anthropic-work",
+            ApiProvider::Anthropic,
+            env_var,
+        )];
+
+        // 9 canned pages, every one claiming more follow — the lane must stop at the 8-page cap.
+        let pages: Vec<AppResult<Vec<u8>>> = (1..=9)
+            .map(|n| {
+                Ok(format!(
+                    r#"{{"data":[{{"results":[{{"amount":"10","currency":"USD"}}]}}],"has_more":true,"next_page":"p{n}"}}"#
+                )
+                .into_bytes())
+            })
+            .collect();
+        let endpoint = Arc::new(QueuedBillingEndpoint::new(pages));
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+        while let Some(joined) = tasks.join_next().await {
+            apply_billing_outcome(&cfg, &store, &mut state, joined.expect("join"));
+        }
+
+        let rows = store.latest_api_billing().expect("query");
+        let row = rows
+            .iter()
+            .find(|r| r.api_id == "anthropic-work")
+            .expect("row present");
+        assert_eq!(
+            row.amount_minor, 80,
+            "must stop at the 8-page cap and use the accumulated sum-so-far (8 × 10 cents)"
+        );
+        assert_eq!(
+            endpoint.recorded_cursors().len(),
+            8,
+            "exactly 8 pages fetched — the 9th is never reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_key_never_appears_in_debug_output() {
+        let secret = "sk-FAKE-key";
+        let env_var = "TOK_TEST_BILLING_KEY_NO_LEAK";
+        std::env::set_var(env_var, secret);
+        let mut cfg = config(vec![]);
+        cfg.api = vec![api_account(
+            "anthropic-work",
+            ApiProvider::Anthropic,
+            env_var,
+        )];
+
+        let endpoint = Arc::new(idle_billing_endpoint());
+        let mut state = BillingState::default();
+        let mut tasks: JoinSet<BillingOutcome> = JoinSet::new();
+        spawn_billing_fetches(&cfg, &endpoint, &mut state, &mut tasks);
+        std::env::remove_var(env_var);
+
+        let outcome = tasks.join_next().await.expect("one task").expect("join");
+        assert!(!format!("{outcome:?}").contains(secret));
+        assert!(!format!("{state:?}").contains(secret));
+    }
+
+    #[test]
+    fn utc_month_start_table() {
+        let cases = [
+            ("2026-07-14T15:23:45Z", "2026-07-01T00:00:00Z"), // mid-month
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"), // already exactly the boundary
+            ("2025-12-31T23:59:59Z", "2025-12-01T00:00:00Z"), // year-end day → same-year Dec 1
+            ("2028-02-15T12:00:00Z", "2028-02-01T00:00:00Z"), // leap year's February
+        ];
+        for (now, expected) in cases {
+            let now: Timestamp = now.parse().expect("fixture timestamp parses");
+            let expected: Timestamp = expected.parse().expect("fixture timestamp parses");
+            assert_eq!(utc_month_start(now), expected, "now={now}");
+        }
     }
 }

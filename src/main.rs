@@ -18,9 +18,6 @@
 //! - The only I/O the CLI drives is at the command edges; the async runtime is built explicitly here.
 
 mod alerts;
-// Wired in by the collector/doctor wave (spec 024 §D/§E) + TUI wave (spec 025);
-// module-level dead-code allow dies with that wiring.
-#[allow(dead_code)]
 mod billing;
 mod collector;
 mod config;
@@ -42,6 +39,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use serde::Serialize;
 
+use billing::http::HttpBillingEndpoint;
 use config::Config;
 use domain::{Account, Limit, Provider, UsageSnapshot};
 use error::AppResult;
@@ -413,6 +411,7 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
         let rate_source = AppServerClient::new(Duration::from_secs(CODEX_APP_SERVER_TIMEOUT_SECS));
         let zai_endpoint = HttpQuotaEndpoint::new()?;
         let kimi_endpoint = KimiHttpQuotaEndpoint::new()?;
+        let billing_endpoint = HttpBillingEndpoint::new()?;
         let overlay_on = cfg.accounts.iter().filter(|a| a.limits_overlay).count();
         println!(
             "collector: watching {} account(s) every {}s ({overlay_on} with overlay) → {} (Ctrl-C to stop)",
@@ -428,6 +427,7 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
             rate_source,
             zai_endpoint,
             kimi_endpoint,
+            billing_endpoint,
             store,
             collector::shutdown_signal(),
         )

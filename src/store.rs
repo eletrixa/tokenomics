@@ -182,7 +182,6 @@ pub struct CollectorStamp {
 /// API id, as read back by [`Store::latest_api_billing`]. `figure` is a typed [`ApiFigureKind`]; a
 /// stored `figure` string that no longer parses is dropped at read time (see `latest_api_billing`).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // consumed by the spec 024 collector + 025 TUI waves; allow dies with the wiring
 pub struct ApiBillingRow {
     /// The API id this figure belongs to.
     pub api_id: String,
@@ -374,7 +373,6 @@ impl Store {
     /// writer, the TUI the sole reader ([`Store::latest_api_billing`]) — the same discipline as
     /// [`Store::set_limits`]. An empty `figures` clears the id's rows (the `DELETE` runs, the loop
     /// inserts nothing): a valid but figure-less poll, distinct from a failed one.
-    #[allow(dead_code)] // consumed by the spec 024 collector wave; allow dies with the wiring
     pub fn set_api_billing(
         &self,
         api_id: &str,
@@ -626,7 +624,6 @@ impl Store {
     /// SKIPPED, not fatal — defensive read, so one bad row can't blank the whole billing plane; its
     /// parseable siblings survive. Mirrors the degrade-don't-error discipline of
     /// [`Store::latest_limits`].
-    #[allow(dead_code)] // consumed by the spec 025 TUI wave; allow dies with the wiring
     pub fn latest_api_billing(&self) -> AppResult<Vec<ApiBillingRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT api_id, figure, amount_minor, currency, polled_at_ms

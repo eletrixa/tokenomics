@@ -51,16 +51,14 @@ impl ProviderAdapter for ZaiAdapter {
 /// `Err(reason)` when `api_key_env` itself is absent (validation-guaranteed present for a zai
 /// account — this is a defensive case), unset, or empty (spec 019 §A/§D). Shared by `doctor`
 /// (presence-only reporting) and the collector's overlay fetch (needs the actual value) so the
-/// eligibility rule can never drift between the two call sites.
+/// eligibility rule can never drift between the two call sites. Wraps the canonical env-var lookup
+/// (`providers::resolve_api_key`, spec 024 §D hoist) — this `Account`-shaped signature is kept so
+/// `doctor` and the collector's zai lane are untouched.
 pub fn resolve_api_key(account: &Account) -> Result<String, String> {
     let Some(name) = account.api_key_env.as_deref() else {
         return Err("api_key_env not configured".to_string());
     };
-    match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
-        Ok(_) => Err(format!("{name} is set but empty")),
-        Err(_) => Err(format!("{name} is not set")),
-    }
+    crate::providers::resolve_api_key(name).ok_or_else(|| format!("{name} is not set or is empty"))
 }
 
 #[cfg(test)]

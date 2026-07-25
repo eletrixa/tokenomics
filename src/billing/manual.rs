@@ -41,8 +41,6 @@ use serde::Deserialize;
 use crate::billing::{dollars_f64_to_cents, ApiFigureKind};
 
 /// Env var overriding the manual path (empty ⇒ ignored) — mirrors `TOKENOMICS_LEDGER`.
-// Consumed by the TUI wiring wave (spec 025 §C); dead until then.
-#[allow(dead_code)]
 pub const API_MANUAL_ENV: &str = "TOKENOMICS_API_MANUAL";
 
 /// A manual row whose `as_of` is strictly older than this many days is stale (spec 024 §C). Pinned
@@ -366,8 +364,6 @@ impl ApiManual {
     }
 
     /// Rows that failed to parse on the last successful read (for `tok doctor`; never rendered).
-    // Consumed by the doctor wave (spec 024 §E); dead until then.
-    #[allow(dead_code)]
     pub fn errors(&self) -> &[RowError] {
         &self.errors
     }

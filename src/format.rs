@@ -168,7 +168,6 @@ pub fn format_dollars(cost_notional: f64) -> String {
 /// Always exactly 2 decimals. Negative → leading "-" before the glyph: "-$0.52".
 /// This grammar is deliberately disjoint from the notional-cost formatting — never add
 /// an "n"/"(notional)" suffix here, and never route notional values through this fn.
-#[allow(dead_code)] // consumed by the spec 025 TUI wave; allow dies with the wiring
 pub fn format_money(amount_minor: i64, currency: &str) -> String {
     let negative = amount_minor < 0;
     let abs = amount_minor.unsigned_abs();

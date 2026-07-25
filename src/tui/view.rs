@@ -7,7 +7,10 @@
 //!          the ledger clause's tier degrade order (`pick_full_clause`, `compact_header_line`,
 //!          `micro_line`) and the fleet header's ledger token (spec 017 §D acceptance 5); the
 //!          verified pill's own degrade step + dim-green span styling (`split_pill`,
-//!          `full_title_spans`) and its absence from MICRO (spec 018 §C acceptance 3/4)
+//!          `full_title_spans`) and its absence from MICRO (spec 018 §C acceptance 3/4); the `o`-gated
+//!          API billing section (`render_api`) — its states, the shared `fit_segments` drop-from-right
+//!          fit (also used by `render_fleet`, byte-identical fleet behaviour), the height gate, and
+//!          the `NO_COLOR` grid with the section on (spec 025 §A/§B/§D)
 //!
 //! Design constraints:
 //! - `render` takes `&App` only; every value it needs is precomputed on `App` (no I/O, no compute).
@@ -28,7 +31,9 @@ use ratatui::Frame;
 use crate::domain::Severity;
 use crate::format::severity_label;
 
-use super::model::{resolve_color, severity_glyph, AccountView, App, GaugeView, SubView};
+use super::model::{
+    resolve_color, severity_glyph, AccountView, ApiRowView, ApiView, App, GaugeView, SubView,
+};
 
 /// Bordered panel height: border (2) + 2 inner lines (5h · weekly). Token/cost/burn moved to the
 /// fleet header line, so the panel no longer carries a per-account meta row.
@@ -105,6 +110,12 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
     let show_fleet = app.fleet.is_some() && !app.show_help && area.height >= 6;
     // The fleet-wide burn bar needs its own row and only earns it in a roomy window with data.
     let show_agg = !app.aggregate_burn.is_empty() && !app.show_help && area.height >= 8;
+    // The API billing section (spec 025 §A): unlike the other chrome rows above, its own block
+    // height grows with the row count (header + one line per row), so a single fixed literal like
+    // `8` above can't gate it — the floor below is added to that height instead, keeping the same
+    // amount of room clear for the rest of the chrome plus the body as the fleet/agg gates do.
+    let api_h = api_block_height(app.api.as_ref());
+    let show_api = app.show_api && !app.show_help && area.height >= API_CHROME_FLOOR + api_h;
 
     let mut constraints = vec![Constraint::Length(1)]; // title
     if show_collector_alert {
@@ -118,6 +129,9 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
     }
     if show_agg {
         constraints.push(Constraint::Length(1));
+    }
+    if show_api {
+        constraints.push(Constraint::Length(api_h));
     }
     constraints.push(Constraint::Min(1)); // body
     if show_footer {
@@ -143,6 +157,10 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
     }
     if show_agg {
         render_agg_bar(f, app, chunks[idx]);
+        idx += 1;
+    }
+    if show_api {
+        render_api(f, app, chunks[idx]);
         idx += 1;
     }
     let body = chunks[idx];
@@ -440,24 +458,7 @@ fn render_fleet(f: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let width = usize::from(area.width);
-    let mut spans = Vec::with_capacity(segments.len() * 2);
-    let mut used = 0usize;
-    for (text, style) in segments {
-        let cells = text.chars().count();
-        let add = if spans.is_empty() {
-            cells
-        } else {
-            SEP.chars().count() + cells
-        };
-        if used + add > width {
-            break; // this segment (and every less-important one after it) doesn't fit
-        }
-        if !spans.is_empty() {
-            spans.push(Span::styled(SEP, dim));
-        }
-        spans.push(Span::styled(text, style));
-        used += add;
-    }
+    let (mut spans, used) = fit_segments(segments, width, SEP, dim);
     // The ledger plane's one dim fleet token (spec 017 §D), lowest priority of all — it already
     // carries its own leading `"· "` bullet (see `ledger_fleet_note`), so it's appended with a
     // plain space rather than through the `SEP`-joined segments above.
@@ -469,6 +470,100 @@ fn render_fleet(f: &mut Frame<'_>, app: &App, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Drop `segments` (in priority order, most→least important) from the right until the `sep`-joined
+/// line fits `width` cells — a segment renders whole or not at all, so nothing is ever truncated
+/// mid-figure/word. Shared by `render_fleet` and `render_api` (spec 025 §B acceptance 3) so both
+/// planes' dense lines degrade the same way. Returns the styled spans plus the cell width they used.
+fn fit_segments(
+    segments: Vec<(String, Style)>,
+    width: usize,
+    sep: &str,
+    sep_style: Style,
+) -> (Vec<Span<'static>>, usize) {
+    let mut spans = Vec::with_capacity(segments.len() * 2);
+    let mut used = 0usize;
+    for (text, style) in segments {
+        let cells = text.chars().count();
+        let add = if spans.is_empty() {
+            cells
+        } else {
+            sep.chars().count() + cells
+        };
+        if used + add > width {
+            break; // this segment (and every less-important one after it) doesn't fit
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(sep.to_string(), sep_style));
+        }
+        spans.push(Span::styled(text, style));
+        used += add;
+    }
+    (spans, used)
+}
+
+/// Minimum height kept clear of the API section for the rest of the chrome plus a body floor
+/// (title + footer + a few body rows) — mirrors the fixed literals `show_fleet`/`show_agg` gate on
+/// above, but the API block's own height varies with the row count (see [`api_block_height`]), so
+/// that height is added to this floor rather than folded into one fixed literal.
+const API_CHROME_FLOOR: u16 = 6;
+
+/// The API section's own height: a header line plus one line per row, or 2 (header + the
+/// unconfigured line) when there is no data to show yet (`app.api` is `None` or carries no rows) —
+/// spec 025 §A/§B.
+fn api_block_height(api: Option<&ApiView>) -> u16 {
+    let rows = api.map_or(0, |view| view.rows.len());
+    if rows == 0 {
+        2
+    } else {
+        1 + u16::try_from(rows).unwrap_or(u16::MAX)
+    }
+}
+
+/// The API billing overview section (spec 025 §B, `o` to toggle): a header line, then one dense
+/// line per `[[api]]` row (config order, then trailing divergent manual-only ids) — 2-space indent,
+/// name left-justified 10, then its figure/provenance segments dropped from the right via
+/// [`fit_segments`]. When there's no data yet (`app.api` is `None` or carries no rows), it's just
+/// the header plus a dim pointer at `tokenomics.toml`.
+fn render_api(f: &mut Frame<'_>, app: &App, area: Rect) {
+    const SEP: &str = " · ";
+    const NAME_W: usize = 10;
+    let dim = Style::new().fg(resolve_color(app.use_color, Color::DarkGray));
+    let header = Line::from(vec![
+        Span::styled(
+            "api",
+            Style::new()
+                .fg(resolve_color(app.use_color, Color::Magenta))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · real $ — bills & balances, never notional", dim),
+    ]);
+
+    let mut lines = vec![header];
+    let rows: &[ApiRowView] = app.api.as_ref().map_or(&[], |view| view.rows.as_slice());
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  not configured — see tokenomics.toml [api] (tok doctor explains)",
+            dim,
+        )));
+    } else {
+        let width = usize::from(area.width);
+        for row in rows {
+            let prefix = format!("  {} ", ljust(&row.name, NAME_W));
+            let avail = width.saturating_sub(prefix.chars().count());
+            let segments: Vec<(String, Style)> = row
+                .segments
+                .iter()
+                .map(|seg| (seg.text.clone(), Style::new().fg(seg.color)))
+                .collect();
+            let (seg_spans, _) = fit_segments(segments, avail, SEP, dim);
+            let mut spans = vec![Span::raw(prefix)];
+            spans.extend(seg_spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// A gauge row without a leading spine: `"5h <bar> <label>"`, or `"5h <fallback>"`. `tight` swaps the
@@ -1054,6 +1149,7 @@ fn render_help(f: &mut Frame<'_>, area: Rect) {
         Line::from("↓ / j        move selection down"),
         Line::from("r            refresh from the store now"),
         Line::from("i            toggle showing inactive (unsubscribed) accounts"),
+        Line::from("o            toggle the api pay-as-you-go section (real dollars)"),
         Line::from("?            toggle this help"),
         Line::from("q / Esc      quit"),
         Line::from(""),
@@ -1061,6 +1157,9 @@ fn render_help(f: &mut Frame<'_>, area: Rect) {
         Line::from("compact view when shorter, one line per account when tiny."),
         Line::from("Limits are % utilization + reset time — never \"X of Y\"."),
         Line::from("Cost is a notional usage proxy, never a bill."),
+        Line::from(
+            "The api section shows REAL money (balances & bills) — never the notional proxy.",
+        ),
         Line::from("Badge shows provenance: derived (local) vs authoritative (overlay)."),
         Line::from("An inactive account, when shown, is dimmed and tagged \"(inactive)\"."),
     ];
@@ -1071,7 +1170,10 @@ fn render_help(f: &mut Frame<'_>, area: Rect) {
 mod tests {
     use super::*;
     use crate::domain::{Provenance, Severity};
-    use crate::tui::model::{severity_color, AccountView, Badge, FleetView, GaugeView, SubView};
+    use crate::tui::model::{
+        severity_color, AccountView, ApiRowView, ApiSegment, ApiView, Badge, FleetView, GaugeView,
+        SubView,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -1224,6 +1326,71 @@ mod tests {
         app.aggregate_burn = vec![10, 25, 18, 40, 33, 60, 55, 80];
         app.fleet = Some(fleet_derived());
         app.selected = 1;
+        app
+    }
+
+    /// One hand-built API row segment (view tests don't exercise `build_api_view` — that's
+    /// `model.rs`'s job; these just cover how `render_api` lays out whatever it's handed).
+    fn api_segment(text: &str, color: Color) -> ApiSegment {
+        ApiSegment {
+            text: text.to_string(),
+            color,
+        }
+    }
+
+    /// An `ApiView` covering every §B row state: live-fresh, manual-stale, mixed planes with
+    /// per-figure notes, dormant xai, a divergent manual-only id, and `waiting for collector`.
+    fn api_view_all_states() -> ApiView {
+        ApiView {
+            rows: vec![
+                ApiRowView {
+                    name: "anthropic".to_string(),
+                    segments: vec![
+                        api_segment("bal $120.00", Color::White),
+                        api_segment("owed $0.00", Color::White),
+                        api_segment("mtd $42.10", Color::White),
+                        api_segment("live 2m ago", Color::DarkGray),
+                    ],
+                },
+                ApiRowView {
+                    name: "openai".to_string(),
+                    segments: vec![
+                        api_segment("mtd $18.50", Color::White),
+                        api_segment("manual 2026-06-01 · stale", Color::Yellow),
+                    ],
+                },
+                ApiRowView {
+                    name: "moonshot".to_string(),
+                    segments: vec![
+                        api_segment("bal $50.00", Color::White),
+                        api_segment("mtd $9.20", Color::White),
+                        api_segment("mtd live 3m ago · bal manual 2026-07-20", Color::DarkGray),
+                    ],
+                },
+                ApiRowView {
+                    name: "xai".to_string(),
+                    segments: vec![api_segment("dormant (XAI_API_KEY unset)", Color::DarkGray)],
+                },
+                ApiRowView {
+                    name: "shadow-id".to_string(),
+                    segments: vec![
+                        api_segment("mtd $3.00", Color::White),
+                        api_segment("manual 2026-07-10", Color::DarkGray),
+                    ],
+                },
+                ApiRowView {
+                    name: "vertex".to_string(),
+                    segments: vec![api_segment("waiting for collector", Color::DarkGray)],
+                },
+            ],
+        }
+    }
+
+    /// [`board`] with the API section populated and shown — the fixture for every spec 025 test.
+    fn board_with_api() -> App {
+        let mut app = board();
+        app.api = Some(api_view_all_states());
+        app.show_api = true;
         app
     }
 
@@ -1415,6 +1582,18 @@ mod tests {
                 "grid differs with NO_COLOR at {w}x{h}"
             );
         }
+        // spec 025 §D acceptance 6: the api-on board must be identical too — the section's own
+        // colours (header accent, figure/provenance segment colours) are no exception.
+        let colored_api = board_with_api();
+        let mut mono_api = board_with_api();
+        mono_api.use_color = false;
+        for (w, h) in [(120, 40), (80, 20)] {
+            assert_eq!(
+                draw(&colored_api, w, h),
+                draw(&mono_api, w, h),
+                "api-on grid differs with NO_COLOR at {w}x{h}"
+            );
+        }
     }
 
     #[test]
@@ -1565,6 +1744,71 @@ mod tests {
     #[test]
     fn narrow_board_snapshot() {
         insta::assert_snapshot!("board_narrow", draw(&board(), 42, 14));
+    }
+
+    // ── spec 025 §A/§B/§D: the `o`-gated API billing section ───────────────────────────────────
+
+    #[test]
+    fn board_api_snapshot() {
+        insta::assert_snapshot!("board_api", draw(&board_with_api(), 120, 40));
+    }
+
+    #[test]
+    fn board_api_compact_snapshot() {
+        insta::assert_snapshot!("board_api_compact", draw(&board_with_api(), 80, 20));
+    }
+
+    #[test]
+    fn api_toggle_changes_render() {
+        let mut app = board_with_api();
+        app.show_api = false;
+        let hidden = draw(&app, 120, 40);
+        app.show_api = true;
+        let shown = draw(&app, 120, 40);
+        assert_ne!(hidden, shown, "toggling `o` must change the render");
+        assert!(
+            shown.contains("real $"),
+            "shown must carry the api header:\n{shown}"
+        );
+        assert!(
+            !hidden.contains("real $"),
+            "hidden must not show the api header:\n{hidden}"
+        );
+    }
+
+    #[test]
+    fn api_section_height_gated_on_short_terminals() {
+        // Too short to keep the api block's own height plus the rest of the chrome/body floor
+        // clear — the section must drop silently rather than squeeze the body to nothing.
+        let app = board_with_api();
+        let text = draw(&app, 120, 6);
+        assert!(
+            !text.contains("real $"),
+            "a short terminal must drop the api section:\n{text}"
+        );
+    }
+
+    #[test]
+    fn api_section_shows_unconfigured_line_when_no_data() {
+        let mut app = board();
+        app.show_api = true; // app.api stays None — plane not read / off
+        let text = draw(&app, 120, 40);
+        assert!(
+            text.contains("not configured — see tokenomics.toml [api]"),
+            "unconfigured line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_api_toggle_and_dogma() {
+        let mut app = board();
+        app.show_help = true;
+        let text = draw(&app, 80, 24);
+        assert!(
+            text.contains("toggle the api pay-as-you-go section"),
+            "help api key line:\n{text}"
+        );
+        assert!(text.contains("REAL money"), "help api dogma line:\n{text}");
     }
 
     // ── spec 017 §D (acceptance 5): tier rendering of the ledger clause ────────────────────────

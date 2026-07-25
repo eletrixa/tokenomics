@@ -5,12 +5,16 @@
 //! Deps:    jiff; runner (ccusage/codex/gemini/grok version), providers::claude
 //!          (adapter/creds/overlay), providers::codex (app-server rate-limits probe),
 //!          providers::zai (quota probe), providers::kimi (quota probe),
-//!          providers::grok::billing (weekly-quota parse)
+//!          providers::grok::billing (weekly-quota parse), billing::manual (manual TOML lane),
+//!          billing (ApiProvider/ApiFigureKind/ApiAccount), format (poll-age humanizer), store
+//!          (read-only billing rows)
 //! Tested:  the parseable parts are covered in their own modules; this orchestrates + prints. The
 //!          ledger diagnostics' pure helpers (`ledger_status_line`, `ledger_past_dated`,
 //!          `ledger_join_divergence`) get their own inline tests (spec 017 §E acceptance 8); the
 //!          per-row `verified_annotation` / `ledger_verified_lines` helpers get theirs (spec 018 §D
-//!          acceptance 5).
+//!          acceptance 5); the api-plane pure helpers (`api_overview_line`, `api_parse_error_lines`,
+//!          `api_past_stale_lines`, `api_live_and_dormant_lines`, `api_divergence_ids`,
+//!          `pollable_figure`) get theirs (spec 024 §E acceptance 7).
 //!
 //! Key responsibilities:
 //! - Per Claude account: config_dir exists; `.credentials.json` present + owner-only; ccusage active
@@ -37,6 +41,13 @@
 //!   matching config account); per-matched-row `verified` annotation — current / outdated /
 //!   human-entered (spec 018 §D). One read-only poll via the injectable `FileLedgerSource` — never
 //!   written, never held past this run.
+//! - API billing plane (spec 024 §E): resolved manual path + provenance (`"api overview: not
+//!   configured"` when the plane is fully off — no `[[api]]` entries and no manual path — then nothing
+//!   else); per-row manual parse errors; manual rows past the 35-day staleness const; each pollable
+//!   `[[api]]` entry's live figure + last-poll age (or `never polled`) vs its dormant state (env-var
+//!   NAME + `unset`); manual rows joining no configured `[[api]]` id. One read-only poll of the manual
+//!   TOML lane (`FileApiManualSource`) + read-only store billing rows — presence-NOT-value, so never a
+//!   dollar amount, a currency, a key value, or file contents (only states and ages).
 //! - Config divergence (spec 015 §B): flag when the RECORDED config path is newer than what the
 //!   running collector loaded, but only once the collector has heartbeated a few local cadences past
 //!   the edit without reloading (else the reload is simply pending). A persistent mismatch means the
@@ -56,9 +67,15 @@ use std::time::Duration;
 use jiff::tz::TimeZone;
 use jiff::Timestamp;
 
+use crate::billing::manual::{
+    resolve_path, row_is_stale, ApiManual, ApiManualProvenance, ApiManualRow, FileApiManualSource,
+    RowError, API_MANUAL_ENV,
+};
+use crate::billing::{ApiAccount, ApiFigureKind, ApiProvider};
 use crate::config::Config;
 use crate::domain::Provider;
 use crate::error::AppResult;
+use crate::format::format_ago_ms;
 use crate::ledger::{
     verified_current, FileLedgerSource, Ledger, LedgerProvenance, SubStatus, Subscription,
     LEDGER_ENV,
@@ -69,7 +86,7 @@ use crate::providers::claude::{creds, ClaudeAdapter};
 use crate::providers::codex::rate_limits::{AppServerClient, RateLimitsSource};
 use crate::providers::ProviderAdapter;
 use crate::runner::{CommandSpec, Exec, Runner};
-use crate::store::Store;
+use crate::store::{ApiBillingRow, Store};
 
 const DOCTOR_TIMEOUT_SECS: u64 = 30;
 
@@ -119,7 +136,9 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
     report_distinctness(&signatures);
     report_shared_projects(cfg);
     report_config_divergence(cfg);
-    report_ledger(cfg, now.to_zoned(TimeZone::system()).date());
+    let today = now.to_zoned(TimeZone::system()).date();
+    report_ledger(cfg, today);
+    report_api(cfg, today, now_ms);
     Ok(())
 }
 
@@ -385,6 +404,241 @@ fn ledger_join_divergence(
         .collect();
 
     (config_only, ledger_only)
+}
+
+// ── spec 024 §E: api billing-plane diagnostics (manual lane + live/dormant + divergence) ──────
+
+/// Read the manual TOML lane once (path resolution → a single poll of `FileApiManualSource`) and
+/// the store's billing rows once (read-only), then print the api-plane section:
+/// - the resolved manual path with provenance, or `"api overview: not configured"` when the plane
+///   is fully off (no `[[api]]` entries and no manual path — then nothing else is printed);
+/// - per-row manual parse errors and manual rows past the 35-day staleness const;
+/// - each pollable `[[api]]` entry's live figure with its last-poll age (or `never polled`)
+///   vs its dormant state (env-var NAME + `unset`);
+/// - manual rows joining no configured `[[api]]` id.
+///
+/// Mirrors `report_ledger`'s shape (one read-only poll, pure helpers). Presence-NOT-value: no
+/// dollar amount, currency, key value, or file content is ever printed — only states and ages.
+fn report_api(cfg: &Config, today: jiff::civil::Date, now_ms: i64) {
+    let env_override = std::env::var(API_MANUAL_ENV).ok();
+    let path = resolve_path(
+        env_override.as_deref(),
+        cfg.settings.api_manual_path.as_deref(),
+    );
+    let api_empty = cfg.api.is_empty();
+
+    // Plane fully off (no [[api]] entries and no manual path) ⇒ the single overview line, nothing
+    // else — mirroring `report_ledger`'s `Off` short-circuit.
+    if api_empty && path.is_none() {
+        println!(
+            "\n{}",
+            api_overview_line(true, None, ApiManualProvenance::Off)
+        );
+        return;
+    }
+
+    // One read-only poll of the manual lane (only when a path resolved).
+    let mut manual = ApiManual::new();
+    if let Some(p) = &path {
+        let mut source = FileApiManualSource::new(p.clone());
+        manual.poll(&mut source);
+    }
+    let provenance = manual.provenance();
+
+    println!(
+        "\n{}",
+        api_overview_line(api_empty, path.as_deref(), provenance)
+    );
+    if provenance == ApiManualProvenance::Stale {
+        if let Some(reason) = manual.stale_reason() {
+            println!("  api manual stale reason: {reason}");
+        }
+    }
+
+    for line in api_parse_error_lines(manual.errors()) {
+        println!("{line}");
+    }
+    for line in api_past_stale_lines(manual.rows(), today) {
+        println!("{line}");
+    }
+
+    let rows = read_api_billing_rows();
+    let (live, dormant) = api_live_and_dormant_lines(&cfg.api, &rows, now_ms, env_var_present);
+    for line in &live {
+        println!("{line}");
+    }
+    for line in &dormant {
+        println!("{line}");
+    }
+
+    let config_ids: Vec<&str> = cfg.api.iter().map(|a| a.id.as_str()).collect();
+    let divergent = api_divergence_ids(&config_ids, manual.rows());
+    if !divergent.is_empty() {
+        println!(
+            "  api divergence: manual row(s) with no configured [[api]] id: {}",
+            divergent.join(", ")
+        );
+    }
+}
+
+/// Pure: the `"api overview: …"` status line (mirrors `ledger_status_line`). `"api overview: not
+/// configured"` when the plane is fully off (`api_empty` and no manual path); `"api overview: {path}
+/// [{fresh|stale|missing}]"` when a manual path resolved; and `"api overview: manual lane off"` when
+/// `[[api]]` entries exist but no manual path is configured (the live/dormant lines below then make
+/// clear the plane is on and only the manual lane is off).
+fn api_overview_line(
+    api_empty: bool,
+    path: Option<&Path>,
+    provenance: ApiManualProvenance,
+) -> String {
+    match path {
+        Some(p) => {
+            let label = api_provenance_label(provenance);
+            format!("api overview: {} [{label}]", p.display())
+        }
+        None if api_empty => "api overview: not configured".to_string(),
+        None => "api overview: manual lane off".to_string(),
+    }
+}
+
+/// Lowercase provenance label for the api overview line (mirrors `provenance_label`). `Off` only
+/// arises with no resolved path, where [`api_overview_line`] renders `not configured` / `manual lane
+/// off` instead — the arm is included so the match stays exhaustive.
+fn api_provenance_label(provenance: ApiManualProvenance) -> &'static str {
+    match provenance {
+        ApiManualProvenance::Off => "off",
+        ApiManualProvenance::Fresh => "fresh",
+        ApiManualProvenance::Stale => "stale",
+        ApiManualProvenance::Missing => "missing",
+    }
+}
+
+/// Pure: one `"api manual parse error ({id}): {reason}"` line per malformed manual row (spec 024
+/// §E), in row order. A row with no readable id renders `<no id>` (mirrors the ledger parse-error
+/// line).
+fn api_parse_error_lines(errors: &[RowError]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|e| {
+            format!(
+                "  api manual parse error ({}): {}",
+                e.id.as_deref().unwrap_or("<no id>"),
+                e.reason
+            )
+        })
+        .collect()
+}
+
+/// Pure: one `"api manual past-stale: {id} ({as_of})"` line per manual row whose `as_of` is older
+/// than the 35-day const (spec 024 §C/§E), in row order. `as_of` is rendered verbatim; the pinned
+/// boundary is [`row_is_stale`]'s (35 exactly fresh, 36 stale).
+fn api_past_stale_lines(rows: &[ApiManualRow], today: jiff::civil::Date) -> Vec<String> {
+    rows.iter()
+        .filter(|r| row_is_stale(&r.as_of, today))
+        .map(|r| format!("  api manual past-stale: {} ({})", r.id, r.as_of))
+        .collect()
+}
+
+/// Pure: the relevant live figure kind for one `[[api]]` provider — anthropic/openai → month-to-date
+/// spend, moonshot → balance. `None` for gemini (manual-only — no live billing endpoint, spec 024
+/// §B/§A) and xai (dormant — no fetcher in this spec), so those entries get no live/dormant line.
+fn pollable_figure(provider: ApiProvider) -> Option<ApiFigureKind> {
+    match provider {
+        ApiProvider::Anthropic | ApiProvider::OpenAi => Some(ApiFigureKind::MtdSpend),
+        ApiProvider::Moonshot => Some(ApiFigureKind::Balance),
+        ApiProvider::Gemini | ApiProvider::Xai => None,
+    }
+}
+
+/// Pure: the live + dormant lines for the pollable `[[api]]` entries (spec 024 §E). `key_present(name)`
+/// resolves an env-var NAME to whether it is set (NEVER the value) — injected so this is testable
+/// without the real environment. A pollable entry whose key resolves is LIVE: its last-poll age comes
+/// from the matching store row (`now_ms - polled_at_ms` via [`format_ago_ms`]), or `never polled` when
+/// no row exists yet. A pollable entry whose key doesn't resolve is DORMANT (named by its env var).
+/// Inactive entries and non-pollable providers (gemini/xai) are skipped — never a value, only states.
+fn api_live_and_dormant_lines(
+    entries: &[ApiAccount],
+    rows: &[ApiBillingRow],
+    now_ms: i64,
+    key_present: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut live = Vec::new();
+    let mut dormant = Vec::new();
+    for entry in entries {
+        if !entry.active {
+            continue; // an inactive [[api]] entry is unmonitored, never fetched (spec 024 §A)
+        }
+        let Some(figure) = pollable_figure(entry.provider) else {
+            continue; // gemini/xai: no live fetcher in this spec
+        };
+        let Some(env_name) = entry.api_key_env.as_deref() else {
+            // Validation (spec 024 §A) requires api_key_env for pollable providers; report, no panic.
+            dormant.push(format!(
+                "  api dormant: {} (api_key_env not configured)",
+                entry.id
+            ));
+            continue;
+        };
+        if !key_present(env_name) {
+            dormant.push(format!("  api dormant: {} ({env_name} unset)", entry.id));
+            continue;
+        }
+        // Key resolves ⇒ live. Age from the matching store row (`now_ms - polled_at_ms`), else
+        // `never polled` — never the amount, only the age.
+        let suffix = rows
+            .iter()
+            .find(|r| r.api_id == entry.id && r.figure == figure)
+            .map_or_else(
+                || "never polled".to_string(),
+                |r| format!("last poll {}", format_ago_ms(now_ms - r.polled_at_ms)),
+            );
+        live.push(format!(
+            "  api live: {} {} — {suffix}",
+            entry.id,
+            figure.as_str()
+        ));
+    }
+    (live, dormant)
+}
+
+/// Pure: manual-row ids that join no configured `[[api]]` id (exact + case-sensitive match, mirroring
+/// `ledger::find`), in first-occurrence order with duplicates collapsed (a manual id may carry several
+/// figures). The one direction this section reports (spec 024 §E): a configured `[[api]]` id with no
+/// manual row is filled by the live lane, not divergence.
+fn api_divergence_ids(config_ids: &[&str], rows: &[ApiManualRow]) -> Vec<String> {
+    let config_set: std::collections::HashSet<&str> = config_ids.iter().copied().collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in rows {
+        if !config_set.contains(r.id.as_str()) && seen.insert(r.id.clone()) {
+            out.push(r.id.clone());
+        }
+    }
+    out
+}
+
+/// Read-only access to the billing store rows (mirrors `report_config_divergence`'s handle path): the
+/// store is opened READ-ONLY (migration-free), and any absence/open/read failure degrades to no rows
+/// (the live lines then read `never polled`). Diagnosing never creates or migrates the store.
+fn read_api_billing_rows() -> Vec<ApiBillingRow> {
+    let Ok(store_path) = crate::paths::store_path() else {
+        return Vec::new();
+    };
+    if !store_path.exists() {
+        return Vec::new();
+    }
+    let Ok(store) = Store::open_readonly(&store_path) else {
+        return Vec::new();
+    };
+    store.latest_api_billing().unwrap_or_default()
+}
+
+/// Production env-presence lookup for the dormant check (the VALUE is never read, never printed): true
+/// when `name` is set to a non-empty value, matching `resolve_api_key`'s empty-is-unset semantics.
+/// Passed as the injectable `key_present` so [`api_live_and_dormant_lines`] is testable without the
+/// real environment.
+fn env_var_present(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty())
 }
 
 /// Codex diagnostics for one account (read-only): `sessions/` present, `auth.json` present
@@ -1118,5 +1372,231 @@ mod tests {
             lines[0].contains("claude-alpha") && lines[0].contains("current"),
             "{lines:?}"
         );
+    }
+
+    // ── spec 024 §E (acceptance 7): api billing-plane diagnostics ───────────────────────────────
+    // `ApiProvider`/`ApiFigureKind`/`ApiAccount`/`ApiManualRow`/`ApiBillingRow`/`RowError` are in
+    // scope via `use super::*` above.
+
+    fn api_entry(
+        id: &str,
+        provider: ApiProvider,
+        api_key_env: Option<&str>,
+        active: bool,
+    ) -> ApiAccount {
+        ApiAccount {
+            id: id.to_string(),
+            label: None,
+            provider,
+            api_key_env: api_key_env.map(str::to_string),
+            active,
+        }
+    }
+
+    fn manual_row(id: &str, as_of: &str) -> ApiManualRow {
+        ApiManualRow {
+            id: id.to_string(),
+            figure: ApiFigureKind::Balance,
+            amount_minor: 0, // presence-not-value: tests never assert on the amount
+            currency: "USD".to_string(),
+            as_of: as_of.to_string(),
+            notes: None,
+        }
+    }
+
+    fn billing_row(api_id: &str, figure: ApiFigureKind, polled_at_ms: i64) -> ApiBillingRow {
+        ApiBillingRow {
+            api_id: api_id.to_string(),
+            figure,
+            amount_minor: 0, // presence-not-value: tests never assert on the amount
+            currency: "USD".to_string(),
+            polled_at_ms,
+        }
+    }
+
+    #[test]
+    fn api_overview_line_not_configured_when_plane_fully_off() {
+        assert_eq!(
+            api_overview_line(true, None, ApiManualProvenance::Off),
+            "api overview: not configured"
+        );
+    }
+
+    #[test]
+    fn api_overview_line_names_resolved_path_and_provenance_label() {
+        let line = api_overview_line(
+            false,
+            Some(Path::new("/synthetic/api_manual.toml")),
+            ApiManualProvenance::Fresh,
+        );
+        assert!(
+            line.contains("/synthetic/api_manual.toml") && line.contains("[fresh]"),
+            "must name the resolved path + label: {line}"
+        );
+        assert!(
+            api_overview_line(false, Some(Path::new("/x")), ApiManualProvenance::Stale)
+                .contains("[stale]")
+        );
+        assert!(
+            api_overview_line(false, Some(Path::new("/x")), ApiManualProvenance::Missing)
+                .contains("[missing]")
+        );
+    }
+
+    #[test]
+    fn api_overview_line_manual_lane_off_when_entries_exist_but_no_path() {
+        // [[api]] entries present (api_empty=false) but no manual path ⇒ the manual lane is off, NOT
+        // "not configured" — the plane is on and live/dormant lines follow this header.
+        assert_eq!(
+            api_overview_line(false, None, ApiManualProvenance::Off),
+            "api overview: manual lane off"
+        );
+    }
+
+    #[test]
+    fn api_parse_error_lines_one_per_bad_row_with_no_id_fallback() {
+        let errors = vec![
+            RowError {
+                id: Some("foo".to_string()),
+                reason: "unknown figure 'bogus'".to_string(),
+            },
+            RowError {
+                id: None,
+                reason: "missing id".to_string(),
+            },
+        ];
+        assert_eq!(
+            api_parse_error_lines(&errors),
+            vec![
+                "  api manual parse error (foo): unknown figure 'bogus'",
+                "  api manual parse error (<no id>): missing id",
+            ]
+        );
+    }
+
+    #[test]
+    fn api_past_stale_lines_flags_rows_past_the_35_day_const() {
+        // today = 2026-03-01 ⇒ 2026-01-25 is exactly 35 days (fresh), 2026-01-24 is 36 (stale) —
+        // pinned to `row_is_stale`'s boundary.
+        let today = jiff::civil::date(2026, 3, 1);
+        let rows = vec![
+            manual_row("stale", "2026-01-24"),
+            manual_row("fresh-exact", "2026-01-25"),
+            manual_row("fresh-recent", "2026-02-28"),
+        ];
+        assert_eq!(
+            api_past_stale_lines(&rows, today),
+            vec!["  api manual past-stale: stale (2026-01-24)"],
+            "only the >35-day row is flagged; the verbatim as_of is shown"
+        );
+    }
+
+    #[test]
+    fn pollable_figure_maps_providers_to_their_live_figure_kind() {
+        assert_eq!(
+            pollable_figure(ApiProvider::Anthropic),
+            Some(ApiFigureKind::MtdSpend)
+        );
+        assert_eq!(
+            pollable_figure(ApiProvider::OpenAi),
+            Some(ApiFigureKind::MtdSpend)
+        );
+        assert_eq!(
+            pollable_figure(ApiProvider::Moonshot),
+            Some(ApiFigureKind::Balance)
+        );
+        assert_eq!(pollable_figure(ApiProvider::Gemini), None);
+        assert_eq!(pollable_figure(ApiProvider::Xai), None);
+    }
+
+    #[test]
+    fn api_live_and_dormant_lines_split_pollable_entries_by_injected_env_presence() {
+        // Env presence is an INJECTED lookup (never the real env): "PRESENT" resolves, anything else
+        // doesn't. Covers live+polled, live+never-polled, dormant, gemini/xai skipped, inactive
+        // skipped.
+        let now_ms = 1_000_000_000_000_i64;
+        let entries = vec![
+            api_entry(
+                "anthropic-work",
+                ApiProvider::Anthropic,
+                Some("PRESENT"),
+                true,
+            ),
+            api_entry("openai-prod", ApiProvider::OpenAi, Some("PRESENT"), true),
+            api_entry("moonshot-payg", ApiProvider::Moonshot, Some("ABSENT"), true),
+            api_entry("gemini-api", ApiProvider::Gemini, None, true),
+            api_entry("xai-mgmt", ApiProvider::Xai, Some("XAI_KEY"), true),
+            api_entry("inactive", ApiProvider::OpenAi, Some("PRESENT"), false),
+        ];
+        let rows = vec![
+            // anthropic-work polled 3h ago → "3h ago".
+            billing_row(
+                "anthropic-work",
+                ApiFigureKind::MtdSpend,
+                now_ms - 3 * 60 * 60 * 1000,
+            ),
+            // openai-prod has no row → "never polled".
+            // moonshot-payg polled, but its key is unset → dormant regardless.
+            billing_row("moonshot-payg", ApiFigureKind::Balance, now_ms - 60 * 1000),
+        ];
+        let present = |name: &str| name == "PRESENT";
+        let (live, dormant) = api_live_and_dormant_lines(&entries, &rows, now_ms, present);
+        assert_eq!(
+            live,
+            vec![
+                "  api live: anthropic-work mtd_spend — last poll 3h ago",
+                "  api live: openai-prod mtd_spend — never polled",
+            ],
+            "live: {live:?}"
+        );
+        assert_eq!(
+            dormant,
+            vec!["  api dormant: moonshot-payg (ABSENT unset)"],
+            "dormant: {dormant:?}"
+        );
+    }
+
+    #[test]
+    fn api_dormant_line_when_pollable_entry_lacks_api_key_env() {
+        // Validation (spec 024 §A) requires api_key_env for anthropic; report it, never panic.
+        let entries = vec![api_entry(
+            "anthropic-work",
+            ApiProvider::Anthropic,
+            None,
+            true,
+        )];
+        let (live, dormant) = api_live_and_dormant_lines(&entries, &[], 0, |_| true);
+        assert!(live.is_empty());
+        assert_eq!(
+            dormant,
+            vec!["  api dormant: anthropic-work (api_key_env not configured)"]
+        );
+    }
+
+    #[test]
+    fn api_divergence_ids_lists_manual_rows_with_no_config_entry_deduped() {
+        let config_ids = vec!["anthropic-work", "openai-prod"];
+        let rows = vec![
+            manual_row("anthropic-work", "2026-07-20"), // matches
+            manual_row("orphan-a", "2026-07-20"),       // divergent
+            manual_row("orphan-a", "2026-07-21"),       // divergent dup id → collapsed
+            manual_row("orphan-b", "2026-07-20"),       // divergent
+        ];
+        assert_eq!(
+            api_divergence_ids(&config_ids, &rows),
+            vec!["orphan-a", "orphan-b"],
+            "deduped, first-occurrence order preserved"
+        );
+    }
+
+    #[test]
+    fn api_helpers_render_nothing_for_a_fresh_empty_manual() {
+        // A Fresh manual lane with zero rows carries no per-row state — only the overview line does.
+        let today = jiff::civil::date(2026, 7, 25);
+        assert!(api_parse_error_lines(&[]).is_empty());
+        assert!(api_past_stale_lines(&[], today).is_empty());
+        assert!(api_divergence_ids(&["x"], &[]).is_empty());
+        let (live, dormant) = api_live_and_dormant_lines(&[], &[], 0, |_| true);
+        assert!(live.is_empty() && dormant.is_empty());
     }
 }

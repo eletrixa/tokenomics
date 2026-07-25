@@ -2,15 +2,17 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/tui/model.rs
-//! Deps:    ratatui (Color), jiff; domain + format (display logic); ledger (subscription clause)
+//! Deps:    ratatui (Color), jiff; domain + format (display logic); ledger (subscription clause);
+//!          billing + store::ApiBillingRow + format_money (API overview, spec 025)
 //! Tested:  inline `#[cfg(test)]` — update/selection, severity→color, NO_COLOR, view-row build,
 //!          show-inactive toggle + tagged/dimmed inactive rows (spec 014), age-aware overlay hint
 //!          (spec 015 §C); `build_sub_view` clause math + `Account.active`/ledger-status
 //!          independence + `ledger_fleet_note` tokens (spec 017 §D acceptance 4/5/7); the verified
-//!          pill's suppression + degrade-form math (spec 018 §B/§C acceptance 2)
+//!          pill's suppression + degrade-form math (spec 018 §B/§C acceptance 2); `build_api_view`
+//!          §B states + merge + toggle/`o` (spec 025)
 //!
 //! Key responsibilities:
-//! - `App`: selection, help/quit/show-inactive flags, colour policy, and the precomputed
+//! - `App`: selection, help/quit/show-inactive/show-api flags, colour policy, and the precomputed
 //!   `AccountView` rows.
 //! - `update(Msg)`: fold Key / Data (store) / Tick / Resize; selection clamps to the row count.
 //! - `build_account_view`: pure store-data → display-ready row (so `view` only lays out); it now
@@ -19,23 +21,28 @@
 //! - `build_sub_view`: pure ledger-row + `today` → `SubView` (spec 017 §D clause text), now also
 //!   folding in the verified-pill suffixes (`pill_suffixes`, spec 018 §B/§C) — suppressed on the
 //!   stale-`renews` and derived-`ended` states.
+//! - `build_api_view`: pure API billing plane → dense per-`[[api]]` rows (figures + provenance
+//!   notes + empty-row states, live-beats-manual merge) — spec 025 §B.
 //!
 //! Design constraints:
 //! - Everything the view needs is precomputed here; colour is a pure function of state.
 //! - `NO_COLOR` is honoured via `use_color` (resolved once at startup and threaded through).
+//! - Model stays pure: `now` and the env-key probe are always injected (no clock / env reads).
 
 use jiff::Timestamp;
 use ratatui::style::Color;
 
+use crate::billing::manual::{row_is_stale, ApiManualProvenance, ApiManualRow};
+use crate::billing::{ApiAccount, ApiFigureKind, ApiProvider};
 use crate::domain::{Account, Limit, LimitKind, Provenance, Provider, Severity, UsageSnapshot};
 use crate::format::{
-    format_ago, format_ago_ms, format_cost, format_dollars, format_pct, format_reset,
+    format_ago, format_ago_ms, format_cost, format_dollars, format_money, format_pct, format_reset,
     format_tokens, provenance_label, provenance_short, reset_expired, severity_label, RESET_DONE,
 };
 use crate::ledger::{
     find as ledger_find, verified_current, LedgerProvenance, SubStatus, Subscription,
 };
-use crate::store::TokenStatus;
+use crate::store::{ApiBillingRow, TokenStatus};
 use crate::tui::keys::Action;
 
 /// The local ccusage plane is flagged **stale** once its newest data is older than this many local
@@ -316,6 +323,55 @@ pub fn ledger_fleet_note(provenance: LedgerProvenance, matched: usize) -> Option
     }
 }
 
+/// One pre-styled segment of an API overview row (spec 025 §B). Colour is already resolved for the
+/// current `use_color` policy (same discipline as gauge / fleet stale styling).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the spec 025 view + wiring cards
+pub struct ApiSegment {
+    /// The whole segment text (dropped whole at narrow widths — never truncated mid-figure).
+    pub text: String,
+    /// Pre-resolved colour (`Reset` when colour is disabled).
+    pub color: Color,
+}
+
+/// One API account's display-ready overview row (config label or divergent manual id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the spec 025 view + wiring cards
+pub struct ApiRowView {
+    /// Left label: `[[api]]` display name, or the raw manual `id` for a divergent row.
+    pub name: String,
+    /// Segments in grammar order: figures (bal → owed → mtd) then provenance notes then empty-state.
+    pub segments: Vec<ApiSegment>,
+}
+
+/// The API billing overview section's precomputed rows (spec 025 §B). `None` on `Dashboard` means
+/// the plane was not read this tick; an empty `rows` means configured-but-empty / unconfigured.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)] // consumed by the spec 025 view + wiring cards
+pub struct ApiView {
+    /// One row per `[[api]]` entry (config order), then trailing divergent manual-only ids.
+    pub rows: Vec<ApiRowView>,
+}
+
+/// Inputs to [`build_api_view`] — bundled like [`AccountData`] so the builder stays a small call.
+/// The env-key probe is injected so the model never reads the environment (pure).
+pub struct ApiData<'a> {
+    /// Config `[[api]]` entries, in display order.
+    pub accounts: &'a [ApiAccount],
+    /// Latest live store rows (`latest_api_billing`).
+    pub live: &'a [ApiBillingRow],
+    /// Manual TOML rows (last-good when Stale).
+    pub manual: &'a [ApiManualRow],
+    /// Manual-plane provenance for this read (caller-owned; builder does not branch on it today).
+    #[allow(dead_code)]
+    // reserved for plane-off / doctor-adjacent notes; kept for the contract
+    pub manual_provenance: ApiManualProvenance,
+    /// Whether a named env var is present (non-empty). Injected — model never touches `std::env`.
+    pub key_present: &'a dyn Fn(&str) -> bool,
+    /// Collector billing poll cadence in seconds — live age is fresh while ≤ `2 ×` this.
+    pub poll_billing_secs: u64,
+}
+
 /// One account's display-ready row. `view` only lays these out — no computation.
 #[derive(Debug, Clone)]
 pub struct AccountView {
@@ -415,6 +471,8 @@ pub struct Dashboard {
     /// A collector-liveness alert (banner text) when the writer looks down/stalled, else `None`
     /// (spec 011 §A). Computed at the store-read site from the collector heartbeat age.
     pub collector_alert: Option<String>,
+    /// The API billing overview (spec 025), or `None` when the plane was not assembled this tick.
+    pub api: Option<ApiView>,
 }
 
 impl From<Vec<AccountView>> for Dashboard {
@@ -425,6 +483,7 @@ impl From<Vec<AccountView>> for Dashboard {
             aggregate_burn: Vec::new(),
             fleet: None,
             collector_alert: None,
+            api: None,
         }
     }
 }
@@ -444,8 +503,8 @@ pub enum Msg {
 }
 
 /// The dashboard state.
-// Five independent UI flags (quit / help / reload / colour policy / show-inactive); grouping
-// unrelated booleans into an enum would obscure, not clarify.
+// Six independent UI flags (quit / help / reload / colour policy / show-inactive / show-api);
+// grouping unrelated booleans into an enum would obscure, not clarify.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
@@ -458,6 +517,8 @@ pub struct App {
     pub fleet: Option<FleetView>,
     /// Collector-liveness alert (banner text) when the writer looks down/stalled, else `None`.
     pub collector_alert: Option<String>,
+    /// The API billing overview rows (spec 025), or `None` before the first plane read.
+    pub api: Option<ApiView>,
     /// Selected row index (clamped to `rows`).
     pub selected: usize,
     /// Set when the user asks to quit.
@@ -470,6 +531,8 @@ pub struct App {
     pub use_color: bool,
     /// Whether inactive accounts are included in `rows` (toggled by `i`; default off — spec 014 §C).
     pub show_inactive: bool,
+    /// Whether the API billing section is shown (toggled by `o`; default off — spec 025 §A).
+    pub show_api: bool,
     /// Number of visible accounts (for the header). Tracks `rows.len()` once data has landed; before
     /// the first store read it holds the caller's initial estimate.
     pub account_count: usize,
@@ -486,12 +549,14 @@ impl App {
             aggregate_burn: Vec::new(),
             fleet: None,
             collector_alert: None,
+            api: None,
             selected: 0,
             should_quit: false,
             show_help: false,
             reload_requested: false,
             use_color,
             show_inactive: false,
+            show_api: false,
             account_count,
             message: None,
         }
@@ -507,6 +572,7 @@ impl App {
                 self.aggregate_burn = data.aggregate_burn;
                 self.fleet = data.fleet;
                 self.collector_alert = data.collector_alert;
+                self.api = data.api;
                 // Rows already reflect the current `show_inactive` filter (see `read_rows`), so the
                 // header count tracks exactly what's on screen — including across a toggle.
                 self.account_count = self.rows.len();
@@ -531,6 +597,8 @@ impl App {
                 self.show_inactive = !self.show_inactive;
                 self.reload_requested = true;
             }
+            // Session-only flag; the API plane is rebuilt every store read / tick anyway (spec 025 §A).
+            Action::ToggleApi => self.show_api = !self.show_api,
         }
     }
 
@@ -982,6 +1050,298 @@ pub fn build_fleet_view(
         overlay_age: oldest_overlay.map(|ms| format!("limits {}", format_ago(ms, now))),
         ledger_note: ledger_fleet_note(ledger_provenance, ledger_matched),
     })
+}
+
+// ── API overview builder (spec 025 §B) ────────────────────────────────────────────────────────
+// Helpers are dead outside tests until the wiring card calls `build_api_view` (same mid-wave
+// posture as `format_money` / `ApiBillingRow`).
+
+/// Figure short labels in segment order: Balance → `bal`, Owed → `owed`, MtdSpend → `mtd`.
+#[allow(dead_code)]
+const API_FIGURE_ORDER: [ApiFigureKind; 3] = [
+    ApiFigureKind::Balance,
+    ApiFigureKind::Owed,
+    ApiFigureKind::MtdSpend,
+];
+
+/// Short display token for a figure kind (`"bal"` / `"owed"` / `"mtd"`).
+#[allow(dead_code)]
+fn api_figure_short(kind: ApiFigureKind) -> &'static str {
+    match kind {
+        ApiFigureKind::Balance => "bal",
+        ApiFigureKind::Owed => "owed",
+        ApiFigureKind::MtdSpend => "mtd",
+    }
+}
+
+/// Index of `kind` in [`API_FIGURE_ORDER`].
+#[allow(dead_code)]
+fn api_figure_index(kind: ApiFigureKind) -> usize {
+    match kind {
+        ApiFigureKind::Balance => 0,
+        ApiFigureKind::Owed => 1,
+        ApiFigureKind::MtdSpend => 2,
+    }
+}
+
+/// Provenance of one merged figure slot (live store row or manual TOML fill).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum ApiFigSource {
+    /// Live collector poll at `polled_at_ms`.
+    Live { polled_at_ms: i64 },
+    /// Manual TOML row with verbatim `as_of` ISO date.
+    Manual { as_of: String },
+}
+
+/// One merged money figure for a single (id, kind).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct ApiFigSlot {
+    amount_minor: i64,
+    currency: String,
+    source: ApiFigSource,
+}
+
+/// Merge live + manual for one API id: live wins per figure, manual fills gaps (spec 024 §C / 025 §B).
+#[allow(dead_code)]
+fn merge_api_figures(
+    id: &str,
+    live: &[ApiBillingRow],
+    manual: &[ApiManualRow],
+) -> [Option<ApiFigSlot>; 3] {
+    let mut slots: [Option<ApiFigSlot>; 3] = [None, None, None];
+    for row in live.iter().filter(|r| r.api_id == id) {
+        let i = api_figure_index(row.figure);
+        slots[i] = Some(ApiFigSlot {
+            amount_minor: row.amount_minor,
+            currency: row.currency.clone(),
+            source: ApiFigSource::Live {
+                polled_at_ms: row.polled_at_ms,
+            },
+        });
+    }
+    for row in manual.iter().filter(|r| r.id == id) {
+        let i = api_figure_index(row.figure);
+        if slots[i].is_none() {
+            slots[i] = Some(ApiFigSlot {
+                amount_minor: row.amount_minor,
+                currency: row.currency.clone(),
+                source: ApiFigSource::Manual {
+                    as_of: row.as_of.clone(),
+                },
+            });
+        }
+    }
+    slots
+}
+
+/// Whether any slot is filled.
+#[allow(dead_code)]
+fn api_slots_any(slots: &[Option<ApiFigSlot>; 3]) -> bool {
+    slots.iter().any(Option::is_some)
+}
+
+/// Empty-row state segment when no figure exists for a configured `[[api]]` account (spec 025 §B).
+#[allow(dead_code)]
+fn api_empty_state_segment(
+    account: &ApiAccount,
+    key_present: &dyn Fn(&str) -> bool,
+    use_color: bool,
+) -> ApiSegment {
+    let dim = resolve_color(use_color, Color::DarkGray);
+    match account.provider {
+        ApiProvider::Gemini => ApiSegment {
+            text: "manual entries expected — api.toml".to_string(),
+            color: dim,
+        },
+        // Pollable providers + xai: key present → waiting; key absent → dormant (env name).
+        ApiProvider::Anthropic | ApiProvider::OpenAi | ApiProvider::Moonshot | ApiProvider::Xai => {
+            match account.api_key_env.as_deref() {
+                Some(env) if key_present(env) => ApiSegment {
+                    text: "waiting for collector".to_string(),
+                    color: dim,
+                },
+                Some(env) => ApiSegment {
+                    text: format!("dormant ({env} unset)"),
+                    color: dim,
+                },
+                None => ApiSegment {
+                    text: "dormant (api_key_env unset)".to_string(),
+                    color: dim,
+                },
+            }
+        }
+    }
+}
+
+/// Build figure + provenance segments for a merged slot array (shared by config and divergent rows).
+#[allow(dead_code)]
+fn api_figure_and_prov_segments(
+    slots: &[Option<ApiFigSlot>; 3],
+    now: Timestamp,
+    today: jiff::civil::Date,
+    use_color: bool,
+    poll_billing_secs: u64,
+) -> Vec<ApiSegment> {
+    let primary = resolve_color(use_color, Color::White);
+    let dim = resolve_color(use_color, Color::DarkGray);
+    let warn = resolve_color(use_color, Color::Yellow);
+
+    let mut segments = Vec::new();
+
+    // 1. Figure segments in bal → owed → mtd order (omit absent).
+    for kind in API_FIGURE_ORDER {
+        if let Some(slot) = &slots[api_figure_index(kind)] {
+            segments.push(ApiSegment {
+                text: format!(
+                    "{} {}",
+                    api_figure_short(kind),
+                    format_money(slot.amount_minor, &slot.currency)
+                ),
+                color: primary,
+            });
+        }
+    }
+
+    let has_live = slots
+        .iter()
+        .flatten()
+        .any(|s| matches!(s.source, ApiFigSource::Live { .. }));
+    let has_manual = slots
+        .iter()
+        .flatten()
+        .any(|s| matches!(s.source, ApiFigSource::Manual { .. }));
+    let mixed = has_live && has_manual;
+
+    // 2. Provenance notes — one per DISTINCT source present (live then manual).
+    if has_live {
+        let live_kinds: Vec<ApiFigureKind> = API_FIGURE_ORDER
+            .into_iter()
+            .filter(|&k| {
+                slots[api_figure_index(k)]
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.source, ApiFigSource::Live { .. }))
+            })
+            .collect();
+        // Oldest poll wins the age (most conservative for the yellow aging threshold).
+        // `has_live` guarantees at least one Live slot.
+        let oldest_ms = slots
+            .iter()
+            .flatten()
+            .filter_map(|s| match s.source {
+                ApiFigSource::Live { polled_at_ms } => Some(polled_at_ms),
+                ApiFigSource::Manual { .. } => None,
+            })
+            .min()
+            .unwrap_or(0);
+        let age = format_ago(oldest_ms, now);
+        let age_ms = now.as_millisecond() - oldest_ms;
+        let stale_ms = i64::try_from(poll_billing_secs.saturating_mul(1000))
+            .unwrap_or(i64::MAX)
+            .saturating_mul(LOCAL_STALE_FACTOR);
+        let color = if age_ms > stale_ms { warn } else { dim };
+        let text = if mixed {
+            let kinds = live_kinds
+                .iter()
+                .map(|k| api_figure_short(*k))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{kinds} live {age}")
+        } else {
+            format!("live {age}")
+        };
+        segments.push(ApiSegment { text, color });
+    }
+
+    if has_manual {
+        let manual_kinds: Vec<ApiFigureKind> = API_FIGURE_ORDER
+            .into_iter()
+            .filter(|&k| {
+                slots[api_figure_index(k)]
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.source, ApiFigSource::Manual { .. }))
+            })
+            .collect();
+        // Oldest as_of for the date text; any stale ⇒ yellow + ` · stale`.
+        let as_ofs: Vec<&str> = slots
+            .iter()
+            .flatten()
+            .filter_map(|s| match &s.source {
+                ApiFigSource::Manual { as_of } => Some(as_of.as_str()),
+                ApiFigSource::Live { .. } => None,
+            })
+            .collect();
+        // `has_manual` guarantees a non-empty as_ofs.
+        let as_of = as_ofs.iter().min().copied().unwrap_or("");
+        let stale = as_ofs.iter().any(|a| row_is_stale(a, today));
+        let base = if mixed {
+            let kinds = manual_kinds
+                .iter()
+                .map(|k| api_figure_short(*k))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{kinds} manual {as_of}")
+        } else {
+            format!("manual {as_of}")
+        };
+        let (text, color) = if stale {
+            (format!("{base} · stale"), warn)
+        } else {
+            (base, dim)
+        };
+        segments.push(ApiSegment { text, color });
+    }
+
+    segments
+}
+
+/// Pure builder for the API billing overview (spec 025 §B). `now` and `key_present` are injected.
+///
+/// Row order: each `[[api]]` entry (config order), then one trailing row per manual `id` that joins
+/// no config entry (labelled by the raw id). No totals row.
+#[allow(dead_code)] // consumed by the spec 025 wiring card
+pub fn build_api_view(data: &ApiData<'_>, now: Timestamp, use_color: bool) -> ApiView {
+    // UTC civil date once for all `row_is_stale` checks (spec 025 card: today = now → UTC).
+    let today = now.to_zoned(jiff::tz::TimeZone::UTC).date();
+    let mut rows = Vec::new();
+
+    for account in data.accounts {
+        let slots = merge_api_figures(&account.id, data.live, data.manual);
+        let segments = if api_slots_any(&slots) {
+            api_figure_and_prov_segments(&slots, now, today, use_color, data.poll_billing_secs)
+        } else {
+            vec![api_empty_state_segment(
+                account,
+                data.key_present,
+                use_color,
+            )]
+        };
+        rows.push(ApiRowView {
+            name: account.display_label().to_string(),
+            segments,
+        });
+    }
+
+    // Divergent manual ids (join no `[[api]]` entry) — trailing, first-seen order, labelled by raw id.
+    let mut seen_divergent: Vec<String> = Vec::new();
+    for row in data.manual {
+        let known = data.accounts.iter().any(|a| a.id == row.id);
+        if known || seen_divergent.iter().any(|id| id == &row.id) {
+            continue;
+        }
+        seen_divergent.push(row.id.clone());
+        let slots = merge_api_figures(&row.id, data.live, data.manual);
+        // Divergent rows exist because of manual money; always have at least that figure.
+        let segments =
+            api_figure_and_prov_segments(&slots, now, today, use_color, data.poll_billing_secs);
+        rows.push(ApiRowView {
+            name: row.id.clone(),
+            segments,
+        });
+    }
+
+    ApiView { rows }
 }
 
 /// A minimal row shown when an account's store read fails — so one bad read never blanks or crashes
@@ -2550,5 +2910,359 @@ mod tests {
             None,
             "Off renders nothing anywhere in the TUI"
         );
+    }
+
+    // ── spec 025 §B: API overview build_api_view ──────────────────────────────────────────────
+
+    fn api_acct(id: &str, provider: ApiProvider, env: Option<&str>) -> ApiAccount {
+        ApiAccount {
+            id: id.to_string(),
+            label: None,
+            provider,
+            api_key_env: env.map(str::to_string),
+            active: true,
+        }
+    }
+
+    fn live_row(
+        id: &str,
+        figure: ApiFigureKind,
+        amount_minor: i64,
+        currency: &str,
+        polled_at_ms: i64,
+    ) -> ApiBillingRow {
+        ApiBillingRow {
+            api_id: id.to_string(),
+            figure,
+            amount_minor,
+            currency: currency.to_string(),
+            polled_at_ms,
+        }
+    }
+
+    fn manual_row(
+        id: &str,
+        figure: ApiFigureKind,
+        amount_minor: i64,
+        currency: &str,
+        as_of: &str,
+    ) -> ApiManualRow {
+        ApiManualRow {
+            id: id.to_string(),
+            figure,
+            amount_minor,
+            currency: currency.to_string(),
+            as_of: as_of.to_string(),
+            notes: None,
+        }
+    }
+
+    fn api_data<'a>(
+        accounts: &'a [ApiAccount],
+        live: &'a [ApiBillingRow],
+        manual: &'a [ApiManualRow],
+        key_present: &'a dyn Fn(&str) -> bool,
+        poll_billing_secs: u64,
+    ) -> ApiData<'a> {
+        ApiData {
+            accounts,
+            live,
+            manual,
+            manual_provenance: ApiManualProvenance::Fresh,
+            key_present,
+            poll_billing_secs,
+        }
+    }
+
+    #[test]
+    fn api_view_live_fresh_figure_and_dim_note() {
+        // Live mtd 4m ago, poll=300s ⇒ age 240s ≤ 2×300=600s ⇒ dim note, plain "live …".
+        let now: Timestamp = "2026-07-20T12:04:00Z".parse().unwrap();
+        let polled: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("anth", ApiProvider::Anthropic, Some("ANTH_KEY"))];
+        let live = [live_row(
+            "anth",
+            ApiFigureKind::MtdSpend,
+            1234,
+            "USD",
+            polled.as_millisecond(),
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &live, &[], &present, 300), now, true);
+        assert_eq!(view.rows.len(), 1);
+        let segs = &view.rows[0].segments;
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "mtd $12.34");
+        assert_eq!(segs[0].color, Color::White);
+        assert_eq!(segs[1].text, "live 4m ago");
+        assert_eq!(segs[1].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_live_aging_note_turns_yellow() {
+        // Age 20m > 2×300s=10m ⇒ yellow aging note.
+        let now: Timestamp = "2026-07-20T12:20:00Z".parse().unwrap();
+        let polled: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("anth", ApiProvider::Anthropic, Some("ANTH_KEY"))];
+        let live = [live_row(
+            "anth",
+            ApiFigureKind::MtdSpend,
+            100,
+            "USD",
+            polled.as_millisecond(),
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &live, &[], &present, 300), now, true);
+        assert_eq!(view.rows[0].segments[1].text, "live 20m ago");
+        assert_eq!(view.rows[0].segments[1].color, Color::Yellow);
+    }
+
+    #[test]
+    fn api_view_manual_fresh_dim_note() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
+        let manual = [manual_row(
+            "gem",
+            ApiFigureKind::Balance,
+            500,
+            "USD",
+            "2026-07-18",
+        )];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &manual, &present, 300), now, true);
+        let segs = &view.rows[0].segments;
+        assert_eq!(segs[0].text, "bal $5.00");
+        assert_eq!(segs[0].color, Color::White);
+        assert_eq!(segs[1].text, "manual 2026-07-18");
+        assert_eq!(segs[1].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_manual_stale_yellow_suffix() {
+        // as_of 2026-06-10 + 35 days = 2026-07-15; today 2026-07-20 ⇒ stale.
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
+        let manual = [manual_row(
+            "gem",
+            ApiFigureKind::Owed,
+            350,
+            "EUR",
+            "2026-06-10",
+        )];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &manual, &present, 300), now, true);
+        let segs = &view.rows[0].segments;
+        assert_eq!(segs[0].text, "owed €3.50");
+        assert_eq!(segs[1].text, "manual 2026-06-10 · stale");
+        assert_eq!(segs[1].color, Color::Yellow);
+    }
+
+    #[test]
+    fn api_view_mixed_planes_name_kinds_per_source() {
+        // Live mtd + manual bal ⇒ kind-prefixed notes on both provenance segments.
+        let now: Timestamp = "2026-07-20T12:04:00Z".parse().unwrap();
+        let polled: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("anth", ApiProvider::Anthropic, Some("ANTH_KEY"))];
+        let live = [live_row(
+            "anth",
+            ApiFigureKind::MtdSpend,
+            999,
+            "USD",
+            polled.as_millisecond(),
+        )];
+        let manual = [manual_row(
+            "anth",
+            ApiFigureKind::Balance,
+            1234,
+            "USD",
+            "2026-07-20",
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(
+            &api_data(&accounts, &live, &manual, &present, 300),
+            now,
+            true,
+        );
+        let segs = &view.rows[0].segments;
+        assert_eq!(segs[0].text, "bal $12.34");
+        assert_eq!(segs[1].text, "mtd $9.99");
+        assert_eq!(segs[2].text, "mtd live 4m ago");
+        assert_eq!(segs[2].color, Color::DarkGray);
+        assert_eq!(segs[3].text, "bal manual 2026-07-20");
+        assert_eq!(segs[3].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_live_beats_manual_same_figure() {
+        let now: Timestamp = "2026-07-20T12:04:00Z".parse().unwrap();
+        let polled: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("anth", ApiProvider::Anthropic, Some("ANTH_KEY"))];
+        let live = [live_row(
+            "anth",
+            ApiFigureKind::MtdSpend,
+            200,
+            "USD",
+            polled.as_millisecond(),
+        )];
+        let manual = [manual_row(
+            "anth",
+            ApiFigureKind::MtdSpend,
+            9999,
+            "USD",
+            "2026-07-01",
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(
+            &api_data(&accounts, &live, &manual, &present, 300),
+            now,
+            true,
+        );
+        let segs = &view.rows[0].segments;
+        assert_eq!(
+            segs.len(),
+            2,
+            "single figure + one live note (manual discarded)"
+        );
+        assert_eq!(segs[0].text, "mtd $2.00", "live amount wins");
+        assert_eq!(segs[1].text, "live 4m ago", "not mixed — no kind prefix");
+    }
+
+    #[test]
+    fn api_view_waiting_for_collector_when_key_present() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct(
+            "oai",
+            ApiProvider::OpenAi,
+            Some("OPENAI_ADMIN_API_KEY"),
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(view.rows[0].segments.len(), 1);
+        assert_eq!(view.rows[0].segments[0].text, "waiting for collector");
+        assert_eq!(view.rows[0].segments[0].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_dormant_when_key_absent() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct(
+            "moon",
+            ApiProvider::Moonshot,
+            Some("MOONSHOT_API_KEY"),
+        )];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(
+            view.rows[0].segments[0].text,
+            "dormant (MOONSHOT_API_KEY unset)"
+        );
+        assert_eq!(view.rows[0].segments[0].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_gemini_expects_manual_entries() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(
+            view.rows[0].segments[0].text,
+            "manual entries expected — api.toml"
+        );
+        assert_eq!(view.rows[0].segments[0].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_xai_dormant_per_key_rule() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("x", ApiProvider::Xai, Some("XAI_API_KEY"))];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(view.rows[0].segments[0].text, "dormant (XAI_API_KEY unset)");
+        assert_eq!(view.rows[0].segments[0].color, Color::DarkGray);
+    }
+
+    #[test]
+    fn api_view_divergent_manual_id_trailing_labelled_by_raw_id() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("configured", ApiProvider::Anthropic, Some("K"))];
+        let manual = [manual_row(
+            "orphan-id",
+            ApiFigureKind::Balance,
+            -52,
+            "USD",
+            "2026-07-19",
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &[], &manual, &present, 300), now, true);
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(view.rows[0].name, "configured");
+        assert_eq!(view.rows[1].name, "orphan-id");
+        assert_eq!(view.rows[1].segments[0].text, "bal -$0.52");
+        assert_eq!(view.rows[1].segments[1].text, "manual 2026-07-19");
+    }
+
+    #[test]
+    fn api_view_preserves_config_order() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [
+            api_acct("z-last-in-alpha", ApiProvider::Anthropic, Some("A")),
+            api_acct("a-first-in-alpha", ApiProvider::OpenAi, Some("B")),
+        ];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(view.rows[0].name, "z-last-in-alpha");
+        assert_eq!(view.rows[1].name, "a-first-in-alpha");
+    }
+
+    #[test]
+    fn api_view_negative_amount_passes_through_format_money() {
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
+        let manual = [manual_row(
+            "gem",
+            ApiFigureKind::Owed,
+            -12_345,
+            "USD",
+            "2026-07-20",
+        )];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &manual, &present, 300), now, true);
+        assert_eq!(view.rows[0].segments[0].text, "owed -$123.45");
+    }
+
+    #[test]
+    fn toggle_api_flips_flag_without_reload() {
+        let mut app = App::new(1, true);
+        assert!(!app.show_api, "hidden by default (spec 025 §A)");
+        assert!(!app.reload_requested);
+        app.update(Msg::Key(Action::ToggleApi));
+        assert!(app.show_api);
+        assert!(
+            !app.reload_requested,
+            "toggle must not request a store reload"
+        );
+        app.update(Msg::Key(Action::ToggleApi));
+        assert!(!app.show_api, "pressing o again hides it");
+        assert!(!app.reload_requested);
+    }
+
+    #[test]
+    fn api_view_no_color_flattens_segment_colors() {
+        let now: Timestamp = "2026-07-20T12:04:00Z".parse().unwrap();
+        let polled: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("anth", ApiProvider::Anthropic, Some("K"))];
+        let live = [live_row(
+            "anth",
+            ApiFigureKind::Balance,
+            100,
+            "USD",
+            polled.as_millisecond(),
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &live, &[], &present, 300), now, false);
+        for seg in &view.rows[0].segments {
+            assert_eq!(seg.color, Color::Reset);
+        }
     }
 }

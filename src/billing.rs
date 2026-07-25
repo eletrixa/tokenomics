@@ -65,6 +65,9 @@ impl ApiProvider {
     }
 
     /// Parse the stable identifier back into an `ApiProvider` (e.g. when reading a stored row).
+    // Config deserialization goes through serde; retained for `as_str` symmetry with the sibling
+    // enums (`Provider`, `LimitKind`) and any future store round-trip.
+    #[allow(dead_code)]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "anthropic" => Some(Self::Anthropic),
