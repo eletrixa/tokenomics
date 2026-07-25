@@ -36,8 +36,10 @@ tok init      # writes a commented ~/.config/tokenomics/tokenomics.toml (refuses
 ### 3. Add your accounts
 
 Open `~/.config/tokenomics/tokenomics.toml` and add one `[[account]]` block per subscription. Each
-account is monitored under its own config dir, and **attribution is that dir, never the logs**. The
-per-provider shape:
+account is monitored under its own config dir, and **attribution is that dir, never the logs**. If
+you're running more than one Claude subscription, see [multi-account.md](multi-account.md) for how to
+set up an isolated `CLAUDE_CONFIG_DIR` (e.g. `~/.claude-acct/<lane>`) per account without re-logging.
+The per-provider shape:
 
 ```toml
 [settings]
@@ -248,7 +250,7 @@ api_key_env = "MOONSHOT_API_KEY"          # NAME of the env var — never the ke
 [[api]]
 id = "xai"
 provider = "xai"
-api_key_env = "XAI_API_KEY"               # NAME of the env var — never the key
+api_key_env = "XAI_MANAGEMENT_KEY"        # NAME of the env var — never the key
 ```
 
 The collector polls on `poll_billing_secs` and writes each figure into the store — a failed poll keeps
@@ -304,7 +306,7 @@ dollar amount**.
 
 Press **`o`** to toggle an **API overview** section (default hidden; session-only, like the `i` peek).
 It renders one dense line per `[[api]]` account — balance / owed / month-to-date, each figure carrying
-a plain-word provenance: `live 2m ago`, `manual 2026-07-20`, `· stale`, or `dormant (XAI_API_KEY
+a plain-word provenance: `live 2m ago`, `manual 2026-07-20`, `· stale`, or `dormant (XAI_MANAGEMENT_KEY
 unset)`. Real figures always show exactly two decimals and a currency glyph (`$12.34`, `€3.50`,
 `CZK 1.00`) — a grammar deliberately disjoint from the notional proxy's `$335 (notional)`. **There is
 no totals row** — mixed currencies are never summed.

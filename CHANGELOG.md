@@ -28,6 +28,9 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   1.1.3, CI `actions/checkout` v4 → v7. No behavior change.
 
 ### FIXED
+- **`docs/SETUP.md`'s xAI billing example named the wrong env var.** The `[[api]]` example and the
+  `dormant (...)` board-string example both said `XAI_API_KEY`; the live config key is
+  `XAI_MANAGEMENT_KEY`. Fixed both occurrences.
 - **Collector no longer starves the last account when the fleet grows past the concurrency bound.**
   `MAX_INFLIGHT` was 8 while the live fleet reached 9 active accounts; because `spawn_local_collects`
   iterates accounts in config order and stops once the cap is in flight, the 9th account (the
@@ -37,6 +40,12 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   real subprocess, so effective heavy concurrency stays well under the cap.
 
 ### ADDED
+- **`docs/multi-account.md` — a guide for running multiple Claude Max accounts in parallel without
+  re-logging.** Covers the `CLAUDE_CONFIG_DIR` isolation model (one login per account dir, shared
+  skills/agents/history via symlinks back to `~/.claude`), one-time per-account setup, a reference
+  launcher shell function, and pitfalls (nested shells inheriting a stale `CLAUDE_CONFIG_DIR`, an
+  API-key env var silently outranking OAuth, symlink divergence). `SETUP.md` now points to it where
+  `config_dir` is first introduced.
 - **Real-dollar API billing lands as a fourth data plane (spec 024) — collector-polled live
   admin endpoints plus a manual TOML, money the subscription board (usage, % gauges, ledger
   dates, notional cost) never touches.** A separate `ApiProvider` enum
