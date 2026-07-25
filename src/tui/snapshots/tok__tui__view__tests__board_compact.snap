@@ -1,5 +1,6 @@
 ---
 source: src/tui/view.rs
+assertion_line: 1770
 expression: "draw(&board(), 80, 16)"
 ---
 TOKENOMICS  ·  3 acct  ·  cost notional (proxy, not a bill)                     
@@ -17,4 +18,4 @@ burn · all accts ▁▂▁▄▃▆▅█
 ▏  Research [claude]                                                  ✖ 93% crit
 ▏5h ██████████████████████████████████████████▊░░░ 93% crit · resets in 1h 11m  
 ▏wk n/a (enable overlay)                                                        
-↑/↓ (or j/k) move · r refresh · i inactive · ? help · q quit
+↑↓ move  ·  r refresh  ·  o api  ·  i inactive  ·  ? help  ·  q quit

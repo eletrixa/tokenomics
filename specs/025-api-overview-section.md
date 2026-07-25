@@ -64,8 +64,10 @@ visible, not implied.
 ### D. Surfaces
 
 - Help: `o  toggle the api pay-as-you-go section (real dollars)` plus one line: "The api
-  section shows REAL money (balances & bills) — never the notional proxy." Footer untouched
-  (`?` is the discovery surface; a footer hint would re-approve five snapshots for one word).
+  section shows REAL money (balances & bills) — never the notional proxy." Footer carries
+  `o api` on every rung wide enough (amended 2026-07-25: the section's invisibility made the
+  footer its real discovery surface; the snapshot re-approval was paid deliberately, together
+  with a three-tone footer restyle — bold accent keys, dim labels, darker separators).
 - Snapshots: the existing insta set and the `tok once --json` / `tok accounts` R16 goldens stay
   **byte-identical** (default hidden; neither CLI path touched). New: `board_api` (full, all §B
   states) + `board_api_compact` insta snapshots; toggle/height-gate/unconfigured contains-tests;
@@ -74,8 +76,8 @@ visible, not implied.
 
 ## Non-goals
 
-- Dollar-keyed alerts (future-spec candidate: "owed > $X"), persistence of `show_api`, a footer
-  hint, per-model breakdown rows, totals, scrolling within the section, currency conversion.
+- Dollar-keyed alerts (future-spec candidate: "owed > $X"), persistence of `show_api`,
+  per-model breakdown rows, totals, scrolling within the section, currency conversion.
 - Any new data reads beyond `latest_api_billing()` + the manual TOML (the planes are spec 024's).
 
 ## Acceptance criteria

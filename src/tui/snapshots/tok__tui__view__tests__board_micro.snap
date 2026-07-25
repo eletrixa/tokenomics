@@ -1,5 +1,6 @@
 ---
 source: src/tui/view.rs
+assertion_line: 1775
 expression: "draw(&board(), 58, 9)"
 ---
 TOKENOMICS  ·  3 acct  ·  $ = notional  ·  ▲2 over warn   
@@ -10,4 +11,4 @@ burn · all accts ▁▂▁▄▃▆▅█
 ▊▶ Primary  ▲ warn  76% ████████████████████▌░░░░░░ 1h 11m
                                                           
 ▏  Research ✖ crit  93% █████████████████████████▏░ 1h 11m
-↑/↓ move · r refresh · i inactive · ? help · q quit
+↑↓ move  ·  o api  ·  i inactive  ·  ? help  ·  q quit

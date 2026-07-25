@@ -1,5 +1,6 @@
 ---
 source: src/tui/view.rs
+assertion_line: 1747
 expression: "draw(&app, 120, 40)"
 ---
 TOKENOMICS  ·  3 account(s)  ·  cost is notional (usage proxy, not a bill)                                              
@@ -41,4 +42,4 @@ burn · all accts ▁▂▁▄▃▆▅█
                                                                                                                         
                                                                                                                         
                                                                                                                         
-↑/↓ (or j/k) move · r refresh · i inactive · ? help · q quit
+↑↓ move  ·  r refresh  ·  o api  ·  i inactive  ·  ? help  ·  q quit

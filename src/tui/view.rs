@@ -283,21 +283,55 @@ fn render_collector_alert(f: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_footer(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let text = if area.width >= 62 {
-        "↑/↓ (or j/k) move · r refresh · i inactive · ? help · q quit"
-    } else if area.width >= 53 {
-        "↑/↓ move · r refresh · i inactive · ? help · q quit"
-    } else if area.width >= 40 {
-        "↑↓ move · i inactive · ? help · q quit"
+    // Key/label pairs, widest rung first; each rung drops the least-load-bearing hints whole
+    // (the fleet-line discipline). `o` earns a slot on every rung that fits it — the api section
+    // is invisible until toggled, so the footer is its one discovery surface besides `?`.
+    let pairs: &[(&str, &str)] = if area.width >= 60 {
+        &[
+            ("↑↓", "move"),
+            ("r", "refresh"),
+            ("o", "api"),
+            ("i", "inactive"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    } else if area.width >= 48 {
+        &[
+            ("↑↓", "move"),
+            ("o", "api"),
+            ("i", "inactive"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    } else if area.width >= 36 {
+        &[("↑↓", "move"), ("o", "api"), ("?", "help"), ("q", "quit")]
     } else if area.width >= 25 {
-        "↑↓ move · ? help · q quit"
+        &[("↑↓", "move"), ("?", "help"), ("q", "quit")]
     } else {
-        "↑↓ · q quit"
+        &[("↑↓", ""), ("q", "quit")]
     };
-    f.render_widget(
-        Paragraph::new(text).style(Style::new().fg(resolve_color(app.use_color, Color::DarkGray))),
-        area,
-    );
+
+    // Keys pop (bold accent), labels recede (dim), separators darker still — same three-tone
+    // treatment the title/fleet chrome uses, so the footer reads as hints, not a sentence.
+    let mut key_style = Style::new().fg(resolve_color(app.use_color, Color::Cyan));
+    if app.use_color {
+        key_style = key_style.add_modifier(Modifier::BOLD);
+    }
+    let label_style = Style::new().fg(resolve_color(app.use_color, Color::Gray));
+    let sep_style = Style::new().fg(resolve_color(app.use_color, Color::DarkGray));
+
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    for (i, (key, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", sep_style));
+        }
+        spans.push(Span::styled(*key, key_style));
+        if !label.is_empty() {
+            spans.push(Span::styled(" ", label_style));
+            spans.push(Span::styled(*label, label_style));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ── FULL tier: bordered panels (the roomy design), now with visible eighth-block bars ────────────

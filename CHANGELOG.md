@@ -7,6 +7,14 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 ## [Unreleased]
 
 ### CHANGED
+
+- **The board footer now advertises the api section and got a three-tone restyle (spec 025
+  amendment).** `o api` joins the hint line on every width rung that fits it — the section is
+  invisible until toggled, so the footer is its discovery surface. Keys render as bold accent,
+  labels dim, separators darker (the title/fleet chrome treatment) instead of one gray sentence;
+  `(or j/k)` moved out of the footer (help still documents it). Snapshots re-approved; the
+  NO_COLOR grid stays character-identical.
+
 - **Dependency refresh (supersedes dependabot PRs #1–#5).** rusqlite 0.32.1 → 0.40.1 (the store now
   converts token counts at the u64↔i64 boundary explicitly — saturating, never wrapping — since
   rusqlite dropped its blanket `u64` SQL conversions), tokio → 1.53.1, jiff → 0.2.34, toml →

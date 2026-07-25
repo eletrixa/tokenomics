@@ -1,5 +1,6 @@
 ---
 source: src/tui/view.rs
+assertion_line: 1780
 expression: "draw(&board(), 42, 14)"
 ---
 TOKENOMICS  ·  3 acct · notional          
@@ -15,4 +16,4 @@ burn · all accts ▁▂▁▄▃▆▅█
 ▏  Research [claude]            ✖ 93% crit
 ▏5h █████████████████▋░ 93% 1h 11m        
 ▏wk n/a (enable overlay)                  
-↑↓ move · i inactive · ? help · q quit
+↑↓ move  ·  o api  ·  ? help  ·  q quit
