@@ -32,7 +32,8 @@ use crate::domain::Severity;
 use crate::format::severity_label;
 
 use super::model::{
-    resolve_color, severity_glyph, AccountView, ApiRowView, ApiView, App, GaugeView, SubView,
+    resolve_color, severity_glyph, AccountView, ApiRowView, ApiSegmentKind, ApiView, App,
+    GaugeView, SubView,
 };
 
 /// Bordered panel height: border (2) + 2 inner lines (5h · weekly). Token/cost/burn moved to the
@@ -563,39 +564,102 @@ fn api_block_height(api: Option<&ApiView>) -> u16 {
 fn render_api(f: &mut Frame<'_>, app: &App, area: Rect) {
     const SEP: &str = " · ";
     const NAME_W: usize = 10;
+    /// Below this width the aligned money column costs more than it reads — fall back to flow.
+    const ALIGN_MIN_W: u16 = 70;
+
+    let accent = resolve_color(app.use_color, Color::Magenta);
     let dim = Style::new().fg(resolve_color(app.use_color, Color::DarkGray));
+    let mut money = Style::new().fg(resolve_color(app.use_color, Color::White));
+    if app.use_color {
+        money = money.add_modifier(Modifier::BOLD);
+    }
+    let gutter = || Span::styled("▎ ", Style::new().fg(accent));
+
+    let mut header_api = Style::new().fg(accent);
+    if app.use_color {
+        header_api = header_api.add_modifier(Modifier::BOLD);
+    }
     let header = Line::from(vec![
-        Span::styled(
-            "api",
-            Style::new()
-                .fg(resolve_color(app.use_color, Color::Magenta))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" · real $ — bills & balances, never notional", dim),
+        gutter(),
+        Span::styled("api", header_api),
+        Span::styled(" · real $ — never notional", dim),
     ]);
 
     let mut lines = vec![header];
     let rows: &[ApiRowView] = app.api.as_ref().map_or(&[], |view| view.rows.as_slice());
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  not configured — see tokenomics.toml [api] (tok doctor explains)",
-            dim,
-        )));
+        lines.push(Line::from(vec![
+            gutter(),
+            Span::styled(
+                "not configured — see tokenomics.toml [api] (tok doctor explains)",
+                dim,
+            ),
+        ]));
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    // Aligned mode: the leading money cell of every row shares one column — a dim 4-char kind
+    // label, then the amount right-aligned to the widest amount on the board — so figures scan
+    // vertically like a statement. Rows whose first segment isn't money (states) flow as text.
+    let amount_w = if area.width >= ALIGN_MIN_W {
+        rows.iter()
+            .filter_map(|row| row.segments.first())
+            .filter(|seg| seg.kind == ApiSegmentKind::Figure)
+            .filter_map(|seg| seg.text.split_once(' '))
+            .map(|(_, amount)| amount.chars().count())
+            .max()
     } else {
-        let width = usize::from(area.width);
-        for row in rows {
-            let prefix = format!("  {} ", ljust(&row.name, NAME_W));
-            let avail = width.saturating_sub(prefix.chars().count());
-            let segments: Vec<(String, Style)> = row
-                .segments
-                .iter()
-                .map(|seg| (seg.text.clone(), Style::new().fg(seg.color)))
-                .collect();
-            let (seg_spans, _) = fit_segments(segments, avail, SEP, dim);
-            let mut spans = vec![Span::raw(prefix)];
-            spans.extend(seg_spans);
-            lines.push(Line::from(spans));
+        None
+    };
+
+    let width = usize::from(area.width);
+    for row in rows {
+        let mut spans = vec![
+            gutter(),
+            Span::raw(format!("{} ", ljust(&row.name, NAME_W))),
+        ];
+        let mut used = 2 + NAME_W + 1;
+        let mut rest = row.segments.as_slice();
+
+        if let (Some(col_w), Some(first)) = (amount_w, row.segments.first()) {
+            if first.kind == ApiSegmentKind::Figure {
+                if let Some((label, amount)) = first.text.split_once(' ') {
+                    let cell = format!("{} {:>col_w$}", ljust(label, 4), amount, col_w = col_w);
+                    used += cell.chars().count();
+                    let (label_part, amount_part) =
+                        cell.split_at(cell.char_indices().nth(5).map_or(cell.len(), |(i, _)| i));
+                    spans.push(Span::styled(label_part.to_string(), dim));
+                    spans.push(Span::styled(amount_part.to_string(), money));
+                    rest = &row.segments[1..];
+                }
+            }
         }
+
+        let avail = width.saturating_sub(
+            used + if rest.len() < row.segments.len() {
+                2
+            } else {
+                0
+            },
+        );
+        let segments: Vec<(String, Style)> = rest
+            .iter()
+            .map(|seg| {
+                let style = if seg.kind == ApiSegmentKind::Figure {
+                    money
+                } else {
+                    Style::new().fg(seg.color)
+                };
+                (seg.text.clone(), style)
+            })
+            .collect();
+        let (seg_spans, _) = fit_segments(segments, avail, SEP, dim);
+        if rest.len() < row.segments.len() && !seg_spans.is_empty() {
+            spans.push(Span::styled("  ", dim));
+        }
+        spans.extend(seg_spans);
+        lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -1366,9 +1430,20 @@ mod tests {
     /// One hand-built API row segment (view tests don't exercise `build_api_view` — that's
     /// `model.rs`'s job; these just cover how `render_api` lays out whatever it's handed).
     fn api_segment(text: &str, color: Color) -> ApiSegment {
+        // Money segments carry `label $amount` text; classify by shape so the hand-built rows
+        // exercise the aligned-column path the way real build_api_view output does.
+        let kind = if text
+            .split_once(' ')
+            .is_some_and(|(_, rest)| rest.starts_with(['$', '€']))
+        {
+            ApiSegmentKind::Figure
+        } else {
+            ApiSegmentKind::Note
+        };
         ApiSegment {
             text: text.to_string(),
             color,
+            kind,
         }
     }
 

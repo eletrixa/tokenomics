@@ -332,6 +332,19 @@ pub struct ApiSegment {
     pub text: String,
     /// Pre-resolved colour (`Reset` when colour is disabled).
     pub color: Color,
+    /// What the segment carries — lets the view align money into a column and brighten it
+    /// while notes/states recede, without parsing text.
+    pub kind: ApiSegmentKind,
+}
+
+/// Classifies an [`ApiSegment`] for layout: real-money figures get column alignment + emphasis;
+/// everything else (provenance notes, empty states) flows behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiSegmentKind {
+    /// A `label $amount` money cell (`bal $30.59`).
+    Figure,
+    /// A provenance note or empty/dormant state.
+    Note,
 }
 
 /// One API account's display-ready overview row (config label or divergent manual id).
@@ -1152,8 +1165,9 @@ fn api_empty_state_segment(
     let dim = resolve_color(use_color, Color::DarkGray);
     match account.provider {
         ApiProvider::Gemini => ApiSegment {
-            text: "manual entries expected — see api_manual_path".to_string(),
+            text: "awaiting manual figures".to_string(),
             color: dim,
+            kind: ApiSegmentKind::Note,
         },
         // Xai has NO live fetcher this wave (spec 024 §B): a present key still never produces a
         // poll, so "waiting for collector" would be a promise the collector cannot keep — xai is
@@ -1164,6 +1178,7 @@ fn api_empty_state_segment(
                 _ => "dormant (no live fetcher yet)".to_string(),
             },
             color: dim,
+            kind: ApiSegmentKind::Note,
         },
         // Pollable providers: key present → waiting; key absent → dormant (env name).
         ApiProvider::Anthropic | ApiProvider::OpenAi | ApiProvider::Moonshot => {
@@ -1171,17 +1186,72 @@ fn api_empty_state_segment(
                 Some(env) if key_present(env) => ApiSegment {
                     text: "waiting for collector".to_string(),
                     color: dim,
+                    kind: ApiSegmentKind::Note,
                 },
                 Some(env) => ApiSegment {
                     text: format!("dormant ({env} unset)"),
                     color: dim,
+                    kind: ApiSegmentKind::Note,
                 },
                 None => ApiSegment {
                     text: "dormant (api_key_env unset)".to_string(),
                     color: dim,
+                    kind: ApiSegmentKind::Note,
                 },
             }
         }
+    }
+}
+
+/// Append the manual-provenance notes for a merged slot array: one note per DISTINCT `as_of`
+/// group, each carrying its own date and its own staleness (a fresh balance must never inherit —
+/// nor mask — a stale sibling's marker). Split from `api_figure_and_prov_segments` for the
+/// function-length lint; same contract, spec 025 §B.
+fn push_manual_notes(
+    segments: &mut Vec<ApiSegment>,
+    slots: &[Option<ApiFigSlot>; 3],
+    today: jiff::civil::Date,
+    mixed: bool,
+    use_color: bool,
+) {
+    let dim = resolve_color(use_color, Color::DarkGray);
+    let warn = resolve_color(use_color, Color::Yellow);
+    let mut groups: Vec<(&str, Vec<ApiFigureKind>)> = Vec::new();
+    for kind in API_FIGURE_ORDER {
+        if let Some(slot) = slots[api_figure_index(kind)].as_ref() {
+            if let ApiFigSource::Manual { as_of } = &slot.source {
+                match groups.iter_mut().find(|(a, _)| a == as_of) {
+                    Some((_, kinds)) => kinds.push(kind),
+                    None => groups.push((as_of.as_str(), vec![kind])),
+                }
+            }
+        }
+    }
+    let multi = groups.len() > 1;
+    for (as_of, kinds) in groups {
+        let stale = row_is_stale(as_of, today);
+        // Kind prefixes appear whenever the plain word would be ambiguous: live notes on the
+        // same row, or several manual dates side by side.
+        let base = if mixed || multi {
+            let kinds = kinds
+                .iter()
+                .map(|k| api_figure_short(*k))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{kinds} manual {as_of}")
+        } else {
+            format!("manual {as_of}")
+        };
+        let (text, color) = if stale {
+            (format!("{base} · stale"), warn)
+        } else {
+            (base, dim)
+        };
+        segments.push(ApiSegment {
+            text,
+            color,
+            kind: ApiSegmentKind::Note,
+        });
     }
 }
 
@@ -1223,6 +1293,7 @@ fn api_figure_and_prov_segments(
                     format_money(slot.amount_minor, &slot.currency)
                 ),
                 color: primary,
+                kind: ApiSegmentKind::Figure,
             });
         }
     }
@@ -1274,47 +1345,14 @@ fn api_figure_and_prov_segments(
         } else {
             format!("live {age}")
         };
-        segments.push(ApiSegment { text, color });
+        segments.push(ApiSegment {
+            text,
+            color,
+            kind: ApiSegmentKind::Note,
+        });
     }
 
-    if has_manual {
-        // Group manual figures by their as_of date: figures entered on different dates keep their
-        // own date AND their own staleness — a fresh balance must never inherit a stale owed
-        // figure's marker (nor mask it) by being collapsed into one note.
-        let mut groups: Vec<(&str, Vec<ApiFigureKind>)> = Vec::new();
-        for kind in API_FIGURE_ORDER {
-            if let Some(slot) = slots[api_figure_index(kind)].as_ref() {
-                if let ApiFigSource::Manual { as_of } = &slot.source {
-                    match groups.iter_mut().find(|(a, _)| a == as_of) {
-                        Some((_, kinds)) => kinds.push(kind),
-                        None => groups.push((as_of.as_str(), vec![kind])),
-                    }
-                }
-            }
-        }
-        let multi = groups.len() > 1;
-        for (as_of, kinds) in groups {
-            let stale = row_is_stale(as_of, today);
-            // Kind prefixes appear whenever the plain word would be ambiguous: live notes on the
-            // same row, or several manual dates side by side.
-            let base = if mixed || multi {
-                let kinds = kinds
-                    .iter()
-                    .map(|k| api_figure_short(*k))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("{kinds} manual {as_of}")
-            } else {
-                format!("manual {as_of}")
-            };
-            let (text, color) = if stale {
-                (format!("{base} · stale"), warn)
-            } else {
-                (base, dim)
-            };
-            segments.push(ApiSegment { text, color });
-        }
-    }
+    push_manual_notes(&mut segments, slots, today, mixed, use_color);
 
     segments
 }
@@ -3297,10 +3335,7 @@ mod tests {
         let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
         let present = |_: &str| false;
         let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
-        assert_eq!(
-            view.rows[0].segments[0].text,
-            "manual entries expected — see api_manual_path"
-        );
+        assert_eq!(view.rows[0].segments[0].text, "awaiting manual figures");
         assert_eq!(view.rows[0].segments[0].color, Color::DarkGray);
     }
 

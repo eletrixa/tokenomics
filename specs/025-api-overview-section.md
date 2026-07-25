@@ -28,11 +28,15 @@ visible, not implied.
 
 ### B. Row grammar + states
 
-- Header: `api · real $ — bills & balances, never notional` (`api` bold magenta — an accent no
-  other plane uses; rest dim). Width-laddered literal like the title.
-- Row: 2-space indent, `label` left-justified 10, then ` · `-joined segments **dropped from the
-  right** to fit width (the `render_fleet` mechanism, extracted into a shared `fit_segments`
-  helper — no new widget). A segment renders whole or not at all.
+- Header: `api · real $ — never notional` (`api` bold magenta — an accent no other plane
+  uses; rest dim). Every api line carries a magenta `▎ ` gutter so the section reads as board
+  chrome, not a log (amended 2026-07-26, design pass).
+- Row: gutter, `label` left-justified 10, then segments. At ≥70 cols the leading money cell of
+  every row shares one aligned column — dim 4-char kind label, amount right-aligned to the
+  board's widest amount, rendered bold white so figures scan vertically like a statement.
+  Remaining segments (extra figures, notes) flow after via the shared `fit_segments`
+  drop-from-right mechanism (a segment renders whole or not at all); below 70 cols the whole
+  row flows unaligned.
 - Segment order: `bal $X.XX` → `owed €X.XX` → `mtd $X.XX` → provenance notes. Real figures are
   ALWAYS 2 decimals + currency glyph — a grammar disjoint from the notional proxy's, and real
   figures render only inside this section (the three-cue dogma: header text, grammar, locality).
@@ -40,7 +44,7 @@ visible, not implied.
 - Provenance notes are plain-word segments, never color alone: `live <ago>` (dim; yellow when
   older than 2× `poll_billing_secs`), `manual <as_of>` (dim; `manual <as_of> · stale` yellow
   past the 35-day const), `waiting for collector` (figure expected from the live lane, no row
-  yet), `dormant (<env var> unset)` (xai state). When a row mixes planes, each note names its
+  yet), `dormant (<env var> unset)`, gemini `awaiting manual figures`. When a row mixes planes, each note names its
   figure (`mtd live 2m ago · bal manual 2026-07-20`) — a fresh poll must not imply a fresh
   manual figure.
 - Merge rule (spec 024 §C): live wins per `(id, figure)`, manual fills gaps. Degraded live

@@ -8,6 +8,12 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ### CHANGED
 
+- **The api section got a design pass (spec 025 amendment): aligned money column, magenta
+  gutter, quieter chrome.** At ≥70 cols every row's leading figure shares one column — dim kind
+  label, amount right-aligned and bold — so the dollars scan vertically; every api line carries
+  a `▎` accent gutter matching the board's panel edges; the header shortens to
+  `api · real $ — never notional`; gemini's empty state reads `awaiting manual figures`.
+  Provenance words, drop-from-right fitting, and the NO_COLOR character grid are unchanged.
 - **The board footer now advertises the api section and got a three-tone restyle (spec 025
   amendment).** `o api` joins the hint line on every width rung that fits it — the section is
   invisible until toggled, so the footer is its discovery surface. Keys render as bold accent,
