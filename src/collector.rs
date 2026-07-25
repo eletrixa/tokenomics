@@ -1706,8 +1706,11 @@ mod tests {
                 crit_pct: 90.0,
                 ccusage_cmd: None,
                 ledger_path: None,
+                poll_billing_secs: 3600,
+                api_manual_path: None,
             },
             accounts,
+            api: Vec::new(),
         }
     }
 
@@ -2936,8 +2939,11 @@ mod tests {
                 crit_pct: 90.0,
                 ccusage_cmd: None,
                 ledger_path: None,
+                poll_billing_secs: 3600,
+                api_manual_path: None,
             },
             accounts,
+            api: Vec::new(),
         }
     }
 

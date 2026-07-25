@@ -7,12 +7,14 @@
 //!
 //! Key responsibilities:
 //! - `severity_for`: the canonical threshold classifier (used by the collector and the TUI).
-//! - `format_pct` / `format_tokens` / `format_cost` / `format_reset`: human strings for the board.
+//! - `format_pct` / `format_tokens` / `format_cost` / `format_money` / `format_reset`: human strings for the board.
 //!
 //! Design constraints:
 //! - Everything here is pure and deterministic (time is injected); no I/O.
 //! - `resets_at` is rendered verbatim when it does not parse — a reset time is never fabricated.
 //! - Cost always carries the "notional" label — it is a usage proxy, never a bill.
+//! - `format_money` is the ONLY real-money (billing) formatter — its `$`/`€`/code + 2-dp + sign
+//!   grammar is deliberately disjoint from the notional proxy; never route notional values through it.
 
 use std::collections::HashMap;
 
@@ -161,6 +163,25 @@ pub fn format_dollars(cost_notional: f64) -> String {
     format!("${:.0}", cost_notional.max(0.0).floor())
 }
 
+/// Real-money formatter for the API billing plane (spec 025): minor units → "$12.34".
+/// USD → "$", EUR → "€", anything else → "<CODE> " prefix (uppercased, e.g. "CZK 1.00").
+/// Always exactly 2 decimals. Negative → leading "-" before the glyph: "-$0.52".
+/// This grammar is deliberately disjoint from the notional-cost formatting — never add
+/// an "n"/"(notional)" suffix here, and never route notional values through this fn.
+#[allow(dead_code)] // consumed by the spec 025 TUI wave; allow dies with the wiring
+pub fn format_money(amount_minor: i64, currency: &str) -> String {
+    let negative = amount_minor < 0;
+    let abs = amount_minor.unsigned_abs();
+    let whole = abs / 100;
+    let cents = abs % 100;
+    let sign = if negative { "-" } else { "" };
+    match currency {
+        "USD" => format!("{sign}${whole}.{cents:02}"),
+        "EUR" => format!("{sign}€{whole}.{cents:02}"),
+        other => format!("{sign}{} {whole}.{cents:02}", other.to_uppercase()),
+    }
+}
+
 /// The past-reset sentinel: the stored reset time has passed, so the window has reset and the stored
 /// utilization is history, not state — we're waiting for fresh evidence (a new collect, or an overlay
 /// success after the user logs in / opens Claude) to bring the new countdown. Read verbatim by the
@@ -300,6 +321,29 @@ mod tests {
         assert_eq!(format_dollars(1.0), "$1");
         assert_eq!(format_dollars(0.0), "$0");
         assert_eq!(format_dollars(-5.0), "$0");
+    }
+
+    #[test]
+    fn money_formats_cents_with_currency_glyph_and_sign() {
+        // Real-money table (spec 025 §C): minor units → 2-dp string. USD/EUR get a glyph,
+        // anything else an uppercased "<CODE> " prefix; negatives carry a leading "-".
+        assert_eq!(format_money(1234, "USD"), "$12.34");
+        assert_eq!(format_money(350, "EUR"), "€3.50");
+        assert_eq!(format_money(100, "czk"), "CZK 1.00"); // lowercase → uppercased code
+        assert_eq!(format_money(0, "USD"), "$0.00");
+        assert_eq!(format_money(-52, "USD"), "-$0.52");
+        assert_eq!(format_money(5, "USD"), "$0.05"); // leading-zero cents
+                                                     // Large value keeps full precision (integer math; no float cast to round).
+        assert_eq!(format_money(12_345_678, "USD"), "$123456.78");
+        // A negative code-prefixed amount leads the "-" before the code too.
+        assert_eq!(format_money(-52, "czk"), "-CZK 0.52");
+    }
+
+    #[test]
+    fn money_handles_i64_min_without_overflow() {
+        // i64::MIN must not panic: unsigned_abs() sidesteps abs()'s overflow, and the exact
+        // string pins the integer math at the extreme (no f64 rounding creeps in).
+        assert_eq!(format_money(i64::MIN, "USD"), "-$92233720368547758.08");
     }
 
     #[test]

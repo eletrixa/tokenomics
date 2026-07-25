@@ -8,12 +8,13 @@
 //! Key responsibilities:
 //! - `open`: create/migrate the schema (WAL, foreign keys, busy timeout), keyed by `user_version`.
 //!   `open_readonly` is a migration-free read-only variant for `tok doctor` (spec 015 §B/GAP5).
-//! - Writers: `upsert_accounts`, `insert_snapshot`, `set_limits`, `set_token_state`,
-//!   `record_overlay_success`, `mark_overlay_failing`, `heartbeat`, `record_collector_stamp`.
-//! - Readers: `latest_snapshot`, `latest_limits`, `burn_history`, `latest_token_status`,
-//!   `last_overlay_success`, `overlay_failing_since`, `heartbeat_age` (collector liveness),
-//!   `collector_stamp` (the config path/mtime + exe path/mtime the collector loaded — spec 015 §B
-//!   divergence + rebuild checks).
+//! - Writers: `upsert_accounts`, `insert_snapshot`, `set_limits`, `set_api_billing`,
+//!   `set_token_state`, `record_overlay_success`, `mark_overlay_failing`, `heartbeat`,
+//!   `record_collector_stamp`.
+//! - Readers: `latest_snapshot`, `latest_limits`, `latest_api_billing`, `burn_history`,
+//!   `latest_token_status`, `last_overlay_success`, `overlay_failing_since`,
+//!   `heartbeat_age` (collector liveness), `collector_stamp` (the config path/mtime + exe
+//!   path/mtime the collector loaded — spec 015 §B divergence + rebuild checks).
 //!
 //! Design constraints:
 //! - Timestamps persist as epoch-milliseconds (INTEGER, sortable); `resets_at` is stored verbatim.
@@ -22,6 +23,9 @@
 //!   blanket `u64` conversions): `tokens_to_db` / `tokens_from_db` saturate at the boundary — a
 //!   count beyond i64::MAX (impossible in practice) clamps rather than errors or wraps.
 //! - `set_limits` replaces an account's limit set atomically (callers merge by provenance first).
+//! - The `api_billing` table is the billing plane (real money in minor units, never the notional
+//!   proxy; spec 024 §D): `set_api_billing` replaces an api id's figures atomically, written only
+//!   on a successful parse so a failed poll leaves prior rows to age honestly.
 //! - `token_state` stores freshness only — never a token value.
 
 use std::path::Path;
@@ -30,6 +34,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
+use crate::billing::{ApiFigure, ApiFigureKind};
 use crate::domain::{
     Account, Limit, LimitKind, Provenance, Provider, Severity, UsageSnapshot, Window,
 };
@@ -116,6 +121,22 @@ CREATE TABLE IF NOT EXISTS overlay_failure (
 const SCHEMA_V3: &str = "\
 CREATE INDEX IF NOT EXISTS idx_snapshots_time ON snapshots(collected_at, burn_tpm);";
 
+/// Schema version 6: the billing plane (spec 024 §D). `api_billing` holds real-money figures
+/// (minor units — never the notional proxy) polled from a provider's billing endpoint, one row per
+/// `(api_id, figure)`. The collector is the only writer (`set_api_billing`, on a successful parse);
+/// the TUI is the reader (`latest_api_billing`). Additive and `IF NOT EXISTS`, so an existing v5
+/// store gains the table on open without touching any other table's data. No legacy partial-ship, so
+/// — unlike the v5 stamp columns — it needs no unconditional reconcile: a plain version gate suffices.
+const SCHEMA_V6: &str = "\
+CREATE TABLE IF NOT EXISTS api_billing (
+    api_id       TEXT NOT NULL,
+    figure       TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL,
+    currency     TEXT NOT NULL,
+    polled_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (api_id, figure)
+);";
+
 /// The nullable `heartbeat` stamp columns (spec 015 §B/§B2), each recording what the running collector
 /// loaded: the config file's resolved path + mtime (epoch-ms) and the running executable's path +
 /// mtime (epoch-ms). `ALTER … ADD COLUMN` is additive — existing rows keep their data and read NULL —
@@ -133,7 +154,7 @@ const HEARTBEAT_STAMP_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// The current schema version (the highest migration applied by [`Store::migrate`]).
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The local store — one SQLite connection. Writers and readers each hold their own `Store`;
 /// WAL lets them coexist.
@@ -155,6 +176,24 @@ pub struct CollectorStamp {
     pub exe_path: Option<String>,
     /// That executable's mtime (epoch-ms) at collector-start time.
     pub exe_mtime: Option<i64>,
+}
+
+/// One row of the billing plane — a real-money figure (minor units, never the notional proxy) for an
+/// API id, as read back by [`Store::latest_api_billing`]. `figure` is a typed [`ApiFigureKind`]; a
+/// stored `figure` string that no longer parses is dropped at read time (see `latest_api_billing`).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // consumed by the spec 024 collector + 025 TUI waves; allow dies with the wiring
+pub struct ApiBillingRow {
+    /// The API id this figure belongs to.
+    pub api_id: String,
+    /// Which figure this is — balance / owed / mtd_spend.
+    pub figure: ApiFigureKind,
+    /// The amount in minor units of `currency` (e.g. cents); negative means debt.
+    pub amount_minor: i64,
+    /// ISO-4217 currency code (`USD`, …).
+    pub currency: String,
+    /// When this figure was polled (epoch-millis).
+    pub polled_at_ms: i64,
 }
 
 impl Store {
@@ -201,6 +240,11 @@ impl Store {
         }
         if version < 4 {
             self.conn.execute_batch(SCHEMA_V4)?;
+        }
+        // v6 billing plane: a plain additive `CREATE TABLE` (spec 024 §D) — no legacy partial-ship,
+        // so it needs no unconditional reconcile like the v5 stamp columns.
+        if version < 6 {
+            self.conn.execute_batch(SCHEMA_V6)?;
         }
         // v5 stamp columns are reconciled unconditionally (not version-gated) so a store an earlier
         // build already stamped at v5 with only `config_mtime` still gains the other three columns.
@@ -317,6 +361,38 @@ impl Store {
                     limit.severity.as_str(),
                     limit.source.as_str(),
                     collected_at.as_millisecond(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically replace `api_id`'s billing figures with `figures` (one transaction: `DELETE` then
+    /// `INSERT` each). Called ONLY on a successful parse — a failed poll never touches the rows, so a
+    /// prior figure ages honestly from `polled_at_ms` rather than vanishing. The collector is the sole
+    /// writer, the TUI the sole reader ([`Store::latest_api_billing`]) — the same discipline as
+    /// [`Store::set_limits`]. An empty `figures` clears the id's rows (the `DELETE` runs, the loop
+    /// inserts nothing): a valid but figure-less poll, distinct from a failed one.
+    #[allow(dead_code)] // consumed by the spec 024 collector wave; allow dies with the wiring
+    pub fn set_api_billing(
+        &self,
+        api_id: &str,
+        figures: &[ApiFigure],
+        polled_at_ms: i64,
+    ) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM api_billing WHERE api_id = ?1", params![api_id])?;
+        for figure in figures {
+            tx.execute(
+                "INSERT INTO api_billing (api_id, figure, amount_minor, currency, polled_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    api_id,
+                    figure.kind.as_str(),
+                    figure.amount_minor,
+                    figure.currency,
+                    polled_at_ms,
                 ],
             )?;
         }
@@ -543,6 +619,45 @@ impl Store {
             limits.push(row??);
         }
         Ok(limits)
+    }
+
+    /// Every stored billing row, ordered by `api_id` then `figure` (the natural fleet view). A stored
+    /// `figure` string that no longer parses (a kind retired in a future build, or a corrupt row) is
+    /// SKIPPED, not fatal — defensive read, so one bad row can't blank the whole billing plane; its
+    /// parseable siblings survive. Mirrors the degrade-don't-error discipline of
+    /// [`Store::latest_limits`].
+    #[allow(dead_code)] // consumed by the spec 025 TUI wave; allow dies with the wiring
+    pub fn latest_api_billing(&self) -> AppResult<Vec<ApiBillingRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT api_id, figure, amount_minor, currency, polled_at_ms
+             FROM api_billing
+             ORDER BY api_id, figure",
+        )?;
+        // Each row yields `Option<ApiBillingRow>`: `None` means the stored `figure` string didn't
+        // parse (skip it); an `Err` means a column read failed (propagate).
+        let rows = stmt.query_map([], |row| {
+            let api_id: String = row.get(0)?;
+            let figure_text: String = row.get(1)?;
+            let amount_minor: i64 = row.get(2)?;
+            let currency: String = row.get(3)?;
+            let polled_at_ms: i64 = row.get(4)?;
+            Ok(
+                ApiFigureKind::parse(&figure_text).map(|figure| ApiBillingRow {
+                    api_id,
+                    figure,
+                    amount_minor,
+                    currency,
+                    polled_at_ms,
+                }),
+            )
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Some(row) = row? {
+                out.push(row);
+            }
+        }
+        Ok(out)
     }
 
     /// The last `n` `total_tokens` points for an account, oldest → newest (for the sparkline).
@@ -1286,5 +1401,217 @@ mod tests {
             )
             .expect("read pid");
         assert_eq!(pid, 5678);
+    }
+
+    // ── api_billing (spec 024 §D) ─────────────────────────────────────────────────────────────
+
+    /// Build an `ApiFigure` from a `figure` string. Goes through `ApiFigureKind::parse` so these
+    /// tests never guess c1's variant names — only the parse-mapped strings ("balance" / "owed" /
+    /// "mtd_spend") the contract pins.
+    fn fig(kind: &str, amount_minor: i64, currency: &str) -> ApiFigure {
+        ApiFigure {
+            kind: ApiFigureKind::parse(kind)
+                .unwrap_or_else(|| panic!("test fixture kind '{kind}' must parse")),
+            amount_minor,
+            currency: currency.to_string(),
+        }
+    }
+
+    /// Whether the `api_billing` table is present (queried via `sqlite_master`, never by touching it).
+    fn api_billing_table_exists(store: &Store) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='api_billing'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .expect("sqlite_master read")
+            .is_some()
+    }
+
+    #[test]
+    fn fresh_open_is_v6_with_api_billing_table() {
+        let (_dir, store) = open_temp();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(version, 6);
+        assert!(api_billing_table_exists(&store));
+        assert!(
+            store.latest_api_billing().expect("q").is_empty(),
+            "a fresh store has no billing rows"
+        );
+    }
+
+    #[test]
+    fn open_migrates_a_v5_store_to_v6_adding_api_billing_preserving_data() {
+        // A store last written by a v5 build: every version-gated batch below v6 applied, stamped at
+        // v5 (there is no `SCHEMA_V5` batch — the v5-era change is the unconditionally-reconciled
+        // heartbeat stamp columns, irrelevant here). Opening must add `api_billing` (v6) without
+        // touching any other table's data.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(SCHEMA_V1).expect("seed v1 tables");
+            conn.execute_batch(SCHEMA_V2).expect("seed v2 table");
+            conn.execute_batch(SCHEMA_V3).expect("seed v3 index");
+            conn.execute_batch(SCHEMA_V4).expect("seed v4 table");
+            conn.execute_batch("PRAGMA user_version = 5;")
+                .expect("stamp v5");
+            conn.execute_batch(
+                "INSERT INTO accounts (id, label, provider, config_dir, color, limits_overlay)
+                     VALUES ('acct', 'Acct', 'claude', '/home/x/.claude', 'cyan', 0);
+                 INSERT INTO snapshots
+                     (account_id, collected_at, input, output, cache_read, cache_creation,
+                      total_tokens, cost_notional, win_start, win_end, win_remaining_secs,
+                      burn_tpm, burn_cph)
+                     VALUES ('acct', 1000, 1, 2, 3, 4, 999, 1.5, NULL, NULL, NULL, 0.0, 0.0);",
+            )
+            .expect("seed pre-v6 data");
+        }
+        let store = Store::open(&path).expect("open migrates v5 -> v6");
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(version, 6, "open advanced the stamp to v6");
+        assert!(
+            api_billing_table_exists(&store),
+            "v6 adds the api_billing table"
+        );
+        // The pre-existing data survived the v6 step untouched.
+        assert_eq!(
+            store
+                .latest_snapshot("acct")
+                .expect("q")
+                .expect("snapshot survived")
+                .total_tokens,
+            999
+        );
+        // The new table is empty — the migration added it but seeded nothing.
+        assert!(store.latest_api_billing().expect("q").is_empty());
+    }
+
+    #[test]
+    fn set_then_latest_round_trips_multi_id_ordered() {
+        let (_dir, store) = open_temp();
+        // Two ids; id "b" polled first, id "a" polled later — write order must not affect read order.
+        store
+            .set_api_billing("b", &[fig("mtd_spend", 2000, "USD")], 90_000)
+            .expect("set b");
+        store
+            .set_api_billing(
+                "a",
+                &[fig("owed", -500, "USD"), fig("balance", 1000, "USD")],
+                80_000,
+            )
+            .expect("set a");
+
+        let rows = store.latest_api_billing().expect("q");
+        assert_eq!(rows.len(), 3);
+        // Ordered by api_id, then by the stored figure text (so "balance" < "owed" for id "a").
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.api_id.as_str(), r.figure.as_str()))
+                .collect::<Vec<(&str, &str)>>(),
+            vec![("a", "balance"), ("a", "owed"), ("b", "mtd_spend")],
+            "rows ordered by api_id then figure"
+        );
+        // Values, currency, and polled_at round-trip verbatim.
+        let a_balance = rows
+            .iter()
+            .find(|r| r.api_id == "a" && r.figure.as_str() == "balance")
+            .expect("a/balance row");
+        assert_eq!(a_balance.amount_minor, 1000);
+        assert_eq!(a_balance.currency, "USD");
+        assert_eq!(a_balance.polled_at_ms, 80_000);
+    }
+
+    #[test]
+    fn set_api_billing_replaces_only_that_id_leaving_others_untouched() {
+        let (_dir, store) = open_temp();
+        store
+            .set_api_billing(
+                "a",
+                &[fig("balance", 100, "USD"), fig("owed", 200, "USD")],
+                1_000,
+            )
+            .expect("set a v1");
+        store
+            .set_api_billing("b", &[fig("balance", 300, "USD")], 2_000)
+            .expect("set b");
+        // Re-set id "a" with a SMALLER figure set: its dropped "owed" must vanish, id "b" untouched.
+        store
+            .set_api_billing("a", &[fig("balance", 999, "USD")], 3_000)
+            .expect("set a v2");
+
+        let rows = store.latest_api_billing().expect("q");
+        let a: Vec<_> = rows.iter().filter(|r| r.api_id == "a").collect();
+        let b: Vec<_> = rows.iter().filter(|r| r.api_id == "b").collect();
+        assert_eq!(a.len(), 1, "a's stale 'owed' figure was replaced away");
+        assert_eq!(a[0].figure.as_str(), "balance");
+        assert_eq!(a[0].amount_minor, 999, "a/balance took the new value");
+        assert_eq!(a[0].polled_at_ms, 3_000);
+        assert_eq!(b.len(), 1, "id b is untouched by a's replace");
+        assert_eq!(b[0].figure.as_str(), "balance");
+        assert_eq!(b[0].amount_minor, 300);
+        assert_eq!(b[0].polled_at_ms, 2_000);
+    }
+
+    #[test]
+    fn set_api_billing_with_empty_figures_clears_that_ids_rows() {
+        let (_dir, store) = open_temp();
+        store
+            .set_api_billing("a", &[fig("balance", 100, "USD")], 1_000)
+            .expect("set a");
+        assert_eq!(store.latest_api_billing().expect("q").len(), 1);
+        // An empty slice is a valid "no figures this poll": the DELETE runs, nothing is inserted.
+        store.set_api_billing("a", &[], 2_000).expect("set a empty");
+        assert!(
+            store.latest_api_billing().expect("q").is_empty(),
+            "an empty figures slice clears the id's rows"
+        );
+    }
+
+    #[test]
+    fn latest_api_billing_skips_an_unparsable_figure_string_keeping_siblings() {
+        let (_dir, store) = open_temp();
+        store
+            .set_api_billing("a", &[fig("balance", 100, "USD")], 1_000)
+            .expect("set a");
+        // Plant a row whose `figure` text no ApiFigureKind parses (a kind a future build retired, or a
+        // corrupt row) by going under the typed writer. Distinct (api_id, figure) → no PK clash.
+        store
+            .conn
+            .execute(
+                "INSERT INTO api_billing (api_id, figure, amount_minor, currency, polled_at_ms)
+                 VALUES ('a', 'totally-bogus-kind', 5, 'USD', 9000)",
+                [],
+            )
+            .expect("plant bogus figure");
+        store
+            .set_api_billing("b", &[fig("owed", 7, "USD")], 8_000)
+            .expect("set b");
+
+        let rows = store.latest_api_billing().expect("q");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the unparsable figure is skipped, its siblings survive"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.figure.as_str() != "totally-bogus-kind"),
+            "the bogus figure string never reaches the reader"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.figure.as_str()).collect::<Vec<_>>(),
+            vec!["balance", "owed"],
+            "parseable rows remain ordered by api_id then figure"
+        );
     }
 }

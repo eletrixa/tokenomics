@@ -61,3 +61,52 @@ limits_overlay = false    # opt-in, OFF by default — see the README overlay no
 # provider = "kimi"
 # api_key_env = "KIMI_CODING_KEY"  # NAME of the env var holding your Kimi subscription key — never the key itself
 # limits_overlay = true            # kimi has no local usage lane; opt in to see any gauges at all
+
+# ── API billing plane (spec 024) — real-dollar PAYG balances & month-to-date spend ────────────
+# A separate plane from the subscription `[[account]]` list above: API-key accounts whose numbers
+# are real money (a bill or a balance), never the notional proxy. Absent/unset ⇒ the plane is Off.
+# Add these two `[settings]` keys only if you turn the plane on:
+# [settings]
+# poll_billing_secs = 3600            # how often the collector polls billing endpoints (floor 300s)
+# api_manual_path = "~/tokenomics/api-billing.toml"  # manual TOML for providers with no billing endpoint
+#                                                    # (gemini, xAI); optional, a leading ~ expands against $HOME
+
+# Uncomment one block per API-key account. `api_key_env` is the NAME of the env var holding the key
+# (e.g. ANTHROPIC_ADMIN_API_KEY) — never the key itself. Pollable providers (anthropic/openai/
+# moonshot/xai) require it; gemini rejects it (manual-only).
+
+# Anthropic — admin billing API; month-to-date spend from the cost report.
+# [[api]]
+# id = "anthropic-org"
+# label = "Anthropic Org"
+# provider = "anthropic"
+# api_key_env = "ANTHROPIC_ADMIN_API_KEY"  # NAME of the env var holding your Anthropic admin key — never the key itself
+
+# OpenAI — admin billing API; month-to-date spend summed from daily cost buckets.
+# [[api]]
+# id = "openai-org"
+# label = "OpenAI Org"
+# provider = "openai"
+# api_key_env = "OPENAI_ADMIN_API_KEY"     # NAME of the env var holding your OpenAI admin key — never the key itself
+
+# Gemini — AI Studio personal tier has no billing endpoint, so it is MANUAL-ONLY: no api_key_env,
+# figures come from `api_manual_path` above.
+# [[api]]
+# id = "gemini-studio"
+# label = "Gemini Studio"
+# provider = "gemini"
+
+# Moonshot (Kimi) — balance endpoint; current available balance.
+# [[api]]
+# id = "moonshot"
+# label = "Moonshot"
+# provider = "moonshot"
+# api_key_env = "MOONSHOT_API_KEY"         # NAME of the env var holding your Moonshot API key — never the key itself
+
+# xAI — ships DORMANT this wave (no management key on disk): config-accepted, never fetched until a
+# follow-up spec adds the management-API fetcher. The named env var being unset is the expected state.
+# [[api]]
+# id = "xai"
+# label = "xAI"
+# provider = "xai"
+# api_key_env = "XAI_API_KEY"              # NAME of the env var holding your xAI management key — never the key itself

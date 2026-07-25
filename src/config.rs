@@ -2,13 +2,15 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/config.rs
-//! Deps:    serde, toml (path resolution lives in `crate::paths`)
+//! Deps:    serde, toml (path resolution lives in `crate::paths`); `crate::billing::ApiAccount`
+//!          for the `[[api]]` plane (spec 024 §A)
 //! Tested:  inline `#[cfg(test)]` below + tests/cli.rs (validate/accounts); `ledger_path` parsing
-//!          (spec 017 §B)
+//!          (spec 017 §B); `[[api]]` plane + billing settings (spec 024 §A)
 //!
 //! Key responsibilities:
 //! - `Config`/`Settings` schema with `deny_unknown_fields` (typos are errors).
-//! - `parse` (pure, with `~` expansion) + `load` (path resolution + read).
+//! - `parse` (pure, with `~` expansion of `config_dir` and `api_manual_path`) + `load` (path
+//!   resolution + read).
 //! - `validate` (pure findings) and `validate_environment` (filesystem existence).
 //!
 //! Design constraints:
@@ -35,6 +37,11 @@ pub struct Config {
     /// The monitored accounts (`[[account]]` blocks).
     #[serde(default, rename = "account")]
     pub accounts: Vec<Account>,
+    /// API-key PAYG billing accounts (`[[api]]` blocks, spec 024 §A) — a separate plane from the
+    /// subscription `[[account]]` list; their numbers are real money, never the notional proxy.
+    /// Absent section ⇒ empty vec ⇒ zero behaviour change.
+    #[serde(default, rename = "api")]
+    pub api: Vec<crate::billing::ApiAccount>,
 }
 
 /// Global settings block, all fields optional with sensible defaults.
@@ -47,6 +54,9 @@ pub struct Settings {
     /// Overlay poll cadence in seconds.
     #[serde(default = "default_poll_overlay")]
     pub poll_overlay_secs: u64,
+    /// Billing (API) plane poll cadence in seconds (spec 024 §A); floored at 300.
+    #[serde(default = "default_poll_billing")]
+    pub poll_billing_secs: u64,
     /// Utilization % at which a window is a warning.
     #[serde(default = "default_warn")]
     pub warn_pct: f64,
@@ -61,16 +71,25 @@ pub struct Settings {
     /// absent (and no env override) ⇒ the ledger plane is `Off` (no rendering, no warning).
     #[serde(default)]
     pub ledger_path: Option<String>,
+    /// Optional path to the manual billing TOML (spec 024 §C) — like `ledger_path`, beaten by
+    /// `$TOKENOMICS_API_MANUAL`; absent (and no env override) ⇒ the manual lane is `Off`. A leading
+    /// `~` is expanded at parse time.
+    #[serde(default)]
+    pub api_manual_path: Option<PathBuf>,
 }
 
 const POLL_LOCAL_FLOOR: u64 = 5;
 const POLL_OVERLAY_FLOOR: u64 = 60;
+const POLL_BILLING_FLOOR: u64 = 300;
 
 fn default_poll_local() -> u64 {
     10
 }
 fn default_poll_overlay() -> u64 {
     300
+}
+fn default_poll_billing() -> u64 {
+    3600
 }
 fn default_warn() -> f64 {
     75.0
@@ -84,10 +103,12 @@ impl Default for Settings {
         Self {
             poll_local_secs: default_poll_local(),
             poll_overlay_secs: default_poll_overlay(),
+            poll_billing_secs: default_poll_billing(),
             warn_pct: default_warn(),
             crit_pct: default_crit(),
             ccusage_cmd: None,
             ledger_path: None,
+            api_manual_path: None,
         }
     }
 }
@@ -123,6 +144,9 @@ impl Config {
             if let Some(dir) = &account.config_dir {
                 account.config_dir = Some(expand_tilde(dir, home.as_deref()));
             }
+        }
+        if let Some(path) = cfg.settings.api_manual_path.take() {
+            cfg.settings.api_manual_path = Some(expand_tilde(&path, home.as_deref()));
         }
         Ok(cfg)
     }
@@ -212,6 +236,17 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
         }
         findings.extend(validate_provider_fields(account));
     }
+    // `[[api]]` ids are unique within their own namespace (separate from `[[account]]` ids — the
+    // same string in both is legal; an explicit cross-check would be wrong).
+    let mut seen_api: HashSet<&str> = HashSet::new();
+    for api in &cfg.api {
+        if api.id.trim().is_empty() {
+            findings.push(Finding::error("an api entry has an empty id"));
+        } else if !seen_api.insert(api.id.as_str()) {
+            findings.push(Finding::error(format!("duplicate api id '{}'", api.id)));
+        }
+        findings.extend(validate_api_fields(api));
+    }
     let s = &cfg.settings;
     if s.crit_pct <= s.warn_pct {
         findings.push(Finding::error(format!(
@@ -229,6 +264,12 @@ pub fn validate(cfg: &Config) -> Vec<Finding> {
         findings.push(Finding::error(format!(
             "poll_overlay_secs ({}) is below the floor of {POLL_OVERLAY_FLOOR}s",
             s.poll_overlay_secs
+        )));
+    }
+    if s.poll_billing_secs < POLL_BILLING_FLOOR {
+        findings.push(Finding::error(format!(
+            "poll_billing_secs ({}) is below the floor of {POLL_BILLING_FLOOR}s",
+            s.poll_billing_secs
         )));
     }
     findings
@@ -267,6 +308,36 @@ fn validate_provider_fields(account: &Account) -> Vec<Finding> {
                 )));
             }
         }
+    }
+    findings
+}
+
+/// Per-provider `[[api]]` field validation (spec 024 §A): `api_key_env` (a non-empty env-var NAME)
+/// is required for anthropic/openai/moonshot/xai (each exposes a billing endpoint) and rejected for
+/// gemini (no endpoint — manual TOML only). Pure — no I/O, no env-var reads.
+fn validate_api_fields(api: &crate::billing::ApiAccount) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let p = api.provider.as_str();
+    match p {
+        "anthropic" | "openai" | "moonshot" | "xai" => {
+            let missing = api
+                .api_key_env
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty());
+            if missing {
+                findings.push(Finding::error(format!(
+                    "api '{}': api_key_env is required for provider '{}'",
+                    api.id, p
+                )));
+            }
+        }
+        "gemini" if api.api_key_env.is_some() => {
+            findings.push(Finding::error(format!(
+                "api '{}': api_key_env is rejected for provider '{}' — gemini is manual-only",
+                api.id, p
+            )));
+        }
+        _ => {}
     }
     findings
 }
@@ -787,5 +858,211 @@ config_dir = \"/nonexistent/gemini/home\"
         assert!(validate(&cfg).is_empty());
         let zai_cfg = Config::parse(ZAI).expect("parses");
         assert!(validate(&zai_cfg).is_empty());
+    }
+
+    // ── spec 024 §A (AC2): `[[api]]` plane + billing settings ──────────────────────────────────
+
+    const API_ALL: &str = "\
+[[account]]
+id = \"a\"
+label = \"A\"
+provider = \"claude\"
+config_dir = \"/tmp\"
+
+[[api]]
+id = \"ant\"
+label = \"Anthropic Org\"
+provider = \"anthropic\"
+api_key_env = \"ANTHROPIC_ADMIN_API_KEY\"
+
+[[api]]
+id = \"oai\"
+provider = \"openai\"
+api_key_env = \"OPENAI_ADMIN_API_KEY\"
+
+[[api]]
+id = \"gem\"
+provider = \"gemini\"
+
+[[api]]
+id = \"moon\"
+provider = \"moonshot\"
+api_key_env = \"MOONSHOT_API_KEY\"
+
+[[api]]
+id = \"xai\"
+provider = \"xai\"
+api_key_env = \"XAI_API_KEY\"
+";
+
+    #[test]
+    fn api_block_parses_all_five_providers_with_correct_types() {
+        let cfg = Config::parse(API_ALL).expect("parses");
+        assert_eq!(cfg.api.len(), 5);
+        // anthropic: every field populated, active defaults true.
+        assert_eq!(cfg.api[0].id, "ant");
+        assert_eq!(cfg.api[0].label.as_deref(), Some("Anthropic Org"));
+        assert_eq!(cfg.api[0].provider.as_str(), "anthropic");
+        assert_eq!(
+            cfg.api[0].api_key_env.as_deref(),
+            Some("ANTHROPIC_ADMIN_API_KEY")
+        );
+        assert!(cfg.api[0].active);
+        // openai: label omitted ⇒ None.
+        assert_eq!(cfg.api[1].provider.as_str(), "openai");
+        assert_eq!(cfg.api[1].label.as_deref(), None);
+        // gemini: manual-only ⇒ no api_key_env.
+        assert_eq!(cfg.api[2].provider.as_str(), "gemini");
+        assert_eq!(cfg.api[2].api_key_env.as_deref(), None);
+        assert_eq!(cfg.api[3].provider.as_str(), "moonshot");
+        assert_eq!(cfg.api[4].provider.as_str(), "xai");
+    }
+
+    #[test]
+    fn api_section_absent_yields_empty_vec_and_existing_fixture_is_unchanged() {
+        // Pre-spec-024 fixture reused verbatim — the absent `[[api]]` section is a no-op.
+        let cfg = Config::parse(ONE).expect("pre-spec-024 config still parses");
+        assert!(cfg.api.is_empty());
+        assert_eq!(cfg.settings.poll_billing_secs, 3600);
+        assert_eq!(cfg.settings.api_manual_path, None);
+        assert!(validate(&cfg).is_empty());
+    }
+
+    #[test]
+    fn validate_flags_duplicate_api_id() {
+        let toml = "\
+[[account]]
+id = \"a\"
+label = \"A\"
+provider = \"claude\"
+config_dir = \"/tmp\"
+
+[[api]]
+id = \"dup\"
+provider = \"anthropic\"
+api_key_env = \"K1\"
+
+[[api]]
+id = \"dup\"
+provider = \"openai\"
+api_key_env = \"K2\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert!(
+            validate(&cfg)
+                .iter()
+                .any(|f| f.message.contains("duplicate api id") && f.message.contains("dup")),
+            "{:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_api_key_env_for_a_gemini_api_entry() {
+        let toml = "\
+[[account]]
+id = \"a\"
+label = \"A\"
+provider = \"claude\"
+config_dir = \"/tmp/\"
+
+[[api]]
+id = \"gem\"
+provider = \"gemini\"
+api_key_env = \"GEMINI_API_KEY\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("gem")
+                && m.contains("api_key_env")
+                && m.contains("manual-only")),
+            "must name the api, the field, and say gemini is manual-only: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_requires_api_key_env_for_a_moonshot_api_entry() {
+        let toml = "\
+[[account]]
+id = \"a\"
+label = \"A\"
+provider = \"claude\"
+config_dir = \"/tmp/\"
+
+[[api]]
+id = \"moon\"
+provider = \"moonshot\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        let msgs: Vec<String> = validate(&cfg).into_iter().map(|f| f.message).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("moon") && m.contains("api_key_env") && m.contains("moonshot")),
+            "must name the api, the provider, and the missing field: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_enforces_poll_billing_secs_floor() {
+        let below = format!("{ONE}[settings]\npoll_billing_secs = 299\n");
+        let cfg = Config::parse(&below).expect("parses");
+        assert!(
+            validate(&cfg)
+                .iter()
+                .any(|f| f.message.contains("poll_billing_secs") && f.message.contains("300")),
+            "{:?}",
+            validate(&cfg)
+        );
+
+        let at = format!("{ONE}[settings]\npoll_billing_secs = 300\n");
+        let cfg = Config::parse(&at).expect("parses");
+        assert!(
+            validate(&cfg).is_empty(),
+            "exactly at the floor must be clean: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn same_id_in_account_and_api_namespaces_is_accepted() {
+        // `[[account]]` and `[[api]]` are separate namespaces — a shared string must NOT cross-check.
+        let toml = "\
+[[account]]
+id = \"shared\"
+label = \"Shared\"
+provider = \"claude\"
+config_dir = \"/tmp/\"
+
+[[api]]
+id = \"shared\"
+provider = \"anthropic\"
+api_key_env = \"K\"
+";
+        let cfg = Config::parse(toml).expect("parses");
+        assert!(
+            validate(&cfg).is_empty(),
+            "shared id across namespaces must validate clean: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn api_manual_path_tilde_expands_against_home() {
+        // `~` expands at parse time (mirroring config_dir); an absolute path is left untouched.
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/example");
+        let toml =
+            format!("{ONE}[settings]\napi_manual_path = \"~/tokenomics/api-billing.toml\"\n");
+        let cfg = Config::parse(&toml).expect("parses");
+        // Restore before asserting so a failure still leaves the environment clean.
+        match saved {
+            Some(v) => std::env::set_var("HOME", &v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            cfg.settings.api_manual_path.as_deref(),
+            Some(Path::new("/home/example/tokenomics/api-billing.toml"))
+        );
     }
 }

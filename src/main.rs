@@ -18,6 +18,10 @@
 //! - The only I/O the CLI drives is at the command edges; the async runtime is built explicitly here.
 
 mod alerts;
+// Wired in by the collector/doctor wave (spec 024 §D/§E) + TUI wave (spec 025);
+// module-level dead-code allow dies with that wiring.
+#[allow(dead_code)]
+mod billing;
 mod collector;
 mod config;
 mod doctor;
@@ -596,6 +600,7 @@ mod tests {
         let cfg = Config {
             settings: config::Settings::default(),
             accounts: vec![account("alive", true), account("dead", false)],
+            api: Vec::new(),
         };
         let records = collect_once(&cfg).await;
         assert_eq!(
@@ -618,6 +623,7 @@ mod tests {
         let cfg = Config {
             settings: config::Settings::default(),
             accounts: vec![codex],
+            api: Vec::new(),
         };
         let records = collect_once(&cfg).await;
         assert_eq!(records.len(), 1);
@@ -644,6 +650,7 @@ mod tests {
         let cfg = Config {
             settings: config::Settings::default(),
             accounts: vec![zai],
+            api: Vec::new(),
         };
         let records = collect_once(&cfg).await;
         assert_eq!(records.len(), 1);
@@ -664,6 +671,7 @@ mod tests {
         let cfg = Config {
             settings: config::Settings::default(),
             accounts: vec![kimi],
+            api: Vec::new(),
         };
         let records = collect_once(&cfg).await;
         assert_eq!(records.len(), 1);
@@ -683,6 +691,7 @@ mod tests {
         let cfg = Config {
             settings: config::Settings::default(),
             accounts: vec![gemini],
+            api: Vec::new(),
         };
         let records = collect_once(&cfg).await;
         assert_eq!(records.len(), 1);

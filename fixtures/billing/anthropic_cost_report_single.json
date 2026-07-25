@@ -1,0 +1,22 @@
+{
+  "data": [
+    {
+      "starting_at": "2025-08-01T00:00:00Z",
+      "ending_at": "2025-08-02T00:00:00Z",
+      "results": [
+        { "amount": "123.78912", "currency": "USD", "cost_type": "tokens", "context_window": "0-200k", "description": "uncached input", "inference_geo": "global", "model": "claude-fable-5", "service_tier": "standard", "token_type": "uncached_input_tokens", "workspace_id": "wrkspc_fake01" },
+        { "amount": "1000", "currency": "USD", "cost_type": "tokens", "context_window": "0-200k", "description": "output", "inference_geo": "global", "model": "claude-opus-5", "service_tier": "standard", "token_type": "output_tokens", "workspace_id": "wrkspc_fake01" }
+      ]
+    },
+    {
+      "starting_at": "2025-08-02T00:00:00Z",
+      "ending_at": "2025-08-03T00:00:00Z",
+      "results": [
+        { "amount": "0.5", "currency": "USD", "cost_type": "tokens", "context_window": "0-200k", "description": "cache read", "inference_geo": "global", "model": "claude-haiku-4-5", "service_tier": "standard", "token_type": "cache_read_input_tokens", "workspace_id": "wrkspc_fake02" },
+        { "amount": "7.25", "currency": "USD", "cost_type": "tokens", "context_window": "0-200k", "description": "cache write", "inference_geo": "global", "model": "claude-haiku-4-5", "service_tier": "standard", "token_type": "cache_creation_input_tokens", "workspace_id": "wrkspc_fake02" }
+      ]
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}

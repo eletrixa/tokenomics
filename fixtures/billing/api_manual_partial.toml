@@ -1,0 +1,29 @@
+# Fixture for spec 024 §C — per-row degradation. Two clean rows (anthropic-api, gemini-api)
+# survive alongside two malformed rows: a bad `figure` string (moonshot-api) and a missing
+# `as_of` (openai-api). All ids are fake; no PII.
+[[api_manual]]
+id = "anthropic-api"
+figure = "balance"
+amount = 40.12
+currency = "USD"
+as_of = "2026-07-20"
+
+[[api_manual]]
+id = "moonshot-api"
+figure = "bogus"
+amount = 5.00
+currency = "USD"
+as_of = "2026-07-21"
+
+[[api_manual]]
+id = "openai-api"
+figure = "owed"
+amount = 9.99
+currency = "USD"
+
+[[api_manual]]
+id = "gemini-api"
+figure = "mtd_spend"
+amount = 1.23
+currency = "USD"
+as_of = "2026-07-22"

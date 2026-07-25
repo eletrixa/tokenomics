@@ -358,6 +358,7 @@ mod tests {
         Config {
             settings: Settings::default(),
             accounts,
+            api: Vec::new(),
         }
     }
 

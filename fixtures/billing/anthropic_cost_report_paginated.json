@@ -1,0 +1,13 @@
+{
+  "data": [
+    {
+      "starting_at": "2025-08-01T00:00:00Z",
+      "ending_at": "2025-08-02T00:00:00Z",
+      "results": [
+        { "amount": "100", "currency": "USD", "cost_type": "tokens", "context_window": "0-200k", "description": "tokens", "inference_geo": "global", "model": "claude-fable-5", "service_tier": "standard", "token_type": "input_tokens", "workspace_id": "wrkspc_fake01" }
+      ]
+    }
+  ],
+  "has_more": true,
+  "next_page": "page_faketoken"
+}

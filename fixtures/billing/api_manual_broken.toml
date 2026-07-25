@@ -1,0 +1,7 @@
+# Fixture for spec 024 §C — whole-file failure. `[[api_manual` is missing its closing `]]`, so the
+# document is not valid TOML: parse() returns Err, and the loader keeps its last-good rows and
+# marks the plane Stale (ledger discipline). All ids are fake; no PII.
+[[api_manual
+id = "anthropic-api"
+figure = "balance"
+amount = 40.12

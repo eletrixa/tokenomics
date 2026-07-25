@@ -1,0 +1,25 @@
+# Fixture for spec 024 §C — the manual API-billing lane. Three valid rows covering every figure
+# kind (balance / mtd_spend / owed) and two currencies (USD + EUR). All ids are fake; no email or
+# account-name field appears anywhere (the PII gate).
+[[api_manual]]
+id = "anthropic-api"
+figure = "balance"
+amount = 40.12
+currency = "USD"
+as_of = "2026-07-20"
+notes = "console credit"
+
+[[api_manual]]
+id = "openai-api"
+figure = "mtd_spend"
+amount = 12.50
+currency = "USD"
+as_of = "2026-07-21"
+
+[[api_manual]]
+id = "moonshot-api"
+figure = "owed"
+amount = 8.88
+currency = "EUR"
+as_of = "2026-07-22"
+notes = "euro invoice"
