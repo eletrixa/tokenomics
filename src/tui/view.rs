@@ -550,118 +550,158 @@ const API_CHROME_FLOOR: u16 = 6;
 fn api_block_height(api: Option<&ApiView>) -> u16 {
     let rows = api.map_or(0, |view| view.rows.len());
     if rows == 0 {
-        2
+        3 // border + the unconfigured line
     } else {
-        1 + u16::try_from(rows).unwrap_or(u16::MAX)
+        3 + u16::try_from(rows).unwrap_or(u16::MAX) // border + column-header line + rows
     }
 }
 
-/// The API billing overview section (spec 025 §B, `o` to toggle): a header line, then one dense
-/// line per `[[api]]` row (config order, then trailing divergent manual-only ids) — 2-space indent,
-/// name left-justified 10, then its figure/provenance segments dropped from the right via
-/// [`fit_segments`]. When there's no data yet (`app.api` is `None` or carries no rows), it's just
-/// the header plus a dim pointer at `tokenomics.toml`.
-fn render_api(f: &mut Frame<'_>, app: &App, area: Rect) {
-    const SEP: &str = " · ";
-    const NAME_W: usize = 10;
-    /// Below this width the aligned money column costs more than it reads — fall back to flow.
-    const ALIGN_MIN_W: u16 = 70;
+/// The API billing overview section (spec 025 §B, `o` to toggle): a bordered table — magenta
+/// frame + `api · real $` title, a dim column-header line, then one row per `[[api]]` entry
+/// (config order, then trailing divergent manual-only ids). Money columns are DYNAMIC: only the
+/// figure kinds present anywhere on the board get a column (amounts right-aligned, bold; absent
+/// cells a dim `—`), so the table never pads itself with empty columns. Provenance notes flow in
+/// the trailing `source` column via the shared `fit_segments` drop-from-right mechanism; state
+/// rows (dormant / awaiting) span the money columns with their text. Pure layout — no data logic.
+const API_SEP: &str = " · ";
+const API_NAME_W: usize = 10;
+const API_COL_GAP: usize = 2;
+const API_FIG_LABELS: [&str; 3] = ["bal", "owed", "mtd"];
 
+/// One api table row split for layout: money cells by kind column + flowing note segments.
+struct ApiTableRow<'a> {
+    name: &'a str,
+    cells: [Option<&'a str>; 3],
+    notes: Vec<(String, Style)>,
+}
+
+/// Split every model row into money cells (keyed by the stable `bal`/`owed`/`mtd` labels the
+/// model emits) and note segments; unrecognized figure labels degrade to notes, never vanish.
+fn api_table_rows(rows: &[ApiRowView]) -> Vec<ApiTableRow<'_>> {
+    rows.iter()
+        .map(|row| {
+            let mut cells: [Option<&str>; 3] = [None, None, None];
+            let mut notes = Vec::new();
+            for seg in &row.segments {
+                let money_cell = (seg.kind == ApiSegmentKind::Figure)
+                    .then(|| seg.text.split_once(' '))
+                    .flatten()
+                    .and_then(|(label, amount)| {
+                        API_FIG_LABELS
+                            .iter()
+                            .position(|l| *l == label)
+                            .map(|i| (i, amount))
+                    });
+                match money_cell {
+                    Some((i, amount)) => cells[i] = Some(amount),
+                    None => notes.push((seg.text.clone(), Style::new().fg(seg.color))),
+                }
+            }
+            ApiTableRow {
+                name: &row.name,
+                cells,
+                notes,
+            }
+        })
+        .collect()
+}
+
+/// Per-kind column widths — 0 (no column) when no row on the board carries that figure.
+fn api_col_widths(parsed: &[ApiTableRow<'_>]) -> [usize; 3] {
+    std::array::from_fn(|i| {
+        parsed
+            .iter()
+            .filter_map(|r| r.cells[i])
+            .map(|a| a.chars().count())
+            .max()
+            .map_or(0, |w| w.max(API_FIG_LABELS[i].len()))
+    })
+}
+
+/// The dim column-header line: `provider` + each present figure label + `source`.
+fn api_header_line(col_w: &[usize; 3]) -> String {
+    let mut header = format!(" {} ", ljust("provider", API_NAME_W));
+    for (i, w) in col_w.iter().enumerate() {
+        if *w > 0 {
+            header.push_str(&" ".repeat(API_COL_GAP));
+            let label = format!("{:>w$}", API_FIG_LABELS[i], w = w);
+            header.push_str(&label);
+        }
+    }
+    header.push_str(&" ".repeat(API_COL_GAP));
+    header.push_str("source");
+    header
+}
+
+fn render_api(f: &mut Frame<'_>, app: &App, area: Rect) {
     let accent = resolve_color(app.use_color, Color::Magenta);
     let dim = Style::new().fg(resolve_color(app.use_color, Color::DarkGray));
     let mut money = Style::new().fg(resolve_color(app.use_color, Color::White));
+    let mut title_api = Style::new().fg(accent);
     if app.use_color {
         money = money.add_modifier(Modifier::BOLD);
+        title_api = title_api.add_modifier(Modifier::BOLD);
     }
-    let gutter = || Span::styled("▎ ", Style::new().fg(accent));
 
-    let mut header_api = Style::new().fg(accent);
-    if app.use_color {
-        header_api = header_api.add_modifier(Modifier::BOLD);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(accent))
+        .title(Line::from(vec![
+            Span::styled(" api ", title_api),
+            Span::styled("· real $ — never notional ", dim),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return; // the frame alone reads at extreme squeeze
     }
-    let header = Line::from(vec![
-        gutter(),
-        Span::styled("api", header_api),
-        Span::styled(" · real $ — never notional", dim),
-    ]);
 
-    let mut lines = vec![header];
     let rows: &[ApiRowView] = app.api.as_ref().map_or(&[], |view| view.rows.as_slice());
     if rows.is_empty() {
-        lines.push(Line::from(vec![
-            gutter(),
-            Span::styled(
-                "not configured — see tokenomics.toml [api] (tok doctor explains)",
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " not configured — see tokenomics.toml [api] (tok doctor explains)",
                 dim,
-            ),
-        ]));
-        f.render_widget(Paragraph::new(lines), area);
+            ))),
+            inner,
+        );
         return;
     }
 
-    // Aligned mode: the leading money cell of every row shares one column — a dim 4-char kind
-    // label, then the amount right-aligned to the widest amount on the board — so figures scan
-    // vertically like a statement. Rows whose first segment isn't money (states) flow as text.
-    let amount_w = if area.width >= ALIGN_MIN_W {
-        rows.iter()
-            .filter_map(|row| row.segments.first())
-            .filter(|seg| seg.kind == ApiSegmentKind::Figure)
-            .filter_map(|seg| seg.text.split_once(' '))
-            .map(|(_, amount)| amount.chars().count())
-            .max()
-    } else {
-        None
-    };
+    let parsed = api_table_rows(rows);
+    let col_w = api_col_widths(&parsed);
+    let mut lines = vec![Line::from(Span::styled(api_header_line(&col_w), dim))];
 
-    let width = usize::from(area.width);
-    for row in rows {
-        let mut spans = vec![
-            gutter(),
-            Span::raw(format!("{} ", ljust(&row.name, NAME_W))),
-        ];
-        let mut used = 2 + NAME_W + 1;
-        let mut rest = row.segments.as_slice();
+    let width = usize::from(inner.width);
+    for row in &parsed {
+        let mut spans = vec![Span::raw(format!(" {} ", ljust(row.name, API_NAME_W)))];
+        let mut used = API_NAME_W + 2;
+        let money_cols = col_w.iter().any(|w| *w > 0);
+        let is_state = row.cells.iter().all(Option::is_none) && row.notes.len() == 1;
 
-        if let (Some(col_w), Some(first)) = (amount_w, row.segments.first()) {
-            if first.kind == ApiSegmentKind::Figure {
-                if let Some((label, amount)) = first.text.split_once(' ') {
-                    let cell = format!("{} {:>col_w$}", ljust(label, 4), amount, col_w = col_w);
-                    used += cell.chars().count();
-                    let (label_part, amount_part) =
-                        cell.split_at(cell.char_indices().nth(5).map_or(cell.len(), |(i, _)| i));
-                    spans.push(Span::styled(label_part.to_string(), dim));
-                    spans.push(Span::styled(amount_part.to_string(), money));
-                    rest = &row.segments[1..];
+        if money_cols && !is_state {
+            for (i, w) in col_w.iter().enumerate() {
+                if *w == 0 {
+                    continue;
                 }
+                spans.push(Span::raw(" ".repeat(API_COL_GAP)));
+                match row.cells[i] {
+                    Some(amount) => {
+                        spans.push(Span::styled(format!("{amount:>w$}"), money));
+                    }
+                    None => spans.push(Span::styled(format!("{:>w$}", "—"), dim)),
+                }
+                used += API_COL_GAP + w;
             }
         }
 
-        let avail = width.saturating_sub(
-            used + if rest.len() < row.segments.len() {
-                2
-            } else {
-                0
-            },
-        );
-        let segments: Vec<(String, Style)> = rest
-            .iter()
-            .map(|seg| {
-                let style = if seg.kind == ApiSegmentKind::Figure {
-                    money
-                } else {
-                    Style::new().fg(seg.color)
-                };
-                (seg.text.clone(), style)
-            })
-            .collect();
-        let (seg_spans, _) = fit_segments(segments, avail, SEP, dim);
-        if rest.len() < row.segments.len() && !seg_spans.is_empty() {
-            spans.push(Span::styled("  ", dim));
-        }
+        spans.push(Span::raw(" ".repeat(API_COL_GAP)));
+        used += API_COL_GAP;
+        let (seg_spans, _) =
+            fit_segments(row.notes.clone(), width.saturating_sub(used), API_SEP, dim);
         spans.extend(seg_spans);
         lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// A gauge row without a leading spine: `"5h <bar> <label>"`, or `"5h <fallback>"`. `tight` swaps the

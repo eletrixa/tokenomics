@@ -28,15 +28,14 @@ visible, not implied.
 
 ### B. Row grammar + states
 
-- Header: `api · real $ — never notional` (`api` bold magenta — an accent no other plane
-  uses; rest dim). Every api line carries a magenta `▎ ` gutter so the section reads as board
-  chrome, not a log (amended 2026-07-26, design pass).
-- Row: gutter, `label` left-justified 10, then segments. At ≥70 cols the leading money cell of
-  every row shares one aligned column — dim 4-char kind label, amount right-aligned to the
-  board's widest amount, rendered bold white so figures scan vertically like a statement.
-  Remaining segments (extra figures, notes) flow after via the shared `fit_segments`
-  drop-from-right mechanism (a segment renders whole or not at all); below 70 cols the whole
-  row flows unaligned.
+- The section is a bordered TABLE (amended 2026-07-26, second design pass, user-requested):
+  magenta frame matching the account panels, border title `api · real $ — never notional`
+  (`api` bold magenta), then a dim column-header line `provider  <figure cols>  source` and one
+  row per entry. Money columns are DYNAMIC — a figure kind gets a column only when some row
+  carries it; amounts right-aligned bold white, absent cells a dim `—`. Provenance notes flow
+  in the `source` column via the shared `fit_segments` drop-from-right mechanism (a segment
+  renders whole or not at all). State rows (dormant / awaiting / waiting) span the money
+  columns with their text. Block height = rows + 3 (border + column header).
 - Segment order: `bal $X.XX` → `owed €X.XX` → `mtd $X.XX` → provenance notes. Real figures are
   ALWAYS 2 decimals + currency glyph — a grammar disjoint from the notional proxy's, and real
   figures render only inside this section (the three-cue dogma: header text, grammar, locality).
