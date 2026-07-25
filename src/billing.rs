@@ -197,7 +197,17 @@ fn round_half_even_micro(micro: i128) -> i128 {
 /// Returns `None` on: empty input; a sign other than exactly one leading `'-'`; non-digits; more
 /// than one `'.'`; a fractional part longer than 6 digits (cannot be exact at 1e-6 scale); or
 /// overflow of `i64` cents. Accepts `"0"`, `"123"`, `"123.45"`, `"-0.5"`, `"123.78912"` (→ 124).
+/// Single-string convenience form of the cents lane — runtime callers accumulate micro-cents and
+/// round once per figure instead, so this survives only as the contract-table test surface.
+#[cfg(test)]
 pub fn parse_cents_decimal(s: &str) -> Option<i64> {
+    round_micro_to_cents(parse_cents_micro_inner(s, false)?)
+}
+
+/// Shared exact-decimal core: digits → signed micro-cents. `shift_dollars` moves the decimal
+/// point two places right first (a DOLLARS string becomes cents) and switches the >6-fraction
+/// policy from reject to truncate-after-zero-trim (see [`parse_dollars_decimal_micro`]).
+fn parse_cents_micro_inner(s: &str, shift_dollars: bool) -> Option<i128> {
     if s.is_empty() {
         return None;
     }
@@ -229,6 +239,21 @@ pub fn parse_cents_decimal(s: &str) -> Option<i64> {
         return None; // non-digit: other signs, whitespace, unicode digits, etc.
     }
 
+    // Dollars → cents: move the point two places right at the string level (exact) BEFORE any
+    // numeric parse, so both the integer and fractional lanes see cents-denominated digits.
+    let (int_owned, frac_owned);
+    let (int_str, frac_str) = if shift_dollars {
+        let mut frac_padded = frac_str.to_string();
+        while frac_padded.len() < 2 {
+            frac_padded.push('0');
+        }
+        int_owned = format!("{int_str}{}", &frac_padded[..2]);
+        frac_owned = frac_padded[2..].to_string();
+        (int_owned.as_str(), frac_owned.as_str())
+    } else {
+        (int_str, frac_str)
+    };
+
     // Integer part → cents (i128). Astronomically long inputs overflow i128 here → None.
     let int_cents: i128 = if int_str.is_empty() {
         0
@@ -236,10 +261,18 @@ pub fn parse_cents_decimal(s: &str) -> Option<i64> {
         int_str.parse().ok()?
     };
 
-    // Fractional part → micro-cents at scale 1e-6. More than 6 digits can't be exact → None.
-    if frac_str.len() > 6 {
+    // Fractional part → micro-cents at scale 1e-6.
+    let frac_str = if shift_dollars {
+        // Dollars lane: trim trailing zeros, then truncate anything beyond micro-cent precision
+        // (≤ 1e-6 cent per result — beyond any billing wire's real precision).
+        let trimmed = frac_str.trim_end_matches('0');
+        &trimmed[..trimmed.len().min(6)]
+    } else if frac_str.len() > 6 {
+        // Cents lane (spec 024 §A): more than 6 fractional digits can't be exact → reject.
         return None;
-    }
+    } else {
+        frac_str
+    };
     let frac_micro: i128 = if frac_str.is_empty() {
         0
     } else {
@@ -251,9 +284,42 @@ pub fn parse_cents_decimal(s: &str) -> Option<i64> {
         .checked_mul(MICRO_PER_CENT)?
         .checked_add(frac_micro)?;
 
-    // Round half-even on the magnitude, then reapply the sign (matches ties-to-even on negatives).
-    let cents = round_half_even_micro(total_micro);
-    let cents = if neg { -cents } else { cents };
+    Some(if neg { -total_micro } else { total_micro })
+}
+
+/// Exact micro-cents (scale 1e-6 of a cent) for a decimal string ALREADY IN CENTS — the
+/// accumulation form of [`parse_cents_decimal`]: sum these across a page/figure and round ONCE
+/// via [`round_micro_to_cents`] (spec 024 §A: one rounding per figure, never per wire string).
+pub fn parse_cents_decimal_micro(s: &str) -> Option<i128> {
+    parse_cents_micro_inner(s, false)
+}
+
+/// Exact micro-cents for a decimal string in DOLLARS (the live OpenAI wire sends
+/// `amount.value` as a high-precision decimal string — verified 2026-07-25, docs said number).
+/// The point is shifted two places (dollars → cents); fractional digits beyond micro-cent
+/// precision are TRUNCATED after a trailing-zero trim (≤ 1e-6 cent per result — beyond any
+/// billing wire's real precision), never rejected.
+pub fn parse_dollars_decimal_micro(s: &str) -> Option<i128> {
+    parse_cents_micro_inner(s, true)
+}
+
+/// Exact-enough micro-cents for an f64 DOLLARS value (the documented OpenAI number shape,
+/// Moonshot balances, TOML floats): dollars × 1e8, ties-even. Precision is bounded by the f64
+/// wire itself. `None` on non-finite or out-of-range input.
+pub fn dollars_f64_to_micro(v: f64) -> Option<i128> {
+    if !v.is_finite() || v.abs() > MAX_ABS_DOLLARS {
+        return None;
+    }
+    // In-range f64 → i128 via `as` is exact for the rounded value (the bound keeps it well inside
+    // i128); float-to-int `as` saturates rather than wraps in any case.
+    #[allow(clippy::cast_possible_truncation)]
+    Some((v * 100_000_000.0).round_ties_even() as i128)
+}
+
+/// Round exact micro-cents to whole `i64` cents, half-even on the magnitude.
+pub fn round_micro_to_cents(micro: i128) -> Option<i64> {
+    let cents = round_half_even_micro(micro.unsigned_abs().try_into().ok()?);
+    let cents = if micro < 0 { -cents } else { cents };
     i64::try_from(cents).ok()
 }
 

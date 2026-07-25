@@ -1152,11 +1152,21 @@ fn api_empty_state_segment(
     let dim = resolve_color(use_color, Color::DarkGray);
     match account.provider {
         ApiProvider::Gemini => ApiSegment {
-            text: "manual entries expected — api.toml".to_string(),
+            text: "manual entries expected — see api_manual_path".to_string(),
             color: dim,
         },
-        // Pollable providers + xai: key present → waiting; key absent → dormant (env name).
-        ApiProvider::Anthropic | ApiProvider::OpenAi | ApiProvider::Moonshot | ApiProvider::Xai => {
+        // Xai has NO live fetcher this wave (spec 024 §B): a present key still never produces a
+        // poll, so "waiting for collector" would be a promise the collector cannot keep — xai is
+        // ALWAYS dormant until the follow-up spec ships its fetcher.
+        ApiProvider::Xai => ApiSegment {
+            text: match account.api_key_env.as_deref() {
+                Some(env) if !key_present(env) => format!("dormant ({env} unset)"),
+                _ => "dormant (no live fetcher yet)".to_string(),
+            },
+            color: dim,
+        },
+        // Pollable providers: key present → waiting; key absent → dormant (env name).
+        ApiProvider::Anthropic | ApiProvider::OpenAi | ApiProvider::Moonshot => {
             match account.api_key_env.as_deref() {
                 Some(env) if key_present(env) => ApiSegment {
                     text: "waiting for collector".to_string(),
@@ -1171,6 +1181,19 @@ fn api_empty_state_segment(
                     color: dim,
                 },
             }
+        }
+    }
+}
+
+/// Append the file-degradation marker to every MANUAL provenance note in a row: the plain word
+/// (`· file stale`) plus the warn colour — never colour alone (spec 025 §B). Live notes are
+/// untouched (the store is a different plane and its freshness rides its own age).
+fn mark_manual_segments_degraded(segments: &mut [ApiSegment], use_color: bool) {
+    let warn = resolve_color(use_color, Color::Yellow);
+    for seg in segments.iter_mut() {
+        if seg.text.contains("manual ") && !seg.text.ends_with("· file stale") {
+            seg.text.push_str(" · file stale");
+            seg.color = warn;
         }
     }
 }
@@ -1255,42 +1278,42 @@ fn api_figure_and_prov_segments(
     }
 
     if has_manual {
-        let manual_kinds: Vec<ApiFigureKind> = API_FIGURE_ORDER
-            .into_iter()
-            .filter(|&k| {
-                slots[api_figure_index(k)]
-                    .as_ref()
-                    .is_some_and(|s| matches!(s.source, ApiFigSource::Manual { .. }))
-            })
-            .collect();
-        // Oldest as_of for the date text; any stale ⇒ yellow + ` · stale`.
-        let as_ofs: Vec<&str> = slots
-            .iter()
-            .flatten()
-            .filter_map(|s| match &s.source {
-                ApiFigSource::Manual { as_of } => Some(as_of.as_str()),
-                ApiFigSource::Live { .. } => None,
-            })
-            .collect();
-        // `has_manual` guarantees a non-empty as_ofs.
-        let as_of = as_ofs.iter().min().copied().unwrap_or("");
-        let stale = as_ofs.iter().any(|a| row_is_stale(a, today));
-        let base = if mixed {
-            let kinds = manual_kinds
-                .iter()
-                .map(|k| api_figure_short(*k))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{kinds} manual {as_of}")
-        } else {
-            format!("manual {as_of}")
-        };
-        let (text, color) = if stale {
-            (format!("{base} · stale"), warn)
-        } else {
-            (base, dim)
-        };
-        segments.push(ApiSegment { text, color });
+        // Group manual figures by their as_of date: figures entered on different dates keep their
+        // own date AND their own staleness — a fresh balance must never inherit a stale owed
+        // figure's marker (nor mask it) by being collapsed into one note.
+        let mut groups: Vec<(&str, Vec<ApiFigureKind>)> = Vec::new();
+        for kind in API_FIGURE_ORDER {
+            if let Some(slot) = slots[api_figure_index(kind)].as_ref() {
+                if let ApiFigSource::Manual { as_of } = &slot.source {
+                    match groups.iter_mut().find(|(a, _)| a == as_of) {
+                        Some((_, kinds)) => kinds.push(kind),
+                        None => groups.push((as_of.as_str(), vec![kind])),
+                    }
+                }
+            }
+        }
+        let multi = groups.len() > 1;
+        for (as_of, kinds) in groups {
+            let stale = row_is_stale(as_of, today);
+            // Kind prefixes appear whenever the plain word would be ambiguous: live notes on the
+            // same row, or several manual dates side by side.
+            let base = if mixed || multi {
+                let kinds = kinds
+                    .iter()
+                    .map(|k| api_figure_short(*k))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{kinds} manual {as_of}")
+            } else {
+                format!("manual {as_of}")
+            };
+            let (text, color) = if stale {
+                (format!("{base} · stale"), warn)
+            } else {
+                (base, dim)
+            };
+            segments.push(ApiSegment { text, color });
+        }
     }
 
     segments
@@ -1306,9 +1329,23 @@ pub fn build_api_view(data: &ApiData<'_>, now: Timestamp, use_color: bool) -> Ap
     let today = now.to_zoned(jiff::tz::TimeZone::UTC).date();
     let mut rows = Vec::new();
 
+    // A degraded manual FILE (mid-edit parse failure ⇒ Stale, path vanished ⇒ Missing) must be
+    // visible on every retained manual figure — last-good values rendering exactly like a clean
+    // read would be a silent lie (spec 024 §C provenance-per-read, codex/structural review).
+    let file_degraded = matches!(
+        data.manual_provenance,
+        ApiManualProvenance::Stale | ApiManualProvenance::Missing
+    );
+
     for account in data.accounts {
+        if !account.active {
+            // An inactive [[api]] entry is unmonitored everywhere else (collector skip, doctor
+            // skip) — rendering it as `waiting for collector` would promise a poll that never
+            // comes (the same honesty rule as the xai dormant state).
+            continue;
+        }
         let slots = merge_api_figures(&account.id, data.live, data.manual);
-        let segments = if api_slots_any(&slots) {
+        let mut segments = if api_slots_any(&slots) {
             api_figure_and_prov_segments(&slots, now, today, use_color, data.poll_billing_secs)
         } else {
             vec![api_empty_state_segment(
@@ -1317,6 +1354,9 @@ pub fn build_api_view(data: &ApiData<'_>, now: Timestamp, use_color: bool) -> Ap
                 use_color,
             )]
         };
+        if file_degraded {
+            mark_manual_segments_degraded(&mut segments, use_color);
+        }
         rows.push(ApiRowView {
             name: account.display_label().to_string(),
             segments,
@@ -1333,8 +1373,11 @@ pub fn build_api_view(data: &ApiData<'_>, now: Timestamp, use_color: bool) -> Ap
         seen_divergent.push(row.id.clone());
         let slots = merge_api_figures(&row.id, data.live, data.manual);
         // Divergent rows exist because of manual money; always have at least that figure.
-        let segments =
+        let mut segments =
             api_figure_and_prov_segments(&slots, now, today, use_color, data.poll_billing_secs);
+        if file_degraded {
+            mark_manual_segments_degraded(&mut segments, use_color);
+        }
         rows.push(ApiRowView {
             name: row.id.clone(),
             segments,
@@ -3128,6 +3171,95 @@ mod tests {
     }
 
     #[test]
+    fn api_view_manual_figures_keep_per_as_of_dates_and_staleness() {
+        // Two manual figures entered on different dates must NOT collapse into one note: the
+        // 36-day-old owed figure is stale, the fresh balance is not (codex review finding).
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
+        let manual = [
+            manual_row("gem", ApiFigureKind::Balance, 1200, "USD", "2026-07-18"),
+            manual_row("gem", ApiFigureKind::Owed, 2000, "EUR", "2026-06-01"),
+        ];
+        let present = |_: &str| false;
+        let view = build_api_view(&api_data(&accounts, &[], &manual, &present, 300), now, true);
+        let texts: Vec<&str> = view.rows[0]
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "bal $12.00",
+                "owed €20.00",
+                "bal manual 2026-07-18",
+                "owed manual 2026-06-01 · stale",
+            ],
+            "each as_of group carries its own date and its own staleness"
+        );
+    }
+
+    #[test]
+    fn api_view_xai_is_dormant_even_with_its_key_present() {
+        // Xai has no live fetcher this wave: "waiting for collector" would be a promise the
+        // collector cannot keep (codex review finding).
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct(
+            "xai",
+            ApiProvider::Xai,
+            Some("XAI_MANAGEMENT_KEY"),
+        )];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(
+            view.rows[0].segments[0].text,
+            "dormant (no live fetcher yet)"
+        );
+    }
+
+    #[test]
+    fn api_view_skips_inactive_entries() {
+        // Inactive [[api]] entries are unmonitored everywhere (collector, doctor) — rendering
+        // one as `waiting for collector` would promise a poll that never comes.
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let mut inactive = api_acct("oai", ApiProvider::OpenAi, Some("PRESENT"));
+        inactive.active = false;
+        let accounts = [
+            inactive,
+            api_acct("moon", ApiProvider::Moonshot, Some("PRESENT")),
+        ];
+        let present = |_: &str| true;
+        let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
+        assert_eq!(view.rows.len(), 1, "only the active entry renders");
+        assert_eq!(view.rows[0].name, "moon");
+    }
+
+    #[test]
+    fn api_view_marks_manual_figures_when_the_file_is_degraded() {
+        // A Stale/Missing manual file must be visible on retained manual figures — last-good
+        // values rendering like a clean read would be a silent lie (spec 024 §C).
+        let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
+        let accounts = [api_acct("gem", ApiProvider::Gemini, None)];
+        let manual = [manual_row(
+            "gem",
+            ApiFigureKind::Owed,
+            2000,
+            "EUR",
+            "2026-07-18",
+        )];
+        let present = |_: &str| false;
+        let mut data = api_data(&accounts, &[], &manual, &present, 300);
+        data.manual_provenance = ApiManualProvenance::Stale;
+        let view = build_api_view(&data, now, true);
+        let texts: Vec<&str> = view.rows[0]
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["owed €20.00", "manual 2026-07-18 · file stale"]);
+    }
+
+    #[test]
     fn api_view_waiting_for_collector_when_key_present() {
         let now: Timestamp = "2026-07-20T12:00:00Z".parse().unwrap();
         let accounts = [api_acct(
@@ -3167,7 +3299,7 @@ mod tests {
         let view = build_api_view(&api_data(&accounts, &[], &[], &present, 300), now, true);
         assert_eq!(
             view.rows[0].segments[0].text,
-            "manual entries expected — api.toml"
+            "manual entries expected — see api_manual_path"
         );
         assert_eq!(view.rows[0].segments[0].color, Color::DarkGray);
     }

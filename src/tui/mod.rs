@@ -357,7 +357,7 @@ fn read_rows(
     // env-key presence probe is the one place this module touches `std::env` for it; `build_api_view`
     // itself stays pure.
     let api = api_plane_configured(&cfg.api, manual_rows).then(|| {
-        let key_present = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty());
+        let key_present = |name: &str| std::env::var(name).is_ok_and(|v| !v.trim().is_empty());
         build_api_view(
             &ApiData {
                 accounts: &cfg.api,

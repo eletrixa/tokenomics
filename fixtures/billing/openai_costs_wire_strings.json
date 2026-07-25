@@ -1,0 +1,40 @@
+{
+  "object": "page",
+  "data": [
+    {
+      "object": "bucket",
+      "start_time": 1751328000,
+      "end_time": 1751414400,
+      "results": [
+        {
+          "object": "organization.costs.result",
+          "amount": { "value": "15.78762621000000000000000000", "currency": "usd" },
+          "line_item": null,
+          "project_id": "proj_fake123",
+          "organization_id": "org-fake123",
+          "api_key_id": null,
+          "user_id": null,
+          "user_email": null,
+          "project_name": "fake-project",
+          "organization_name": "fake-org",
+          "quantity": "1"
+        },
+        {
+          "object": "organization.costs.result",
+          "amount": { "value": "0.00000009", "currency": "usd" },
+          "line_item": null,
+          "project_id": "proj_fake456",
+          "organization_id": "org-fake123",
+          "api_key_id": null,
+          "user_id": null,
+          "user_email": null,
+          "project_name": "fake-project-2",
+          "organization_name": "fake-org",
+          "quantity": "2"
+        }
+      ]
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}

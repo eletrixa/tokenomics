@@ -569,7 +569,18 @@ fn api_live_and_dormant_lines(
             continue; // an inactive [[api]] entry is unmonitored, never fetched (spec 024 §A)
         }
         let Some(figure) = pollable_figure(entry.provider) else {
-            continue; // gemini/xai: no live fetcher in this spec
+            // Gemini is manual-only (nothing to poll, nothing dormant). Xai is config-accepted
+            // with NO live fetcher this wave (spec 024 §B) — always dormant, and doctor must say
+            // so rather than omit it (an entry that silently vanishes reads as healthy).
+            if matches!(entry.provider, ApiProvider::Xai) {
+                dormant.push(match entry.api_key_env.as_deref() {
+                    Some(name) if !key_present(name) => {
+                        format!("  api dormant: {} ({name} unset)", entry.id)
+                    }
+                    _ => format!("  api dormant: {} (no live fetcher yet)", entry.id),
+                });
+            }
+            continue;
         };
         let Some(env_name) = entry.api_key_env.as_deref() else {
             // Validation (spec 024 §A) requires api_key_env for pollable providers; report, no panic.
@@ -634,11 +645,12 @@ fn read_api_billing_rows() -> Vec<ApiBillingRow> {
 }
 
 /// Production env-presence lookup for the dormant check (the VALUE is never read, never printed): true
-/// when `name` is set to a non-empty value, matching `resolve_api_key`'s empty-is-unset semantics.
-/// Passed as the injectable `key_present` so [`api_live_and_dormant_lines`] is testable without the
-/// real environment.
+/// when `name` is set to a non-whitespace value, matching `resolve_api_key`'s trim-then-empty-is-
+/// unset semantics (a whitespace-only value must read as dormant here exactly as the collector
+/// treats it). Passed as the injectable `key_present` so [`api_live_and_dormant_lines`] is
+/// testable without the real environment.
 fn env_var_present(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.is_empty())
+    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
 /// Codex diagnostics for one account (read-only): `sessions/` present, `auth.json` present
@@ -1512,8 +1524,8 @@ mod tests {
     #[test]
     fn api_live_and_dormant_lines_split_pollable_entries_by_injected_env_presence() {
         // Env presence is an INJECTED lookup (never the real env): "PRESENT" resolves, anything else
-        // doesn't. Covers live+polled, live+never-polled, dormant, gemini/xai skipped, inactive
-        // skipped.
+        // doesn't. Covers live+polled, live+never-polled, dormant, gemini skipped, xai always
+        // dormant (no live fetcher this wave), inactive skipped.
         let now_ms = 1_000_000_000_000_i64;
         let entries = vec![
             api_entry(
@@ -1551,7 +1563,10 @@ mod tests {
         );
         assert_eq!(
             dormant,
-            vec!["  api dormant: moonshot-payg (ABSENT unset)"],
+            vec![
+                "  api dormant: moonshot-payg (ABSENT unset)",
+                "  api dormant: xai-mgmt (XAI_KEY unset)",
+            ],
             "dormant: {dormant:?}"
         );
     }

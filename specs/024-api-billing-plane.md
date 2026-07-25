@@ -1,6 +1,6 @@
 # Spec 024 — API billing plane: real-dollar balances & month-to-date spend (fourth plane)
 
-Status: **Active**
+Status: **Done**
 
 Amends the PAYG exclusions in specs 020 §A, 021 §A and 023 §Non-goals, which ruled API-key
 setups and dollar figures out of scope. Those rulings said "wrong plane for a subscription

@@ -22,6 +22,66 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   real subprocess, so effective heavy concurrency stays well under the cap.
 
 ### ADDED
+- **Real-dollar API billing lands as a fourth data plane (spec 024) — collector-polled live
+  admin endpoints plus a manual TOML, money the subscription board (usage, % gauges, ledger
+  dates, notional cost) never touches.** A separate `ApiProvider` enum
+  (`Anthropic`/`OpenAi`/`Gemini`/`Moonshot`/`Xai`, its own strings — API accounts are not
+  `[[account]]` subscriptions) and `ApiFigureKind` (`Balance`/`Owed`/`MtdSpend`) back a new
+  `[[api]]` config array: `api_key_env` is an env-var NAME, never a value — required for
+  anthropic/openai/moonshot/xai, **rejected** for gemini (no billing endpoint to call, so it
+  is manual-only); an absent section ⇒ the plane is Off with zero behaviour change. Money is
+  cents as `i64`, each parser owning its exact wire conversion (Anthropic's decimal-string-in-
+  cents accumulated in integer micro-cents and rounded half-even once — no `f64` in the path;
+  OpenAI/Moonshot f64-dollars ×100, round half-even); `currency` is a verbatim label with no
+  conversion or cross-currency arithmetic anywhere. The live lane is one shared
+  `BillingEndpoint` seam (`HttpBillingEndpoint`, 10s/5s timeouts; 429 → `RateLimited`
+  status-only): `parse_anthropic_cost_report`/`parse_openai_costs` sum the daily buckets of a
+  UTC calendar month into one MtdSpend figure (8-page cap; a near-zero early-month total is
+  correct), `parse_moonshot_balance` reads the available balance — unusable numerics skip,
+  never a fabricated zero; nothing usable ⇒ `Err`. The collector polls on its own
+  `poll_billing_secs` cadence (default 3600, floor 300) via `spawn_billing_fetches` (key
+  resolved by the hoisted `resolve_api_key`; an unset env ⇒ skip with a logged reason and
+  **no task spawned** — the dormant state), harvests a `JoinSet`, and writes `set_api_billing`
+  — an atomic per-id replace into the new `api_billing` table (**schema v6**, migrated in
+  place), only on a successful parse so a failed poll keeps the last-good rows and ages
+  honestly. The gaps no endpoint exposes (Gemini AI-Studio, xAI without a management key,
+  console-only credit balances) are filled by a `[[api_manual]]` TOML that mirrors the ledger
+  lane 1:1 — `TOKENOMICS_API_MANUAL` > `[settings] api_manual_path` > off, provenance
+  `Fresh`/`Stale`/`Missing`, per-row errors with the rest surviving, whole-file failure keeps
+  last-good, an `as_of` older than 35 days is stale, join to `[[api]].id` exact + case-
+  sensitive, an exhaustive-destructure PII test — TUI-side only, the collector never reads
+  it, nothing lands in SQLite. **xAI ships dormant** (config-accepted, no fetcher this spec).
+  `tok doctor` gains `report_api` (presence-not-value — **never a dollar amount**): manual
+  path + provenance, per-row errors, past-stale ids, each live figure's last-poll age or
+  `never polled`, dormant env-var names, and manual ids joining no `[[api]]`. The TUI does not
+  read the new table yet (the board section is spec 025). `tok accounts` / `tok once --json`
+  stay byte-identical to the R16 goldens (golden-snapshot enforced).
+- **The API billing plane renders as a hideable overview section on the board (spec 025) — the
+  first real-money surface, default-hidden so every snapshot that came before shifts not one
+  byte.** `o` toggles `Action::ToggleApi` (`App.show_api`, default false, session-only, no
+  persistence — the `i` posture); the section drops in as one chrome block after the agg-bar,
+  height-gated like fleet/agg and silently dropped on a short terminal. Its header reads
+  `api · real $ — bills & balances, never notional` (`api` bold magenta — an accent no other
+  plane uses); each configured `[[api]]` entry is one dense line of `bal $X.XX` / `owed €X.XX`
+  / `mtd $X.XX` segments joined `·` and **dropped from the right** to fit width (a whole
+  segment or nothing — never truncated mid-figure, via a shared `fit_segments` helper, fleet
+  unchanged). Real figures are always exactly two decimals + currency glyph (`format_money`
+  in `format.rs`: `$`/`€` or `<CODE> ` prefix, negatives carry a leading `-`) — a grammar
+  disjoint from the notional proxy's `$335 (notional)`, and real figures render **only**
+  inside this section (header text, grammar, locality — the three cues). **There is no totals
+  row** — mixed currencies never sum. Each figure carries a plain-word provenance note, never
+  colour alone: `live <ago>` (yellow past 2×`poll_billing_secs`), `manual <as_of>` (`· stale`
+  past the 35-day const), `waiting for collector` (expected from the live lane, no row yet),
+  or `dormant (<env> unset)`; when a row mixes planes each note names its figure (`mtd live
+  2m ago · bal manual 2026-07-20`) so a fresh poll can't masquerade as a fresh manual figure.
+  The merge is live-wins-per-`(id, figure)`, manual-fills-gaps, with degraded live figures
+  keeping their last-good value + aging note. A manual row whose id joins no `[[api]]` still
+  renders (labelled by its id) — money you wrote down doesn't vanish; `tok doctor` names the
+  divergence. The pure `build_api_view` builder (new `ApiView`/`ApiRowView`/`ApiSegment` view
+  types) is unit-tested per state; the NO_COLOR grid with the section on is character-
+  identical to the coloured render; `?` lists `o`. `tok accounts` / `tok once --json` and
+  every pre-existing snapshot stay byte-identical (default hidden — neither CLI path is
+  touched).
 - **Kimi (Moonshot AI coding plan) is now a monitored, limits-only provider (spec 023) —
   fixture-tested and shipping dormant until a live subscription key exists (signups paused).**
   `Provider::Kimi` (`"kimi"`) round-trips config/store/display; identity is `api_key_env`

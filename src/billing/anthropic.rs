@@ -2,14 +2,14 @@
 //!
 //! Project: Tokenomics — monitor LLM subscription accounts (usage, limits, time-left) in a TUI
 //! Module:  src/billing/anthropic.rs
-//! Deps:    serde, serde_json; error (AppError/AppResult); crate::billing::parse_cents_decimal
+//! Deps:    serde, serde_json; error (AppError/AppResult); crate::billing::parse_cents_decimal_micro
 //! Tested:  inline `#[cfg(test)]` on fixtures/billing/anthropic_cost_report_{single,paginated,
 //!          empty,malformed}.json + inline-bytes cases (skip rules, cursor rules, drift guard)
 //!
 //! Key responsibilities:
-//! - `parse_cost_report` (pure): one response body → `CostPage { cents, next_page }`. Sums every
+//! - `parse_cost_report` (pure): one response body → `CostPage { micro, next_page }`. Sums every
 //!   `data[].results[]` entry whose `currency` is "USD" (case-insensitive) via
-//!   `parse_cents_decimal` (Anthropic amounts are decimal strings ALREADY in cents — no ×100),
+//!   `parse_cents_decimal_micro` exactly (Anthropic amounts are decimal strings ALREADY in cents),
 //!   and surfaces the pagination cursor.
 //!
 //! Design constraints:
@@ -23,14 +23,15 @@
 
 use serde::Deserialize;
 
-use crate::billing::parse_cents_decimal;
+use crate::billing::parse_cents_decimal_micro;
 use crate::error::{AppError, AppResult};
 
-/// Sum of one page's cost results in integer cents + the pagination cursor.
+/// Sum of one page's cost results in exact micro-cents + the pagination cursor. Micro-cents (not
+/// cents) so the caller can accumulate a whole figure across pages and round ONCE (spec 024 §A).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostPage {
-    /// The summed USD amount of the page, in integer cents (per-amount half-even rounding).
-    pub cents: i64,
+    /// The summed USD amount of the page, in exact micro-cents (scale 1e-6 of a cent, unrounded).
+    pub micro: i128,
     /// The next-page cursor, present only when `has_more == true` and the string is non-empty.
     pub next_page: Option<String>,
 }
@@ -68,7 +69,7 @@ struct CostResult {
 /// Pure: parse one Anthropic cost-report response body into the page's USD cent sum + cursor.
 ///
 /// `bytes` is one HTTP response body. Every `results[]` entry whose `currency` is "USD"
-/// (case-insensitive) is summed via [`parse_cents_decimal`]. A result with a missing/unparsable
+/// (case-insensitive) is summed exactly via [`parse_cents_decimal_micro`]. A result with a missing/unparsable
 /// amount is skipped; if the page carried ≥1 USD result and all were unusable ⇒ [`AppError::Overlay`]
 /// (schema drift must degrade, never a fabricated 0). Zero buckets / zero results ⇒ `Ok(0)` (an
 /// empty month). `next_page` is `Some` only when `has_more == true` and the cursor is non-empty.
@@ -77,7 +78,7 @@ pub fn parse_cost_report(bytes: &[u8]) -> AppResult<CostPage> {
     let response: CostReport = serde_json::from_slice(bytes)
         .map_err(|e| AppError::Overlay(format!("malformed anthropic cost report body: {e}")))?;
 
-    let mut cents: i64 = 0;
+    let mut micro: i128 = 0;
     let mut in_scope: usize = 0; // USD results seen (usable or not)
     let mut unusable: usize = 0; // USD results whose amount was missing/unparsable
     for bucket in response.data {
@@ -92,8 +93,13 @@ pub fn parse_cost_report(bytes: &[u8]) -> AppResult<CostPage> {
                 continue;
             }
             in_scope += 1;
-            match result.amount.as_deref().and_then(parse_cents_decimal) {
-                Some(c) => cents += c,
+            match result.amount.as_deref().and_then(parse_cents_decimal_micro) {
+                Some(m) => {
+                    // A page that overflows i128 micro-cents is drift, never a wrapped sum.
+                    micro = micro.checked_add(m).ok_or_else(|| {
+                        AppError::Overlay("anthropic cost report page sum overflowed".to_string())
+                    })?;
+                }
                 None => unusable += 1, // missing/unparsable amount — skipped, flagged for the guard
             }
         }
@@ -112,7 +118,7 @@ pub fn parse_cost_report(bytes: &[u8]) -> AppResult<CostPage> {
         _ => None,
     };
 
-    Ok(CostPage { cents, next_page })
+    Ok(CostPage { micro, next_page })
 }
 
 #[cfg(test)]
@@ -130,17 +136,21 @@ mod tests {
     // ── fixture matrix (spec 024 §B / AC3) ────────────────────────────────────────────────────
 
     #[test]
-    fn single_page_sums_per_string_rounded_amounts_to_1131_cents() {
-        // parse_cents_decimal rounds EACH amount to integer cents (half-even) before summing:
-        //   "123.78912" → 124    "1000" → 1000    "0.5" → 0 (half-even tie → even)    "7.25" → 7
-        //   sum = 1131. has_more false ⇒ no cursor.
+    fn single_page_sums_exact_micro_cents_unrounded() {
+        // Amounts accumulate EXACTLY in micro-cents; rounding happens once per figure at the
+        // caller (spec 024 §A): 123.78912 + 1000 + 0.5 + 7.25 = 1131.53912 cents.
         let page = parse_cost_report(SINGLE).expect("single fixture parses");
         assert_eq!(
             page,
             CostPage {
-                cents: 1131,
+                micro: 1_131_539_120,
                 next_page: None
             }
+        );
+        assert_eq!(
+            crate::billing::round_micro_to_cents(page.micro),
+            Some(1132),
+            "the figure-level rounding lands on 1132 — one exact sum, one rounding"
         );
     }
 
@@ -150,7 +160,7 @@ mod tests {
         assert_eq!(
             page,
             CostPage {
-                cents: 100,
+                micro: 100_000_000,
                 next_page: Some("page_faketoken".to_string())
             }
         );
@@ -162,7 +172,7 @@ mod tests {
         assert_eq!(
             page,
             CostPage {
-                cents: 0,
+                micro: 0,
                 next_page: None
             },
             "an empty month is a legitimate zero, never an error"
@@ -223,7 +233,7 @@ mod tests {
             {"amount":"bad","currency":"USD"}
         ]}],"has_more":false}"#;
         let page = parse_cost_report(body).expect("the good USD result survives");
-        assert_eq!(page.cents, 100);
+        assert_eq!(page.micro, 100_000_000);
         assert_eq!(page.next_page, None);
     }
 
@@ -239,7 +249,7 @@ mod tests {
         assert_eq!(
             page,
             CostPage {
-                cents: 0,
+                micro: 0,
                 next_page: None
             }
         );
@@ -253,7 +263,7 @@ mod tests {
         ]}],"has_more":false}"#;
         let page = parse_cost_report(body).expect("parses");
         assert_eq!(
-            page.cents, 1000,
+            page.micro, 1_000_000_000,
             "the EUR result must be skipped; only USD is summed"
         );
     }
@@ -268,7 +278,7 @@ mod tests {
         assert_eq!(
             page,
             CostPage {
-                cents: 0,
+                micro: 0,
                 next_page: None
             }
         );
@@ -283,7 +293,7 @@ mod tests {
         assert_eq!(
             page,
             CostPage {
-                cents: 0,
+                micro: 0,
                 next_page: None
             },
             "no currency ⇒ not USD ⇒ skipped, not an unusable-USD result"
@@ -296,7 +306,7 @@ mod tests {
             {"amount":"250","currency":"USD","model":"claude-fable-5","weird_extra_field":true,"nested":{"x":1}}
         ]}],"has_more":false,"unknown_top":42}"#;
         let page = parse_cost_report(body).expect("extras must never fail the parse");
-        assert_eq!(page.cents, 250);
+        assert_eq!(page.micro, 250_000_000);
     }
 
     // ── cursor rules: Some only when has_more && non-empty ────────────────────────────────────
@@ -306,7 +316,7 @@ mod tests {
         let body = br#"{"data":[{"results":[{"amount":"10","currency":"USD"}]}],"has_more":false,"next_page":"page_x"}"#;
         let page = parse_cost_report(body).expect("parses");
         assert_eq!(page.next_page, None, "has_more false ⇒ never a cursor");
-        assert_eq!(page.cents, 10);
+        assert_eq!(page.micro, 10_000_000);
     }
 
     #[test]
@@ -317,7 +327,7 @@ mod tests {
             page.next_page, None,
             "an empty cursor string is not a cursor"
         );
-        assert_eq!(page.cents, 10);
+        assert_eq!(page.micro, 10_000_000);
     }
 
     #[test]
@@ -328,6 +338,6 @@ mod tests {
             page.next_page, None,
             "has_more true but no cursor ⇒ None, not a fabricated token"
         );
-        assert_eq!(page.cents, 10);
+        assert_eq!(page.micro, 10_000_000);
     }
 }

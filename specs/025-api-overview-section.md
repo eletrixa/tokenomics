@@ -1,6 +1,6 @@
 # Spec 025 — API overview section: the billing plane on the board (`o` to toggle)
 
-Status: **Active**
+Status: **Done**
 
 ## Motivation
 

@@ -174,10 +174,14 @@ pub fn format_money(amount_minor: i64, currency: &str) -> String {
     let whole = abs / 100;
     let cents = abs % 100;
     let sign = if negative { "-" } else { "" };
-    match currency {
-        "USD" => format!("{sign}${whole}.{cents:02}"),
-        "EUR" => format!("{sign}€{whole}.{cents:02}"),
-        other => format!("{sign}{} {whole}.{cents:02}", other.to_uppercase()),
+    // Case-insensitive glyph match: manual rows store currency verbatim and the OpenAI wire's
+    // own casing is lowercase "usd" — the same money must never render in two grammars.
+    if currency.eq_ignore_ascii_case("USD") {
+        format!("{sign}${whole}.{cents:02}")
+    } else if currency.eq_ignore_ascii_case("EUR") {
+        format!("{sign}€{whole}.{cents:02}")
+    } else {
+        format!("{sign}{} {whole}.{cents:02}", currency.to_uppercase())
     }
 }
 

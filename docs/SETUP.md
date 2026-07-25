@@ -185,6 +185,130 @@ Both unset = the ledger plane is **off** (no clauses, no warnings). Run `tok doc
 resolved path, provenance (`fresh` / `stale` / `missing`), any past-dated rows, and any id that
 exists on one side but not the other.
 
+## API billing (PAYG) overview
+
+`tok` shows your **subscription** usage and a notional API-equivalent proxy — never a bill. But if you
+also run **pay-as-you-go API keys** (an Anthropic org, an OpenAI org, a Moonshot balance), that is
+**real money**: an actual bill or balance, tracked as a **fourth data plane** beside local usage, the
+opt-in limits overlay, and the subscription ledger. It never mixes with the notional proxy, the %
+gauges, or the subscription dates.
+
+The plane has two lanes. **Live** figures (collector-polled, one per `[[api]]` entry) come from the
+providers' own admin/billing endpoints — Anthropic's cost report summed to month-to-date spend,
+OpenAI's organization costs, Moonshot's balance. **Manual** figures (a read-through TOML, exactly like
+the ledger) fill the gaps no endpoint exposes: Gemini AI Studio, xAI without a management key,
+console-only credit balances. Neither lane appears unless you configure it — an absent `[[api]]`
+section and no manual path leave the plane silently off.
+
+Two honesty rules hold across the whole plane: real money is a **bill or a balance, never the notional
+cost proxy**, and the **% utilization gauges never become dollars** (spend-keyed alerts are out of
+scope).
+
+### Config
+
+Add one `[[api]]` block per API-key account in `tokenomics.toml`. Identity is `api_key_env` — the
+**NAME** of an env var holding the key (e.g. `ANTHROPIC_ADMIN_API_KEY`), never the key itself. Pollable
+providers (anthropic/openai/moonshot/xai) require it; **gemini is manual-only** and **rejects** it (no
+billing endpoint exists to call). `tok validate` enforces every rule.
+
+```toml
+[settings]
+poll_local_secs = 10
+poll_overlay_secs = 300
+poll_billing_secs = 3600   # how often the collector polls billing endpoints — floor 300 (default hourly)
+# api_manual_path = "~/tokenomics/api-billing.toml"   # manual figures — see "Manual figures" below
+
+# Anthropic — admin billing API; month-to-date spend summed from daily cost buckets.
+[[api]]
+id = "anthropic-org"
+label = "Anthropic Org"            # optional — defaults to id
+provider = "anthropic"
+api_key_env = "ANTHROPIC_ADMIN_API_KEY"   # NAME of the env var — never the key
+
+# OpenAI — admin billing API; month-to-date spend summed from daily cost buckets.
+[[api]]
+id = "openai-org"
+provider = "openai"
+api_key_env = "OPENAI_ADMIN_API_KEY"      # NAME of the env var — never the key
+
+# Gemini — AI Studio personal tier has no billing endpoint, so it is MANUAL-ONLY (no api_key_env);
+# its figures come from api_manual_path.
+[[api]]
+id = "gemini-studio"
+provider = "gemini"
+
+# Moonshot (Kimi) — balance endpoint; current available balance.
+[[api]]
+id = "moonshot"
+provider = "moonshot"
+api_key_env = "MOONSHOT_API_KEY"          # NAME of the env var — never the key
+
+# xAI — ships DORMANT until a management key exists: config-accepted, never fetched. The env var
+# being unset is the expected state.
+[[api]]
+id = "xai"
+provider = "xai"
+api_key_env = "XAI_API_KEY"               # NAME of the env var — never the key
+```
+
+The collector polls on `poll_billing_secs` and writes each figure into the store — a failed poll keeps
+the last-good value and ages honestly (never a stale figure dressed up as fresh). Month-to-date spend
+is the **UTC calendar month**, so a near-zero total in the first hours of a month is correct.
+
+### Manual figures
+
+For providers no endpoint exposes, keep a separate TOML of human-entered figures. It's **read-through
+and TUI-only**, exactly like the subscription ledger: `tok` never writes it, the collector never reads
+it, and nothing lands in SQLite — so it can live in a private repo. Point `tok` at it via either (env
+wins):
+
+```bash
+# tokenomics.toml, under [settings]:
+api_manual_path = "~/tokenomics/api-billing.toml"
+
+# or an env override (beats api_manual_path; empty = ignored):
+export TOKENOMICS_API_MANUAL=~/tokenomics/api-billing.toml
+```
+
+One `[[api_manual]]` row per figure. The `id` joins a `[[api]].id` **exactly** (case-sensitive, like
+the ledger). `amount` is a real currency value (a TOML decimal; `tok` converts to cents with no `f64`
+drift), `currency` a verbatim label (`USD`, `EUR`) — never converted, never summed across currencies.
+An `as_of` older than **35 days** is rendered stale (kept, not dropped). There is deliberately no
+email/account-name field.
+
+```toml
+# api-billing.toml — manual API-billing figures. ids must match tokenomics.toml [[api]] ids exactly.
+
+[[api_manual]]
+id = "gemini-studio"        # required — exact, case-sensitive match to an [[api]] id
+figure = "balance"          # "balance" | "owed" | "mtd_spend"
+amount = 12.34              # a real currency amount (a TOML decimal, e.g. dollars)
+currency = "USD"            # verbatim label — never converted or summed across currencies
+as_of = 2026-07-20          # the date you recorded this figure (a bare TOML date, no quotes)
+# notes = "console credit snapshot"   # optional, free text — never an email or account name
+
+[[api_manual]]
+id = "xai"
+figure = "owed"
+amount = 4.50
+currency = "USD"
+as_of = 2026-07-20
+```
+
+Live figures win per figure; manual fills the gaps. Run `tok doctor` to see the resolved manual path
+and provenance (`fresh` / `stale` / `missing`), any past-stale ids, each live figure's last-poll age
+(or `never polled`), dormant entries, and manual ids that join no configured `[[api]]` — **never a
+dollar amount**.
+
+### On the board
+
+Press **`o`** to toggle an **API overview** section (default hidden; session-only, like the `i` peek).
+It renders one dense line per `[[api]]` account — balance / owed / month-to-date, each figure carrying
+a plain-word provenance: `live 2m ago`, `manual 2026-07-20`, `· stale`, or `dormant (XAI_API_KEY
+unset)`. Real figures always show exactly two decimals and a currency glyph (`$12.34`, `€3.50`,
+`CZK 1.00`) — a grammar deliberately disjoint from the notional proxy's `$335 (notional)`. **There is
+no totals row** — mixed currencies are never summed.
+
 ## Let Claude Code set it up
 
 Paste the block below into a Claude Code session **on the machine where your CLIs are installed**. It

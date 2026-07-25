@@ -25,16 +25,17 @@
 
 use serde::Deserialize;
 
-use crate::billing::dollars_f64_to_cents;
+use crate::billing::{dollars_f64_to_micro, parse_dollars_decimal_micro};
 use crate::error::{AppError, AppResult};
 
-/// One parsed page of OpenAI cost results: the summed usd spend in **cents** and the pagination
+/// One parsed page of OpenAI cost results: the summed usd spend in exact **micro-cents** (the
+/// caller accumulates a figure across pages and rounds ONCE — spec 024 §A) and the pagination
 /// cursor to the next page, if any. Same shape as the anthropic card's `CostPage`; declared locally
 /// so the provider parsers stay decoupled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostPage {
-    /// Summed usd spend across the page's readable `amount.value` figures, in cents.
-    pub cents: i64,
+    /// Summed usd spend across the page's readable `amount.value` figures, in exact micro-cents.
+    pub micro: i128,
     /// Cursor for the next page — `Some` only when the wire carried `has_more == true` AND a
     /// non-empty `next_page`; `None` otherwise (empty page, last page, or empty/absent cursor).
     pub next_page: Option<String>,
@@ -67,13 +68,35 @@ struct ResultWire {
     amount: Option<AmountWire>,
 }
 
-/// The `amount` object — `value` is an f64 in DOLLARS on the wire (verified 2026-07-25).
+/// The `amount` object. The reference docs type `value` as a JSON number, but the LIVE wire sends
+/// a high-precision decimal STRING in dollars (verified 2026-07-25, e.g.
+/// `"15.78_762_621_000_000_000_000_000_000"`) — accept both, preferring the exact string path.
 #[derive(Debug, Deserialize)]
 struct AmountWire {
     #[serde(default)]
-    value: Option<f64>,
+    value: Option<ValueWire>,
     #[serde(default)]
     currency: Option<String>,
+}
+
+/// `amount.value`: decimal string (live wire) or JSON number (documented shape).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ValueWire {
+    /// The live wire's decimal string, parsed exactly.
+    Text(String),
+    /// The documented number form — dollars as f64 (precision bounded by the wire itself).
+    Number(f64),
+}
+
+impl ValueWire {
+    /// Exact micro-cents for this value, `None` when unreadable (non-finite / malformed).
+    fn micro_cents(&self) -> Option<i128> {
+        match self {
+            Self::Text(s) => parse_dollars_decimal_micro(s),
+            Self::Number(v) => dollars_f64_to_micro(*v),
+        }
+    }
 }
 
 /// Parse one OpenAI `/v1/organization/costs` page into a summed-cents [`CostPage`] (spec 024 §B).
@@ -88,7 +111,7 @@ pub fn parse_costs(bytes: &[u8]) -> AppResult<CostPage> {
     let page: CostPageWire = serde_json::from_slice(bytes)
         .map_err(|e| AppError::Overlay(format!("malformed openai costs body: {e}")))?;
 
-    let mut cents: i64 = 0;
+    let mut micro: i128 = 0;
     let mut results_summed: usize = 0;
     let mut results_unusable: usize = 0;
 
@@ -110,18 +133,21 @@ pub fn parse_costs(bytes: &[u8]) -> AppResult<CostPage> {
                 continue;
             }
 
-            let Some(value) = amount.value else {
+            let Some(value) = amount.value.as_ref() else {
                 results_unusable += 1;
                 continue;
             };
 
-            // `dollars_f64_to_cents` returns `None` for non-finite values — skip those too.
-            let Some(contribution) = dollars_f64_to_cents(value) else {
+            // Unreadable values (non-finite number / malformed string) are skipped, never 0.
+            let Some(contribution) = value.micro_cents() else {
                 results_unusable += 1;
                 continue;
             };
 
-            cents += contribution;
+            // A page that overflows i128 micro-cents is drift, never a wrapped sum.
+            micro = micro
+                .checked_add(contribution)
+                .ok_or_else(|| AppError::Overlay("openai costs page sum overflowed".to_string()))?;
             results_summed += 1;
         }
     }
@@ -141,7 +167,7 @@ pub fn parse_costs(bytes: &[u8]) -> AppResult<CostPage> {
         _ => None,
     };
 
-    Ok(CostPage { cents, next_page })
+    Ok(CostPage { micro, next_page })
 }
 
 #[cfg(test)]
@@ -149,6 +175,11 @@ mod tests {
     use super::*;
 
     const SINGLE: &[u8] = include_bytes!("../../fixtures/billing/openai_costs_single.json");
+    /// The LIVE wire shape (verified 2026-07-25): `amount.value` as a decimal STRING.
+    const WIRE_STRINGS: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/billing/openai_costs_wire_strings.json"
+    ));
     const PAGINATED: &[u8] = include_bytes!("../../fixtures/billing/openai_costs_paginated.json");
     const EMPTY: &[u8] = include_bytes!("../../fixtures/billing/openai_costs_empty.json");
     const MALFORMED: &[u8] = include_bytes!("../../fixtures/billing/openai_costs_malformed.json");
@@ -160,16 +191,30 @@ mod tests {
         // 0.06 → 6, 12.5 → 1250, 1.239 → 124 (half-even) ⇒ 1380 cents.
         let page = parse_costs(SINGLE).expect("well-formed page parses");
         assert_eq!(
-            page.cents, 1380,
-            "0.06 + 12.5 + 1.239 must sum to exactly 1380 cents"
+            page.micro, 1_379_900_000,
+            "0.06 + 12.5 + 1.239 dollars = exactly 1379.9 cents in micro (figure-level rounding lands 1380)"
         );
         assert_eq!(page.next_page, None, "has_more=false ⇒ no cursor");
     }
 
     #[test]
+    fn live_wire_string_values_parse_exactly() {
+        // The live wire sends dollars as high-precision decimal strings — parsed exactly, no f64:
+        // 15.78_762_621 $ = 1578.762621 ¢ = 1_578_762_621 µ¢; 0.00_000_009 $ = 9 µ¢.
+        let page = parse_costs(WIRE_STRINGS).expect("live wire shape parses");
+        assert_eq!(
+            page,
+            CostPage {
+                micro: 1_578_762_630,
+                next_page: None
+            }
+        );
+    }
+
+    #[test]
     fn surfaces_cursor_on_paginated_page() {
         let page = parse_costs(PAGINATED).expect("parses");
-        assert_eq!(page.cents, 250, "single 2.50 bucket ⇒ 250 cents");
+        assert_eq!(page.micro, 250_000_000, "single 2.50 bucket ⇒ 250 cents");
         assert_eq!(
             page.next_page.as_deref(),
             Some("page_fakecursor"),
@@ -180,7 +225,7 @@ mod tests {
     #[test]
     fn empty_page_is_zero_not_an_error() {
         let page = parse_costs(EMPTY).expect("an empty page is a real zero, not an error");
-        assert_eq!(page.cents, 0);
+        assert_eq!(page.micro, 0);
         assert_eq!(page.next_page, None);
     }
 
@@ -218,7 +263,7 @@ mod tests {
         ]}],"has_more":false,"next_page":null}"#;
         let page = parse_costs(body).expect("parses");
         assert_eq!(
-            page.cents, 506,
+            page.micro, 506_000_000,
             "eur skipped; usd + USD summed case-insensitively"
         );
     }
@@ -229,7 +274,7 @@ mod tests {
             {"amount":{"value":1.0,"currency":"usd"}}
         ]}],"has_more":false,"next_page":null}"#;
         let page = parse_costs(body).expect("parses");
-        assert_eq!(page.cents, 100);
+        assert_eq!(page.micro, 100_000_000);
         assert_eq!(
             page.next_page, None,
             "has_more=false ⇒ next_page None even if a cursor value leaked"
@@ -259,7 +304,7 @@ mod tests {
              "line_item":"total","project_id":"proj_fake123","some_new_field":42,"quantity":7}
         ],"start_time":1730419200,"end_time":1730505600}],"has_more":false,"next_page":null,"extra_top":"x"}"#;
         let page = parse_costs(body).expect("unknown fields must not break the parse");
-        assert_eq!(page.cents, 100);
+        assert_eq!(page.micro, 100_000_000);
     }
 
     #[test]

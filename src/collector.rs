@@ -1303,7 +1303,9 @@ impl BillingState {
             Self::cap(base),
         );
         self.backoff_secs.insert(api_id.to_string(), next);
-        let ticks = next.div_ceil(base).max(1);
+        // The tick that harvested this 429 already consumed one cadence interval, so waiting a
+        // further `next/base` ticks would overshoot the backoff by one interval — skip one fewer.
+        let ticks = next.div_ceil(base).saturating_sub(1).max(1);
         self.cooldown_ticks
             .insert(api_id.to_string(), u32::try_from(ticks).unwrap_or(u32::MAX));
     }
@@ -1363,7 +1365,10 @@ fn spawn_billing_fetches<B: BillingEndpoint + 'static>(
         let endpoint = Arc::clone(endpoint);
         let api_id = api.id.clone();
         let provider = api.provider;
-        let cap = Duration::from_secs(OVERLAY_TICK_BUDGET_SECS);
+        // Billing gets triple the overlay budget: a paginated month (up to 8 sequential pages at
+        // a 10s request timeout each) cannot fit the 20s overlay budget, and the hourly cadence
+        // makes a longer-running task harmless.
+        let cap = Duration::from_secs(OVERLAY_TICK_BUDGET_SECS * 3);
         // The key is moved into the task (used for the requests, never logged).
         tasks.spawn(async move {
             let result = match tokio::time::timeout(
@@ -1407,7 +1412,7 @@ async fn fetch_billing_figures<B: BillingEndpoint>(
             let cents =
                 paginate_cost_report(endpoint, provider, key, month_start, api_id, |body| {
                     crate::billing::anthropic::parse_cost_report(body)
-                        .map(|page| (page.cents, page.next_page))
+                        .map(|page| (page.micro, page.next_page))
                 })
                 .await?;
             Ok(vec![mtd_spend_figure(cents)])
@@ -1416,7 +1421,7 @@ async fn fetch_billing_figures<B: BillingEndpoint>(
             let cents =
                 paginate_cost_report(endpoint, provider, key, month_start, api_id, |body| {
                     crate::billing::openai::parse_costs(body)
-                        .map(|page| (page.cents, page.next_page))
+                        .map(|page| (page.micro, page.next_page))
                 })
                 .await?;
             Ok(vec![mtd_spend_figure(cents)])
@@ -1432,7 +1437,7 @@ async fn fetch_billing_figures<B: BillingEndpoint>(
 /// [`BILLING_PAGE_CAP`] pages — logging once and returning the accumulated sum-so-far — so a
 /// runaway or misbehaving cursor can never stall the billing lane.
 /// One provider page → (cents on this page, next-page cursor when more remain).
-type CostPageParser = fn(&[u8]) -> AppResult<(i64, Option<String>)>;
+type CostPageParser = fn(&[u8]) -> AppResult<(i128, Option<String>)>;
 
 async fn paginate_cost_report<B: BillingEndpoint>(
     endpoint: &B,
@@ -1442,14 +1447,14 @@ async fn paginate_cost_report<B: BillingEndpoint>(
     api_id: &str,
     parse: CostPageParser,
 ) -> AppResult<i64> {
-    let mut cents: i64 = 0;
+    let mut micro: i128 = 0;
     let mut cursor: Option<String> = None;
     for page in 0..BILLING_PAGE_CAP {
         let body = endpoint
             .fetch(provider, key, month_start, cursor.as_deref())
             .await?;
-        let (page_cents, next_page) = parse(&body)?;
-        cents = cents.saturating_add(page_cents);
+        let (page_micro, next_page) = parse(&body)?;
+        micro = micro.saturating_add(page_micro);
         match next_page {
             Some(next) => {
                 cursor = Some(next);
@@ -1463,7 +1468,10 @@ async fn paginate_cost_report<B: BillingEndpoint>(
             None => break,
         }
     }
-    Ok(cents)
+    // One rounding per figure (spec 024 §A): the exact cross-page micro-cent sum lands on cents
+    // exactly once, here.
+    crate::billing::round_micro_to_cents(micro)
+        .ok_or_else(|| AppError::Overlay("billing figure sum out of range".to_string()))
 }
 
 /// Build the one-figure MTD-spend result Anthropic/OpenAI produce (spec 024 §B).

@@ -124,8 +124,23 @@ struct RawApiManualRow {
     /// amount"), not the whole document. Only TOML floats are accepted dollars (spec 024 §C).
     amount: Option<toml::Value>,
     currency: Option<String>,
-    as_of: Option<String>,
+    /// Accepts BOTH a bare TOML date (`as_of = 2026-07-20` — the ledger's shape, which spec 024
+    /// §C promises to mirror) and a quoted string (`as_of = "2026-07-20"`). toml deserializes a
+    /// bare date as `Datetime`, not `String` — accepting only strings would fail the WHOLE
+    /// document for users copying the ledger's un-quoted style.
+    as_of: Option<toml::Value>,
     notes: Option<String>,
+}
+
+/// Normalize the permissive `as_of` value to its string form: a TOML datetime renders via
+/// `Display` (a bare `2026-07-20` displays as exactly that); a string passes through. Anything
+/// else (integer, bool, …) ⇒ `None` ⇒ a per-row error.
+fn as_of_text(v: &toml::Value) -> Option<String> {
+    match v {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Datetime(d) => Some(d.to_string()),
+        _ => None,
+    }
 }
 
 /// Parse a manual-row `figure` string into an `ApiFigureKind`. Depends on the pinned sibling
@@ -136,15 +151,19 @@ fn parse_figure(s: &str) -> Option<ApiFigureKind> {
     ApiFigureKind::parse(s)
 }
 
-/// Coerce a raw TOML amount value to f64 dollars. The manual amount is a TOML **float** (dollars)
-/// per spec 024 §C / the file format; any other present value (integer, string, bool, …) is an
-/// "unparsable amount" — `None`, which `parse` turns into a per-row error. Accepting only floats
-/// keeps the int→float cast (and its `cast_precision_loss` lint) out of the path entirely.
-fn amount_dollars(v: &toml::Value) -> Option<f64> {
-    if let toml::Value::Float(d) = v {
-        Some(*d)
-    } else {
-        None
+/// Coerce a raw TOML amount value to exact cents. A decimal **string** (`amount = "1.015"`) is the
+/// exact lane — parsed digit-for-digit, half-even ([`crate::billing::parse_dollars_decimal_micro`]).
+/// A TOML **float** stays accepted (`amount = 40.12`) but rides f64 (`1.015` may land a cent off
+/// its decimal reading — TOML floats ARE f64 by spec; prefer strings for tie-sensitive amounts).
+/// Any other value (integer, bool, …) is an "unparsable amount" — `None` → a per-row error.
+fn amount_cents(v: &toml::Value) -> Option<i64> {
+    match v {
+        toml::Value::Integer(i) => i.checked_mul(100),
+        toml::Value::Float(d) => dollars_f64_to_cents(*d),
+        toml::Value::String(s) => {
+            crate::billing::round_micro_to_cents(crate::billing::parse_dollars_decimal_micro(s)?)
+        }
+        _ => None,
     }
 }
 
@@ -212,7 +231,7 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
                 continue;
             }
             Some(v) => {
-                let Some(cents) = amount_dollars(&v).and_then(dollars_f64_to_cents) else {
+                let Some(cents) = amount_cents(&v) else {
                     errors.push(RowError {
                         id: Some(id.clone()),
                         reason: "amount is not a usable decimal number".to_string(),
@@ -229,10 +248,10 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
             });
             continue;
         };
-        let Some(as_of) = row.as_of else {
+        let Some(as_of) = row.as_of.as_ref().and_then(as_of_text) else {
             errors.push(RowError {
                 id: Some(id.clone()),
-                reason: "missing as_of".to_string(),
+                reason: "missing or non-date as_of".to_string(),
             });
             continue;
         };
@@ -941,5 +960,38 @@ as_of = \"2026-07-21\"
 
     fn find<'a>(rows: &'a [ApiManualRow], id: &str) -> Option<&'a ApiManualRow> {
         rows.iter().find(|r| r.id == id)
+    }
+
+    #[test]
+    fn bare_toml_date_as_of_parses_like_the_ledger() {
+        // spec 024 §C promises the ledger mirror; the ledger uses BARE dates (`as_of = 2026-07-20`).
+        let body = r#"
+[[api_manual]]
+id = "anthropic-api"
+figure = "balance"
+amount = 40.12
+currency = "USD"
+as_of = 2026-07-20
+"#;
+        let out = parse(body).expect("bare-date document parses");
+        assert_eq!(out.errors.len(), 0, "errors: {:?}", out.errors);
+        assert_eq!(out.rows[0].as_of, "2026-07-20");
+    }
+
+    #[test]
+    fn integer_amount_is_whole_dollars() {
+        // `amount = 50` is the spec's own Moonshot top-up figure — three spellings of fifty
+        // dollars (50, 50.0, "50") must all land on 5000 cents.
+        let body = r#"
+[[api_manual]]
+id = "m"
+figure = "balance"
+amount = 50
+currency = "USD"
+as_of = "2026-07-20"
+"#;
+        let out = parse(body).expect("parses");
+        assert_eq!(out.errors.len(), 0, "errors: {:?}", out.errors);
+        assert_eq!(out.rows[0].amount_minor, 5000);
     }
 }
