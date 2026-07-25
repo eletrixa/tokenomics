@@ -64,7 +64,8 @@ shape, re-run `check.sh`, flip Status to Done.
 ## Non-goals
 
 - PAYG balance (`api.moonshot.ai/v1/users/me/balance`) — dollars, not quota-%; no gauge concept
-  exists. Not even a `doctor` line.
+  exists. Not even a `doctor` line. *(Superseded by spec 024: the balance is now a live figure
+  of the separate API-billing plane — still nothing here in the subscription lanes.)*
 - Any usage lane, cost display, new `LimitKind`, key validation beyond presence.
 - Parsing the 429 body / `error.type` surfacing.
 - New dependencies.

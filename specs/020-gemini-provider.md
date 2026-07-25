@@ -22,7 +22,8 @@ activates once a Google-account-OAuth gemini-cli login exists on this machine.
 - `Provider::Gemini` (string `"gemini"`) round-trips config → store → display.
 - Config: `config_dir` **required** (the `GEMINI_CLI_HOME` dir, default `~/.gemini`),
   `api_key_env` **rejected** (an API-key Gemini setup is PAYG, not a subscription — same
-  exclusion as a raw Anthropic Console key). `limits_overlay` is accepted but **ignored** (no
+  exclusion as a raw Anthropic Console key). *(The rejection stands for `[[account]]`; PAYG
+  dollars now live in the separate `[[api]]` plane — spec 024.)* `limits_overlay` is accepted but **ignored** (no
   limits surface exists); `doctor` states this so a set flag isn't a silent mystery.
 
 ### B. Usage lane (local, ToS-safe)

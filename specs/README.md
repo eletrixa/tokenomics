@@ -30,6 +30,8 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 021 | [grok-provider](021-grok-provider.md) | Grok Build adapter: usage-only from `logs/unified.jsonl` (`inference_done` events, no dedup, reasoning ⊆ completion), both gauges n/a, no cost | Done |
 | 022 | [grok-weekly-quota](022-grok-weekly-quota.md) | Grok weekly quota gauge from local `billing: fetched credits config` lines (supersedes 021 §C — `creditUsagePercent` IS the sub quota); additive `collect_local_limits` seam; quota rides idle ticks | Done |
 | 023 | [kimi-provider](023-kimi-provider.md) | Kimi adapter: limits-only quota overlay (`api_key_env` identity, derived % from string numerics, session %/reset + weekly %/reset), dormant until a live subscription key | Active |
+| 024 | [api-billing-plane](024-api-billing-plane.md) | Fourth data plane: real-dollar API billing — live admin endpoints (anthropic/openai MTD, moonshot balance) → SQLite, manual `api.toml` read-through for the gaps, xai dormant; doctor-only surface; supersedes the 020/021/023 PAYG exclusions | Active |
+| 025 | [api-overview-section](025-api-overview-section.md) | API overview on the board: `o` toggles a per-provider line of balance/owed/MTD with per-figure provenance (live age vs manual as-of), default hidden, goldens untouched | Active |
 
 Scope now: **Claude** (6 accounts) + **Codex** (spec 013) + **z.ai** (spec 019, limits-only) +
 **Gemini** (spec 020, usage-only — activates on a gemini-cli login) + **Grok Build** (spec 021,

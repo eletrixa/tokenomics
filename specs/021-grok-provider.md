@@ -28,7 +28,8 @@ default `~/.grok`), never the logs.
 - `Provider::Grok` (string `"grok"`) round-trips config → store → display.
 - Config: `config_dir` **required** (the `GROK_HOME` dir, default `~/.grok`), `api_key_env`
   **rejected** (an `XAI_API_KEY` Grok setup is PAYG API, not a subscription — same exclusion as a raw
-  Anthropic Console key / API-key Gemini). `limits_overlay` accepted but **ignored** (no subscription
+  Anthropic Console key / API-key Gemini). *(The rejection stands for `[[account]]`; PAYG
+  dollars now live in the separate `[[api]]` plane — spec 024, xai dormant.)* `limits_overlay` accepted but **ignored** (no subscription
   limits surface exists); `doctor` states this so a set flag isn't a silent mystery. Same posture as
   Gemini (spec 020 §A).
 
