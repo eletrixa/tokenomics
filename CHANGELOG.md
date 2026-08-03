@@ -8,6 +8,14 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ### CHANGED
 
+- **Default local poll cadence raised from 10s to 60s.** A local tick re-reads every transcript
+  under each account's `config_dir`, so cost scales with history size — with a multi-GB
+  `projects/` tree one ccusage scan can take a minute of CPU, and N accounts sharing one
+  transcripts tree run N identical scans per tick. Scans that outlast the cadence run
+  back-to-back forever (observed: sustained load ~44 on 16 threads at 20s with 7 accounts). 60s
+  keeps small setups responsive; `tokenomics.example.toml` and `docs/running-the-collector.md`
+  now document when to raise it to ~300s. Explicit `poll_local_secs` values are unaffected.
+
 - **The api section is now a bordered table (spec 025 amendment, two design passes).** A
   magenta frame matching the account panels, a dim `provider / <figures> / source` column-header
   line, dynamic money columns (a figure kind appears only when some row carries it; amounts

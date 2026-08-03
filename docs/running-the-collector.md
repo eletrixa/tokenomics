@@ -9,6 +9,16 @@ account into the overlay.
   summary, exit.
 - **Daemon** (24/7): `tok collector` — loop until `SIGINT`/`SIGTERM`, writing a `heartbeat` each tick.
 
+## Picking `poll_local_secs`
+
+A local tick re-reads **all** transcripts under each account's `config_dir` — cost scales with
+history size, not with new activity. With a multi-GB `projects/` tree one ccusage scan can take a
+minute of CPU, and N accounts whose config dirs share one transcripts tree (symlinked `projects/`)
+run N identical scans per tick. The per-account inflight guard stops stacking, but scans that
+outlast the cadence run back-to-back forever — on one real 7-account machine a 20s cadence held
+load at ~44 on 16 threads. Default is 60s; raise to ~300s for large histories or account fleets
+(the overlay cadence, which carries the authoritative limits anyway).
+
 ## systemd `--user` unit (optional; not auto-installed)
 
 Run the daemon as a user service so it starts with your session and restarts on failure. Adjust the

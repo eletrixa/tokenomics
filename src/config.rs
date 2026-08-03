@@ -48,7 +48,9 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// ccusage (local) poll cadence in seconds.
+    /// ccusage (local) poll cadence in seconds. Each tick re-reads every transcript under each
+    /// account's `config_dir`, so the right cadence scales with history size — see
+    /// `tokenomics.example.toml` for the tradeoff.
     #[serde(default = "default_poll_local")]
     pub poll_local_secs: u64,
     /// Overlay poll cadence in seconds.
@@ -83,7 +85,7 @@ const POLL_OVERLAY_FLOOR: u64 = 60;
 const POLL_BILLING_FLOOR: u64 = 300;
 
 fn default_poll_local() -> u64 {
-    10
+    60
 }
 fn default_poll_overlay() -> u64 {
     300
@@ -384,7 +386,7 @@ config_dir = \"/tmp\"
     #[test]
     fn parses_defaults_and_one_account() {
         let cfg = Config::parse(ONE).expect("parses");
-        assert_eq!(cfg.settings.poll_local_secs, 10);
+        assert_eq!(cfg.settings.poll_local_secs, 60);
         assert_eq!(cfg.settings.poll_overlay_secs, 300);
         assert_eq!(cfg.accounts.len(), 1);
         assert_eq!(cfg.accounts[0].provider, Provider::Claude);

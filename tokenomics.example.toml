@@ -2,7 +2,12 @@
 # `tok validate` to check it. Lives at ~/.config/tokenomics/tokenomics.toml ($TOKENOMICS_CONFIG overrides).
 
 [settings]
-poll_local_secs = 10      # ccusage/local poll cadence
+# Every local tick re-reads ALL transcripts under each account's config_dir. With years of history
+# (multi-GB projects/) one scan can cost a minute of CPU — and N accounts whose config_dirs share
+# one transcripts tree (symlinked projects/) run N identical scans per tick. If scans outlast the
+# cadence they run back-to-back forever and pin the machine: raise this to ~300 for big histories
+# or account fleets.
+poll_local_secs = 60      # ccusage/local poll cadence
 poll_overlay_secs = 300   # overlay poll cadence (only used by accounts with the overlay on)
 warn_pct = 75.0           # window utilization % → warning
 crit_pct = 90.0           # window utilization % → critical
