@@ -48,8 +48,9 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// ccusage (local) poll cadence in seconds. Each tick re-reads every transcript under each
-    /// account's `config_dir`, so the right cadence scales with history size — see
+    /// Local poll cadence in seconds. Each tick re-reads only transcripts changed since the last
+    /// tick (native scanner, spec 026) — or, under the opt-in `ccusage_cmd` lane, every transcript
+    /// under each account's `config_dir`, so the right cadence scales with history size there — see
     /// `tokenomics.example.toml` for the tradeoff.
     #[serde(default = "default_poll_local")]
     pub poll_local_secs: u64,
@@ -65,8 +66,9 @@ pub struct Settings {
     /// Utilization % at which a window is critical.
     #[serde(default = "default_crit")]
     pub crit_pct: f64,
-    /// Optional launcher for ccusage (argv[0] + prefix args). Absent/empty ⇒ a bare `ccusage` on
-    /// `PATH`; set to e.g. `["npx", "ccusage"]` on machines without a global install.
+    /// Opt-in: set to select the ccusage subprocess lane instead of the native transcript scanner
+    /// (spec 026). Absent/empty ⇒ native. When set, this is the launcher for ccusage (argv[0] +
+    /// prefix args); set to e.g. `["npx", "ccusage"]` on machines without a global install.
     #[serde(default)]
     pub ccusage_cmd: Option<Vec<String>>,
     /// Optional path to the subscription ledger (spec 017 §B) — beaten by `$TOKENOMICS_LEDGER`;

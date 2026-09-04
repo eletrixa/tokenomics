@@ -2,8 +2,8 @@
 
 `tok collector` is the background writer: it polls every configured account on the local cadence
 (`[settings].poll_local_secs`) and writes snapshots + derived limits to the SQLite store. The TUI
-(and `tok collector --once`) read that store. It is ToS-safe (local ccusage only) until you opt an
-account into the overlay.
+(and `tok collector --once`) read that store. It is ToS-safe (local reads only — a native transcript
+scan by default, `ccusage` if you opt into that lane) until you opt an account into the overlay.
 
 - **One-shot** (cron-friendly): `tok collector --once` — collect once, persist, print a read-back
   summary, exit.
@@ -11,13 +11,13 @@ account into the overlay.
 
 ## Picking `poll_local_secs`
 
-A local tick re-reads **all** transcripts under each account's `config_dir` — cost scales with
-history size, not with new activity. With a multi-GB `projects/` tree one ccusage scan can take a
-minute of CPU, and N accounts whose config dirs share one transcripts tree (symlinked `projects/`)
-run N identical scans per tick. The per-account inflight guard stops stacking, but scans that
-outlast the cadence run back-to-back forever — on one real 7-account machine a 20s cadence held
-load at ~44 on 16 threads. Default is 60s; raise to ~300s for large histories or account fleets
-(the overlay cadence, which carries the authoritative limits anyway).
+Claude usage is read by the native in-process transcript scanner (spec 026) by default: the first
+tick reads every file touched in the last 24h, and later ticks re-read only files that changed since
+the last tick (per-file incremental cache), with N accounts whose config dirs share one transcripts
+tree (symlinked `projects/`) sharing a single scan per tick. Cost is bounded by recent activity, not
+history size. Default is 60s; raise to ~300s if you've opted into the `ccusage` subprocess lane
+(`ccusage_cmd`), which re-reads all transcripts every tick and scales with history size — on one
+real 7-account machine under that lane a 20s cadence held load at ~44 on 16 threads.
 
 ## systemd `--user` unit (optional; not auto-installed)
 
@@ -37,6 +37,10 @@ ExecStart=%h/.local/bin/tok collector
 Restart=on-failure
 RestartSec=10
 # tok reads ~/.config/tokenomics/tokenomics.toml and writes the XDG data-dir store.
+# Contain any regression to this unit instead of letting systemd-oomd pick bystanders in the
+# user slice (spec 026 NFR-2).
+MemoryHigh=768M
+MemoryMax=1G
 
 [Install]
 WantedBy=default.target

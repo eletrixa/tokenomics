@@ -2,8 +2,7 @@
   {
     "account": "claude-alpha",
     "label": "Claude Alpha",
-    "provider": "claude",
-    "error": "<ERR>"
+    "provider": "claude"
   },
   {
     "account": "codex-gamma",

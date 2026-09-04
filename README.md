@@ -21,8 +21,9 @@ reset time**, never "X of Y left".
   TUI only reads it, so the dashboard is always instant.
 - **Config hot-reload** — edit `tokenomics.toml` while the collector runs; it picks up account
   changes without a restart and surfaces any collector/config divergence.
-- **`tok doctor`** — read-only diagnostics for config, credentials, `ccusage`, and the overlay.
-- **Claude + Codex providers** — Claude via `ccusage`/JSONL, Codex via its local sessions tree;
+- **`tok doctor`** — read-only diagnostics for config, credentials, the active Claude usage lane, and the overlay.
+- **Claude + Codex providers** — Claude reads its local JSONL transcripts natively (in-process, no
+  subprocess), with `ccusage` available as an opt-in lane; Codex reads its local sessions tree;
   the provider seam is built to extend.
 
 ## Install
@@ -31,8 +32,8 @@ reset time**, never "X of Y left".
 cargo install --path .    # builds and installs the `tok` binary
 ```
 
-Prebuilt binaries are planned. For now, a Rust toolchain (1.96+) and a local `ccusage` (for Claude
-accounts) are the only prerequisites.
+Prebuilt binaries are planned. For now, a Rust toolchain (1.96+) is the only prerequisite — Claude
+usage is read natively from the local JSONL transcripts, no `ccusage` install required.
 
 ## Quick start
 
@@ -64,7 +65,7 @@ This is exactly what `tok init` writes (embedded from
 # `tok validate` to check it. Lives at ~/.config/tokenomics/tokenomics.toml ($TOKENOMICS_CONFIG overrides).
 
 [settings]
-poll_local_secs = 10      # ccusage/local poll cadence
+poll_local_secs = 10      # local poll cadence (native transcript scan / Codex sessions tree)
 poll_overlay_secs = 300   # overlay poll cadence (only used by accounts with the overlay on)
 warn_pct = 75.0           # window utilization % → warning
 crit_pct = 90.0           # window utilization % → critical
@@ -94,8 +95,9 @@ Each account is monitored under its own config dir. Optional per-account keys: `
 Everything stays on your machine. `tok` never sends your usage anywhere.
 
 - **Claude** — reads token usage from the local Claude Code JSONL logs
-  (`<config_dir>/projects/**/*.jsonl`) via the [`ccusage`](https://github.com/ryoppippi/ccusage)
-  CLI, once per account by setting `CLAUDE_CONFIG_DIR`.
+  (`<config_dir>/projects/**/*.jsonl`) natively, in-process — streaming, mtime-pruned to the last
+  24h, incrementally cached per file. `ccusage` is available as an opt-in lane
+  (`ccusage_cmd = ["ccusage"]` in `[settings]`) if you'd rather shell out to it.
 - **Codex** — reads `<CODEX_HOME>/sessions/**` rollout events directly.
 - **Store** — a local SQLite database (`~/.local/share/tokenomics/tokenomics.db`) that only this
   tool reads and writes.
@@ -127,8 +129,9 @@ comparing burn across accounts and time.
 
 ## Credits
 
-The Claude local-usage plane is powered by [`ccusage`](https://github.com/ryoppippi/ccusage) (MIT) —
-`tok` shells out to it for token accounting.
+The Claude local-usage plane reads JSONL transcripts natively; its block semantics are modelled on
+[`ccusage`](https://github.com/ryoppippi/ccusage) (MIT), which remains available as an optional
+subprocess lane (`ccusage_cmd`) — thanks to the ccusage project for the prior art.
 
 ## Not affiliated
 

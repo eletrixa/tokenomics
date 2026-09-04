@@ -22,8 +22,10 @@ cargo build --release      # -> target/release/tok
 # or: cargo install --path .   (puts `tok` on your PATH)
 ```
 
-A Rust toolchain (1.96+) and, for Claude accounts, a local [`ccusage`](https://github.com/ryoppippi/ccusage)
-are the only prerequisites.
+A Rust toolchain (1.96+) is the only prerequisite. Claude usage is read natively from the local
+JSONL transcripts under `<config_dir>/projects/**/*.jsonl` — no `ccusage` install required.
+[`ccusage`](https://github.com/ryoppippi/ccusage) remains available as an opt-in lane
+(`ccusage_cmd` in `[settings]`).
 
 ### 2. Write a starter config
 
@@ -43,13 +45,14 @@ The per-provider shape:
 
 ```toml
 [settings]
-poll_local_secs = 10      # local (ccusage/JSONL) poll cadence — floor 5
+poll_local_secs = 10      # native transcript scan of <config_dir>/projects (or Codex sessions tree) poll cadence — floor 5
+# ccusage_cmd = ["ccusage"]  # opt-in: use the ccusage subprocess lane instead of the native scanner
 poll_overlay_secs = 300   # overlay poll cadence — floor 60; only accounts with the overlay on use it
 warn_pct = 75.0           # window utilization % -> warning
 crit_pct = 90.0           # window utilization % -> critical  (must be > warn_pct)
 # ledger_path = "~/subscriptions/subscriptions.toml"   # optional — see "The subscription ledger"
 
-# Claude — reads local Claude Code JSONL via ccusage, once per account under this CLAUDE_CONFIG_DIR.
+# Claude — native transcript scan of <config_dir>/projects, once per account under this CLAUDE_CONFIG_DIR.
 [[account]]
 id = "claude-personal"
 label = "Personal"
@@ -112,7 +115,7 @@ Field rules `tok validate` enforces:
 
 ```bash
 tok validate      # schema + threshold + "does this config_dir exist" checks
-tok doctor        # read-only diagnostics: config, credentials, ccusage, overlay, ledger
+tok doctor        # read-only diagnostics: config, credentials, active Claude lane, overlay, ledger
 tok accounts      # list what's configured
 ```
 

@@ -32,6 +32,7 @@ Status: **Draft** (don't implement) → **Active** (implement against this) → 
 | 023 | [kimi-provider](023-kimi-provider.md) | Kimi adapter: limits-only quota overlay (`api_key_env` identity, derived % from string numerics, session %/reset + weekly %/reset), dormant until a live subscription key | Active |
 | 024 | [api-billing-plane](024-api-billing-plane.md) | Fourth data plane: real-dollar API billing — live admin endpoints (anthropic/openai MTD, moonshot balance) → SQLite, manual `api.toml` read-through for the gaps, xai dormant; doctor-only surface; supersedes the 020/021/023 PAYG exclusions | Done |
 | 025 | [api-overview-section](025-api-overview-section.md) | API overview on the board: `o` toggles a per-provider line of balance/owed/MTD with per-figure provenance (live age vs manual as-of), default hidden, goldens untouched | Done |
+| 026 | [native-claude-transcript-scanner](026-native-claude-transcript-scanner.md) | in-process JSONL scanner replaces the ccusage subprocess; memoised per shared projects/ tree; MemoryMax'd unit | Active |
 
 Scope now: **Claude** (6 accounts) + **Codex** (spec 013) + **z.ai** (spec 019, limits-only) +
 **Gemini** (spec 020, usage-only — activates on a gemini-cli login) + **Grok Build** (spec 021,

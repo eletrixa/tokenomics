@@ -2,12 +2,12 @@
 # `tok validate` to check it. Lives at ~/.config/tokenomics/tokenomics.toml ($TOKENOMICS_CONFIG overrides).
 
 [settings]
-# Every local tick re-reads ALL transcripts under each account's config_dir. With years of history
-# (multi-GB projects/) one scan can cost a minute of CPU — and N accounts whose config_dirs share
-# one transcripts tree (symlinked projects/) run N identical scans per tick. If scans outlast the
-# cadence they run back-to-back forever and pin the machine: raise this to ~300 for big histories
-# or account fleets.
-poll_local_secs = 60      # ccusage/local poll cadence
+# Claude usage is read natively, in-process, from each account's config_dir: streaming, mtime-pruned
+# to the last 24h, with a per-file incremental cache — and N accounts whose config_dirs share one
+# transcripts tree (symlinked projects/) share a single scan per tick. Raise this for big histories
+# or account fleets only if you've set ccusage_cmd below to opt into the (slower) subprocess lane.
+poll_local_secs = 60      # local poll cadence (native transcript scan / Codex sessions tree)
+# ccusage_cmd = ["ccusage"]   # opt-in: use the ccusage subprocess lane instead of the native scanner
 poll_overlay_secs = 300   # overlay poll cadence (only used by accounts with the overlay on)
 warn_pct = 75.0           # window utilization % → warning
 crit_pct = 90.0           # window utilization % → critical

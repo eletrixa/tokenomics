@@ -47,7 +47,7 @@ use format::{
     format_cost, format_pct, format_reset, format_tokens, merge_limits, provenance_label,
     severity_label,
 };
-use providers::claude::ccusage::{derive_session_limit, CcusageInvocation};
+use providers::claude::ccusage::derive_session_limit;
 use providers::claude::overlay::HttpUsageEndpoint;
 use providers::claude::ClaudeAdapter;
 use providers::codex::rate_limits::AppServerClient;
@@ -263,8 +263,11 @@ fn cmd_once(as_json: bool) -> ExitCode {
 /// inactive account is unmonitored (spec 014 §B/D): it produces no record at all, so `--json` output
 /// contains only active accounts.
 async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
-    let invocation = CcusageInvocation::from_override(cfg.settings.ccusage_cmd.as_deref());
-    let claude = ClaudeAdapter::new(Exec, invocation, Duration::from_secs(CCUSAGE_TIMEOUT_SECS));
+    let claude = ClaudeAdapter::from_settings(
+        Exec,
+        cfg.settings.ccusage_cmd.as_deref(),
+        Duration::from_secs(CCUSAGE_TIMEOUT_SECS),
+    );
     let codex = CodexAdapter::new();
     let zai = ZaiAdapter::new();
     let gemini = GeminiAdapter::new();
@@ -397,8 +400,11 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
     };
     let result = runtime.block_on(async {
         let store = Store::open(&path)?;
-        let invocation = CcusageInvocation::from_override(cfg.settings.ccusage_cmd.as_deref());
-        let claude = ClaudeAdapter::new(Exec, invocation, Duration::from_secs(CCUSAGE_TIMEOUT_SECS));
+        let claude = ClaudeAdapter::from_settings(
+            Exec,
+            cfg.settings.ccusage_cmd.as_deref(),
+            Duration::from_secs(CCUSAGE_TIMEOUT_SECS),
+        );
         let adapter = ProviderRegistry {
             claude,
             codex: CodexAdapter::new(),

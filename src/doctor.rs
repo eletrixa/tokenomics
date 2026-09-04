@@ -92,10 +92,16 @@ const DOCTOR_TIMEOUT_SECS: u64 = 30;
 
 /// Run all diagnostics and print a report. Read-only.
 pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
-    let invocation = CcusageInvocation::from_override(cfg.settings.ccusage_cmd.as_deref());
-    println!("ccusage: {}", ccusage_version(&invocation).await);
-
-    let adapter = ClaudeAdapter::new(Exec, invocation, Duration::from_secs(DOCTOR_TIMEOUT_SECS));
+    let adapter = ClaudeAdapter::from_settings(
+        Exec,
+        cfg.settings.ccusage_cmd.as_deref(),
+        Duration::from_secs(DOCTOR_TIMEOUT_SECS),
+    );
+    println!("claude lane: {}", adapter.lane_name());
+    if adapter.uses_ccusage() {
+        let invocation = CcusageInvocation::from_override(cfg.settings.ccusage_cmd.as_deref());
+        println!("ccusage: {}", ccusage_version(&invocation).await);
+    }
     let now = Timestamp::now();
     let now_ms = now.as_millisecond();
     let mut signatures: Vec<(String, Option<u64>)> = Vec::new();
@@ -1026,17 +1032,17 @@ async fn report_ccusage<R: Runner>(
                 .as_ref()
                 .map_or_else(String::new, |w| format!(", ends {}", w.end));
             println!(
-                "  ccusage:     active block, {} total tokens{ends}",
+                "  usage:       active block, {} total tokens{ends}",
                 snapshot.total_tokens
             );
             Some(snapshot.total_tokens)
         }
         Ok(None) => {
-            println!("  ccusage:     no active block (idle)");
+            println!("  usage:       no active block (idle)");
             None
         }
         Err(e) => {
-            println!("  ccusage:     error: {e}");
+            println!("  usage:       error: {e}");
             None
         }
     }

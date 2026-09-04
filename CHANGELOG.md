@@ -8,6 +8,11 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ### CHANGED
 
+- **Claude local usage is now scanned natively** (spec 026): `<config_dir>/projects/**/*.jsonl` is read in-process — streaming, 24h mtime lookback, per-file incremental cache, one scan per shared `projects/` tree per tick, scans serialised. Replaces the per-account `ccusage blocks --json` subprocess, which on an 11 GB tree cost 10.8 s / 1.2 GB **per account per tick** and OOM-killed the collector. `ccusage` is now opt-in via `[settings] ccusage_cmd`. Notional cost comes from a built-in pricing table (unknown models count tokens, contribute $0).
+- `tok doctor` prints the active Claude lane (`native transcript scanner` / `ccusage subprocess`) and only probes ccusage when that lane is selected.
+- Golden `tok once --json`: a Claude account without a `projects/` tree is idle (no `error` field) instead of a ccusage error.
+- Documented collector unit gains `MemoryHigh=768M` / `MemoryMax=1G`.
+
 - **Default local poll cadence raised from 10s to 60s.** A local tick re-reads every transcript
   under each account's `config_dir`, so cost scales with history size — with a multi-GB
   `projects/` tree one ccusage scan can take a minute of CPU, and N accounts sharing one
