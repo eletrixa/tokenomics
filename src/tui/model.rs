@@ -73,9 +73,25 @@ pub struct GaugeView {
     /// The limit's reset time has passed: the window reset, so the stored percent is history — the
     /// gauge renders dormant (`"waiting for reset"`) and never alarms (spec 012 §A).
     pub expired: bool,
+    /// Where this figure came from. Anything but `Authoritative` is NOT a measured quota reading and
+    /// must say so on the row: `Derived` is the time-elapsed-in-window clock (labelled `elapsed`),
+    /// `Estimate` is a last-known authoritative value whose overlay went stale. Both carry the `~`
+    /// prefix, so a proxy can never be mistaken for the account's real usage.
+    pub source: Provenance,
 }
 
 impl GaugeView {
+    /// The word that follows the percent. An `Authoritative` figure is a real quota reading, so it
+    /// says how bad it is (`ok`/`warn`/`crit`). A `Derived` session percent is the 5h window's clock,
+    /// not usage at all — it says `elapsed`, because calling it `warn` alarmed on time passing. An
+    /// `Estimate` keeps its (real, if stale) severity word.
+    fn qualifier(&self) -> &'static str {
+        match self.source {
+            Provenance::Derived => "elapsed",
+            Provenance::Authoritative | Provenance::Estimate => severity_label(self.severity),
+        }
+    }
+
     /// Compose the roomy right-hand label: `"[scope ]pct sev[ · resets reset]"`, e.g.
     /// `"Fable 92% crit · resets in 5d 9h"`. Used by the FULL and COMPACT tiers.
     pub fn label(&self) -> String {
@@ -92,9 +108,12 @@ impl GaugeView {
             s.push_str(scope);
             s.push(' ');
         }
+        if self.source != Provenance::Authoritative {
+            s.push('~'); // not measured now — a clock (Derived) or a stale last-known (Estimate)
+        }
         s.push_str(&self.pct);
         s.push(' ');
-        s.push_str(severity_label(self.severity));
+        s.push_str(self.qualifier());
         if let Some(reset) = &self.reset {
             // A past reset reads standalone; a countdown takes the "resets" verb ("· resets in
             // 2h 41m"). Never "resets waiting for reset".
@@ -940,6 +959,7 @@ fn gauge_from_limit(
             scope: scope.map(str::to_string),
             color: resolve_color(use_color, Color::DarkGray),
             expired: true,
+            source: limit.source,
         };
     }
     GaugeView {
@@ -949,8 +969,17 @@ fn gauge_from_limit(
         // An idle window carries no reset time (`resets_at: ""`) — no countdown, no "resets" tail.
         reset: (!limit.resets_at.is_empty()).then(|| format_reset(&limit.resets_at, now)),
         scope: scope.map(str::to_string),
-        color: resolve_color(use_color, severity_color(limit.severity)),
+        // A `Derived` figure is a clock, so it never borrows the severity palette — a yellow bar
+        // must mean "quota burning", never "3 of 5 hours have passed". `Estimate` keeps its colour:
+        // the value is a real (if stale) reading, and dimming it would hide a genuine 95%.
+        color: match limit.source {
+            Provenance::Derived => resolve_color(use_color, Color::DarkGray),
+            Provenance::Authoritative | Provenance::Estimate => {
+                resolve_color(use_color, severity_color(limit.severity))
+            }
+        },
         expired: false,
+        source: limit.source,
     }
 }
 
@@ -1650,7 +1679,8 @@ mod tests {
             scope: None,
             utilization_pct: 76.0,
             resets_at: "2026-07-04T12:00:00Z".to_string(),
-            severity: Severity::Warn,
+            // A `Derived` limit is a clock, so it is always `Ok` — see `derive_session_limit`.
+            severity: Severity::Ok,
             source: Provenance::Derived,
         };
         let now: Timestamp = "2026-07-04T10:49:00Z".parse().unwrap();
@@ -1669,14 +1699,17 @@ mod tests {
         assert_eq!(row.title, "Personal [claude]");
         let session = row.session.expect("session gauge");
         assert!((session.ratio - 0.76).abs() < 1e-9);
-        // The composed 5h label carries its own reset countdown.
-        assert_eq!(session.label(), "76% warn · resets in 1h 11m");
+        // The composed 5h label carries its own reset countdown — and marks itself a proxy: `~`
+        // plus `elapsed`, because 76% here means "76% of the 5h window has passed", not "76% of the
+        // quota is spent". Rendering it as `76% warn` was the false-usage bug.
+        assert_eq!(session.label(), "~76% elapsed · resets in 1h 11m");
         // The tight MICRO tier strips the leading "in " (but never reformats the time value).
         assert_eq!(session.reset_short(), Some("1h 11m"));
         // With only a session limit, the headline is that session.
         assert_eq!(row.headline.expect("headline").label(), session.label());
         assert_eq!(row.status.as_deref(), Some("idle (no active block)"));
-        assert_eq!(row.severity, Severity::Warn);
+        // A clock never escalates the row: time passing is not a quota warning.
+        assert_eq!(row.severity, Severity::Ok);
         // The shared token/cost/provenance figures now come off `account_usage` (fleet line), not the
         // per-account row. No active window ⇒ no burn rate.
         let usage = account_usage(Some(&snapshot), &limits, None);

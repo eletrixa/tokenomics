@@ -6,6 +6,17 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ## [Unreleased]
 
+### FIXED
+
+- **The 5h gauge no longer reports the clock as usage.** When an account's overlay goes stale, the
+  5h figure falls back to a locally derived proxy that measures *time elapsed in the window*, not
+  tokens spent — but it rendered identically to a real reading (`76% warn`, yellow bar) and was
+  classified against the warn/crit thresholds, so a window merely passing three of its five hours
+  raised a warning and fired a desktop alert on an account that may have spent nothing. A derived
+  figure is now always `ok` (a proxy never alarms), never borrows the severity colour, and says what
+  it actually measures: `~76% elapsed`. A last-known authoritative value whose overlay went stale
+  keeps its severity but gains the same `~` prefix. The `~` survives every width tier.
+
 ### CHANGED
 
 - **Claude local usage is now scanned natively** (spec 026): `<config_dir>/projects/**/*.jsonl` is read in-process — streaming, 24h mtime lookback, per-file incremental cache, one scan per shared `projects/` tree per tick, scans serialised. Replaces the per-account `ccusage blocks --json` subprocess, which on an 11 GB tree cost 10.8 s / 1.2 GB **per account per tick** and OOM-killed the collector. `ccusage` is now opt-in via `[settings] ccusage_cmd`. Notional cost comes from a built-in pricing table (unknown models count tokens, contribute $0).

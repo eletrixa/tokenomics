@@ -274,19 +274,18 @@ async fn collect_once(cfg: &Config) -> Vec<OnceRecord> {
     let grok = GrokAdapter::new();
     let kimi = KimiAdapter::new();
     let now = Timestamp::now();
-    let (warn, crit) = (cfg.settings.warn_pct, cfg.settings.crit_pct);
     let mut records = Vec::with_capacity(cfg.accounts.len());
     for account in cfg.accounts.iter().filter(|a| a.active) {
         // All adapters run through the same `collect_record`; a windowless snapshot (Codex/Gemini)
         // or an always-idle one (zai) naturally yields no derived session limit (specs 013, 019
         // §C, 020 §C).
         let record = match account.provider {
-            Provider::Claude => collect_record(&claude, account, now, warn, crit).await,
-            Provider::Codex => collect_record(&codex, account, now, warn, crit).await,
-            Provider::Zai => collect_record(&zai, account, now, warn, crit).await,
-            Provider::Gemini => collect_record(&gemini, account, now, warn, crit).await,
-            Provider::Grok => collect_record(&grok, account, now, warn, crit).await,
-            Provider::Kimi => collect_record(&kimi, account, now, warn, crit).await,
+            Provider::Claude => collect_record(&claude, account, now).await,
+            Provider::Codex => collect_record(&codex, account, now).await,
+            Provider::Zai => collect_record(&zai, account, now).await,
+            Provider::Gemini => collect_record(&gemini, account, now).await,
+            Provider::Grok => collect_record(&grok, account, now).await,
+            Provider::Kimi => collect_record(&kimi, account, now).await,
         };
         records.push(record);
     }
@@ -299,8 +298,6 @@ async fn collect_record<A: ProviderAdapter>(
     adapter: &A,
     account: &Account,
     now: Timestamp,
-    warn_pct: f64,
-    crit_pct: f64,
 ) -> OnceRecord {
     let base = |snapshot, session_limit, error| OnceRecord {
         account: account.id.clone(),
@@ -312,7 +309,7 @@ async fn collect_record<A: ProviderAdapter>(
     };
     match adapter.collect(account, now).await {
         Ok(Some(snapshot)) => {
-            let limit = derive_session_limit(&snapshot, now, warn_pct, crit_pct);
+            let limit = derive_session_limit(&snapshot, now);
             base(Some(snapshot), limit, None)
         }
         Ok(None) => base(None, None, None),

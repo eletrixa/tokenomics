@@ -27,7 +27,7 @@ remainingMinutes, .. } } ] }`. `totalTokens` already sums cache.
 |----|-------------|---------------------|
 | FR-1 | `parse_ccusage_blocks` (pure) | `serde` over the JSON; tolerate unknown fields; empty `blocks` ⇒ no active block. |
 | FR-2 | `reduce_snapshot` (pure) | pick the `isActive` block; map `tokenCounts`→fields; `total_tokens` from `totalTokens`; `window` from start/end; `remaining` from `projection.remainingMinutes`; `cost_notional` from `costUSD`. |
-| FR-3 | `derive_session_limit` (pure) | from the active `Window`, `Limit { Session, utilization = elapsed/5h × 100 (time-in-window proxy), resets_at = window.end, source = Derived }`. See Open Questions. |
+| FR-3 | `derive_session_limit` (pure) | from the active `Window`, `Limit { Session, utilization = elapsed/5h × 100 (time-in-window proxy), resets_at = window.end, source = Derived, severity = Ok always }`. A time proxy is never classified against `warn_pct`/`crit_pct` — see Resolved decisions. |
 | FR-4 | `Runner` trait + `Exec` | The pure argv builder returns a `CommandSpec { program, args, env, timeout }` (subprocess-safety: the builder is a tested pure fn); `Runner::run(&CommandSpec)` executes it. `Exec` via `tokio::process`, bounded by `spec.timeout`, stdin nulled; explicit **argv** (never `sh -c`). |
 | FR-5 | `ClaudeAdapter::collect` | `ccusage_command_spec` sets `CLAUDE_CONFIG_DIR = config_dir` and argv `[<prefix> blocks --json --active]` → run → `parse` → `reduce`. Returns `Option<UsageSnapshot>` (`None` = idle / no active block; a valid state, not an error). `now` is injected so reduction stays pure. |
 | FR-6 | `CannedRunner` test seam | returns fixture bytes AND records the last `CommandSpec` (incl. env), so `collect` is tested with no process spawn. Test-only (`#[cfg(test)]`). |
@@ -52,6 +52,13 @@ fallback is NOT needed for v1** (keep it as a documented future option only).
   `Provenance::Derived`. `now` is injected so `derive_session_limit` is pure. The authoritative
   token % replaces it only when the overlay is enabled (Wave 7). Rationale: a countdown-style proxy
   is more useful on the dashboard than `n/a`, and the `Derived` badge prevents plane-conflation.
+- **A time proxy never carries severity (amended 2026-09-04):** `derive_session_limit` stamps
+  `Severity::Ok` unconditionally. It originally ran its percent through `severity_for`, which meant
+  a 5h window simply *elapsing* past `warn_pct` painted the gauge yellow and fired a desktop alert —
+  an alarm on the clock, on an account that may have spent nothing. Thresholds classify quota
+  readings only. Surfaces mark the proxy instead: the TUI prefixes a non-authoritative percent with
+  `~` and replaces the severity word with `elapsed` (`~76% elapsed`), so the `Derived` badge is no
+  longer the *only* thing separating a clock from real usage — the row itself says which it is.
 - **Early `tok once` (human + `--json`):** the minimal `once` command (spec 009) landed here so the
   collector core is reachable from `main` (keeps the strict-lints build free of dead code) and gives
   immediate end-to-end value. `--json` serializes `UsageSnapshot` + derived `Limit`. The `doctor`

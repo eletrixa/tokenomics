@@ -28,7 +28,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Sparkline};
 use ratatui::Frame;
 
-use crate::domain::Severity;
+use crate::domain::{Provenance, Severity};
 use crate::format::severity_label;
 
 use super::model::{
@@ -733,7 +733,8 @@ fn gauge_line(
 }
 
 /// The narrow label: `"[scope ]pct[ reset]"` (e.g. `"42% 1h 11m"`) — the time value is never
-/// reformatted (verbatim rule); only the `"resets in "` filler is shed.
+/// reformatted (verbatim rule); only the `"resets in "` filler is shed. The `~` proxy prefix
+/// survives every tier: a non-authoritative percent must never render bare, at any width.
 fn tight_label(g: &GaugeView) -> String {
     if g.expired {
         return g.label(); // "[scope ]waiting for reset" — no stale pct to show
@@ -742,6 +743,9 @@ fn tight_label(g: &GaugeView) -> String {
     if let Some(scope) = &g.scope {
         s.push_str(scope);
         s.push(' ');
+    }
+    if g.source != Provenance::Authoritative {
+        s.push('~');
     }
     s.push_str(&g.pct);
     if let Some(reset) = g.reset_short() {
@@ -1299,6 +1303,10 @@ fn render_help(f: &mut Frame<'_>, area: Rect) {
             "The api section shows REAL money (balances & bills) — never the notional proxy.",
         ),
         Line::from("Badge shows provenance: derived (local) vs authoritative (overlay)."),
+        Line::from(
+            "A ~ prefix marks a gauge that is NOT a live quota reading: \"~76% elapsed\" is",
+        ),
+        Line::from("the 5h clock (overlay stale), \"~76% warn\" is the last authoritative value."),
         Line::from("An inactive account, when shown, is dimmed and tagged \"(inactive)\"."),
     ];
     f.render_widget(Paragraph::new(lines), inner);
@@ -1336,6 +1344,18 @@ mod tests {
             scope: scope.map(str::to_string),
             color: severity_color(severity),
             expired: false,
+            source: Provenance::Authoritative,
+        }
+    }
+
+    /// A proxy gauge: the `Derived` time-in-window clock the Claude local lane produces when the
+    /// overlay is stale — must never render as a bare measured percent.
+    fn derived_gauge(pct: f64) -> GaugeView {
+        GaugeView {
+            source: Provenance::Derived,
+            severity: Severity::Ok,
+            color: Color::DarkGray,
+            ..gauge(pct, Severity::Ok, None)
         }
     }
 
@@ -1630,6 +1650,42 @@ mod tests {
         assert!(text.contains("usage 5s ago"), "local-plane age:\n{text}");
         assert!(!text.contains("enable overlay"), "no nudge:\n{text}");
         assert_no_overflow(&text, 120);
+    }
+
+    /// The proxy marker must survive every width tier. A `Derived` 5h gauge is the time-elapsed
+    /// clock the local lane produces while the overlay is stale — at 76% it used to render exactly
+    /// like a measured `76% warn`, so the board claimed three-quarters of the quota was spent when
+    /// nothing but three of five hours had passed.
+    #[test]
+    fn derived_gauge_is_marked_a_proxy_at_every_tier() {
+        let mut row = overlay_row();
+        row.session = Some(derived_gauge(76.0));
+        row.weekly = None;
+        row.weekly_scoped = None;
+        row.headline = row.session.clone();
+        row.severity = Severity::Ok;
+
+        let mut app = App::new(1, true);
+        app.rows = vec![row];
+        app.fleet = Some(fleet_derived());
+
+        // FULL tier: the percent is prefixed and the severity word is replaced by what it measures.
+        let full = draw(&app, 120, 40);
+        assert!(
+            full.contains("~76% elapsed · resets in 1h 11m"),
+            "full tier proxy label:\n{full}"
+        );
+        assert!(
+            !full.contains("76% warn"),
+            "a clock must never read as a quota warning:\n{full}"
+        );
+        assert_no_overflow(&full, 120);
+
+        // MICRO tier sheds the "resets in" filler but never the `~` — a bare percent at any width
+        // would be the same lie in fewer cells.
+        let tight = draw(&app, 46, 10);
+        assert!(tight.contains("~76%"), "tight tier proxy prefix:\n{tight}");
+        assert_no_overflow(&tight, 46);
     }
 
     #[test]

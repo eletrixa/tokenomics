@@ -23,9 +23,8 @@ use std::time::Duration;
 use jiff::Timestamp;
 use serde::Deserialize;
 
-use crate::domain::{Limit, LimitKind, Provenance, Provider, UsageSnapshot, Window};
+use crate::domain::{Limit, LimitKind, Provenance, Provider, Severity, UsageSnapshot, Window};
 use crate::error::{AppError, AppResult};
-use crate::format::severity_for;
 use crate::runner::CommandSpec;
 
 /// How to invoke ccusage. Defaults to a bare `ccusage` on `PATH`; a config override can supply a
@@ -204,14 +203,14 @@ fn reduce_window(block: &CcusageBlock) -> Option<Window> {
 /// `resets_at` = window end (verbatim), `source = Derived`. `now` is injected (pure). Returns
 /// `None` when there is no window or the window has zero span.
 ///
+/// Severity is ALWAYS `Ok`. This percent is a **clock** — how far through the 5h window we are —
+/// not a quota reading. Running it through `severity_for` painted every window yellow past 75% and
+/// fired a desktop alert on nothing but elapsed time. A proxy never alarms; the `Derived` provenance
+/// is what the surfaces key off to label it as a proxy.
+///
 /// The i64→f64 millisecond casts are exact for any window shorter than ~285,000 years.
 #[allow(clippy::cast_precision_loss)]
-pub fn derive_session_limit(
-    snapshot: &UsageSnapshot,
-    now: Timestamp,
-    warn_pct: f64,
-    crit_pct: f64,
-) -> Option<Limit> {
+pub fn derive_session_limit(snapshot: &UsageSnapshot, now: Timestamp) -> Option<Limit> {
     let window = snapshot.window.as_ref()?;
     let span_ms = window.end.as_millisecond() - window.start.as_millisecond();
     if span_ms <= 0 {
@@ -226,7 +225,7 @@ pub fn derive_session_limit(
         scope: None,
         utilization_pct,
         resets_at: window.end.to_string(),
-        severity: severity_for(utilization_pct, warn_pct, crit_pct),
+        severity: Severity::Ok,
         source: Provenance::Derived,
     })
 }
@@ -302,8 +301,8 @@ mod tests {
     fn derives_session_limit_as_time_in_window() {
         let snap = active_snapshot();
         // 07:00 → 12:00 is 300 min; at 10:00 that is 180/300 = 60%.
-        let limit = derive_session_limit(&snap, ts("2026-07-04T10:00:00Z"), 75.0, 90.0)
-            .expect("derives a limit");
+        let limit =
+            derive_session_limit(&snap, ts("2026-07-04T10:00:00Z")).expect("derives a limit");
         assert_eq!(limit.kind, LimitKind::Session);
         assert_eq!(limit.source, Provenance::Derived);
         assert!((limit.utilization_pct - 60.0).abs() < 1e-6);
@@ -312,17 +311,17 @@ mod tests {
     }
 
     #[test]
-    fn derived_utilization_clamps_and_classifies() {
+    fn derived_utilization_clamps_and_never_alarms() {
         let snap = active_snapshot();
-        // Past the window end clamps to 100 and is Crit.
-        let limit =
-            derive_session_limit(&snap, ts("2026-07-04T13:00:00Z"), 75.0, 90.0).expect("derives");
+        // Past the window end clamps to 100 — but a clock at 100% is still `Ok`: it means the 5h
+        // window elapsed, NOT that the quota is spent. Alarming here was the false-warn bug.
+        let limit = derive_session_limit(&snap, ts("2026-07-04T13:00:00Z")).expect("derives");
         assert!((limit.utilization_pct - 100.0).abs() < 1e-6);
-        assert_eq!(limit.severity, Severity::Crit);
+        assert_eq!(limit.severity, Severity::Ok);
         // Before the window start clamps to 0.
-        let before =
-            derive_session_limit(&snap, ts("2026-07-04T06:00:00Z"), 75.0, 90.0).expect("derives");
+        let before = derive_session_limit(&snap, ts("2026-07-04T06:00:00Z")).expect("derives");
         assert!((before.utilization_pct - 0.0).abs() < 1e-6);
+        assert_eq!(before.severity, Severity::Ok);
     }
 
     #[test]

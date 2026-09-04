@@ -1573,7 +1573,8 @@ fn apply_outcome(
         .saturating_mul(OVERLAY_TTL_FACTOR);
 
     // Re-stamp local-limit severity from the CURRENT thresholds, so a hot-reloaded warn/crit takes
-    // effect at harvest exactly as it does for the derived session limit (spec 015 §A discipline).
+    // effect at harvest (spec 015 §A discipline). The derived session limit is exempt by design: it
+    // is a clock, not a quota reading, so no threshold applies to it (see `derive_session_limit`).
     for limit in &mut local_limits {
         limit.severity = crate::format::severity_for(limit.utilization_pct, warn, crit);
     }
@@ -1585,8 +1586,6 @@ fn apply_outcome(
                 &snapshot,
                 local_limits,
                 now,
-                warn,
-                crit,
                 alerts,
                 overlay_ttl_secs,
             ) {
@@ -1644,22 +1643,20 @@ fn reevaluate_limits(
 }
 
 /// Persist a snapshot and its derived session limit plus any local limits (via the shared
-/// merge+alert write path).
-#[allow(clippy::too_many_arguments)]
+/// merge+alert write path). Takes no thresholds: `local_limits` arrive already re-stamped by the
+/// caller, and the derived session limit carries no severity to stamp.
 fn persist_snapshot(
     store: &Store,
     snapshot: &UsageSnapshot,
     local_limits: Vec<Limit>,
     now: Timestamp,
-    warn: f64,
-    crit: f64,
     alerts: &mut AlertTracker,
     overlay_ttl_secs: u64,
 ) -> AppResult<()> {
     store.insert_snapshot(snapshot)?;
     // Always run the merge point — with an empty set when no block is active — so the stale-
     // authoritative demotion applies on every outcome, not only when a derived limit exists.
-    let new_limits: Vec<Limit> = derive_session_limit(snapshot, now, warn, crit)
+    let new_limits: Vec<Limit> = derive_session_limit(snapshot, now)
         .into_iter()
         .chain(local_limits)
         .collect();
