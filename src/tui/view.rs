@@ -7,7 +7,9 @@
 //!          the ledger clause's tier degrade order (`pick_full_clause`, `compact_header_line`,
 //!          `micro_line`) and the fleet header's ledger token (spec 017 §D acceptance 5); the
 //!          verified pill's own degrade step + dim-green span styling (`split_pill`,
-//!          `full_title_spans`) and its absence from MICRO (spec 018 §C acceptance 3/4); the `o`-gated
+//!          `full_title_spans`) and its absence from MICRO (spec 018 §C acceptance 3/4); the
+//!          renewal cancel window's per-day colour ramp (`renew_urgency_style`, FULL + COMPACT,
+//!          spec 017 §D.1); the `o`-gated
 //!          API billing section (`render_api`) — its states, the shared `fit_segments` drop-from-right
 //!          fit (also used by `render_fleet`, byte-identical fleet behaviour), the height gate, and
 //!          the `NO_COLOR` grid with the section on (spec 025 §A/§B/§D)
@@ -773,6 +775,26 @@ fn pick_full_clause(sub: &SubView, avail: usize) -> Option<&str> {
     .map(String::as_str)
 }
 
+/// The ledger clause's style inside the renewal cancel window (spec 017 §D.1): a per-day escalating
+/// ramp — 5–4d yellow, 3–2d light red, 1d/today red and reversed (the loudest form, the last chance
+/// to cancel before the charge). Always bold, so the clause outweighs the rest of the title even
+/// under `NO_COLOR` (where the `⚠` in the clause text carries the rest of the signal).
+fn renew_urgency_style(days: i32, use_color: bool) -> Style {
+    let color = match days {
+        5 | 4 => Color::Yellow,
+        3 | 2 => Color::LightRed,
+        _ => Color::Red,
+    };
+    let style = Style::new()
+        .fg(resolve_color(use_color, color))
+        .add_modifier(Modifier::BOLD);
+    if days <= 1 {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    }
+}
+
 /// Split the verified pill off the end of a picked FULL-tier clause string (spec 018 §C), so it can
 /// be styled distinctly (dim green) from the rest of the title. Compares `clause` against `sub.full`
 /// to know whether the roomiest (date-bearing) pill suffix applies or the bare `" ✓"` suffix shared
@@ -815,7 +837,15 @@ fn full_title_spans(
         return vec![Span::styled(format!("{prefix} "), bold)];
     };
     let (base, pill) = split_pill(sub, clause);
-    let mut spans = vec![Span::styled(format!("{prefix} {base}"), bold)];
+    // The clause is its own span so a near renewal can carry the urgency ramp (spec 017 §D.1)
+    // without restyling the account title next to it.
+    let clause_style = sub
+        .renew_days
+        .map_or(bold, |days| renew_urgency_style(days, use_color));
+    let mut spans = vec![
+        Span::styled(format!("{prefix} "), bold),
+        Span::styled(base.to_string(), clause_style),
+    ];
     if let Some(pill) = pill {
         spans.push(Span::styled(
             pill.to_string(),
@@ -894,6 +924,7 @@ fn render_compact_block(
             spine_color,
             area.width,
             resolve_color(app.use_color, Color::DarkGray),
+            app.use_color,
         )),
         sub[0],
     );
@@ -920,12 +951,18 @@ fn compact_header_line(
     spine_color: Color,
     width: u16,
     dim: Color,
+    use_color: bool,
 ) -> Line<'static> {
     let caret = if selected { "▶ " } else { "  " };
-    let name = format!("{caret}{}", row.title);
-    let name_w = name.chars().count();
     let (cluster, cluster_w) = compact_cluster(row);
     let avail = usize::from(width).saturating_sub(1); // minus the spine column
+                                                      // A long title (the ` (= label)` / ` (inactive)` tags) is cut so the severity cluster — the
+                                                      // one signal this line must never lose — still fits.
+    let name: String = format!("{caret}{}", row.title)
+        .chars()
+        .take(avail.saturating_sub(cluster_w))
+        .collect();
+    let name_w = name.chars().count();
 
     // spec 017 §D: two-step ladder — try the short dim clause first; if adding it would leave no
     // padding at all (name + clause + cluster would fill or overflow the line), drop the clause.
@@ -947,7 +984,12 @@ fn compact_header_line(
     ));
     let content_w = if let Some(clause) = clause {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(clause.to_string(), Style::new().fg(dim)));
+        // Same urgency ramp as FULL (spec 017 §D.1); otherwise the clause stays dim chrome.
+        let style = row.sub.renew_days.map_or_else(
+            || Style::new().fg(dim),
+            |days| renew_urgency_style(days, use_color),
+        );
+        spans.push(Span::styled(clause.to_string(), style));
         name_w + 1 + clause.chars().count()
     } else {
         name_w
@@ -2028,6 +2070,7 @@ mod tests {
             compact: Some("· renews 27d".to_string()),
             pill_full: None,
             pill_bare: None,
+            renew_days: None,
         }
     }
 
@@ -2046,6 +2089,7 @@ mod tests {
             compact: Some("· renews 27d ✓".to_string()),
             pill_full: Some(" ✓ 2026-07-18".to_string()),
             pill_bare: Some(" ✓".to_string()),
+            renew_days: None,
         }
     }
 
@@ -2069,6 +2113,7 @@ mod tests {
             compact: Some("· ends 4d".to_string()),
             pill_full: None,
             pill_bare: None,
+            renew_days: None,
         }
     }
 
@@ -2082,6 +2127,7 @@ mod tests {
             compact: Some("· ended".to_string()),
             pill_full: None,
             pill_bare: None,
+            renew_days: None,
         }
     }
 
@@ -2095,6 +2141,7 @@ mod tests {
             compact: Some(bare),
             pill_full: None,
             pill_bare: None,
+            renew_days: None,
         }
     }
 
@@ -2133,6 +2180,7 @@ mod tests {
                 Color::Cyan,
                 80,
                 Color::DarkGray,
+                true,
             ));
             assert!(
                 compact_text.contains(compact_needle),
@@ -2281,6 +2329,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn renew_urgency_ramps_per_day_and_honours_no_color() {
+        // Spec 017 §D.1: the closer the renewal, the louder the clause.
+        for (days, color, reversed) in [
+            (5, Color::Yellow, false),
+            (4, Color::Yellow, false),
+            (3, Color::LightRed, false),
+            (2, Color::LightRed, false),
+            (1, Color::Red, true),
+            (0, Color::Red, true),
+        ] {
+            let style = renew_urgency_style(days, true);
+            assert_eq!(style.fg, Some(color), "{days}d out");
+            assert!(style.add_modifier.contains(Modifier::BOLD), "{days}d out");
+            assert_eq!(
+                style.add_modifier.contains(Modifier::REVERSED),
+                reversed,
+                "{days}d out: only the last day reverses"
+            );
+        }
+        let mono = renew_urgency_style(0, false);
+        assert_eq!(
+            mono.fg,
+            Some(Color::Reset),
+            "NO_COLOR drops the colour; the clause's ⚠ + bold carry the signal"
+        );
+        assert!(mono.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn full_title_styles_a_near_renewal_clause_urgently() {
+        let mut sub = sub_view_all_forms();
+        sub.renew_days = Some(2);
+        let spans = full_title_spans("Personal [claude]", "", &sub, 200, true);
+        let clause = spans
+            .iter()
+            .find(|s| s.content.contains("renews"))
+            .expect("the clause renders at this width");
+        assert_eq!(
+            clause.style.fg,
+            Some(Color::LightRed),
+            "the clause span carries the urgency ramp: {spans:?}"
+        );
+        assert!(
+            spans[0].style.fg.is_none(),
+            "the account title itself is untouched: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn compact_header_styles_a_near_renewal_clause_urgently() {
+        let mut sub = sub_view_all_forms();
+        sub.renew_days = Some(0);
+        let row = row_with_sub("Personal [claude]", sub);
+        let line = compact_header_line(&row, false, "▏", Color::Cyan, 80, Color::DarkGray, true);
+        let clause = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("renews"))
+            .expect("the clause fits at 80 cells");
+        assert_eq!(clause.style.fg, Some(Color::Red));
+        assert!(clause.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
     /// Flatten a `Line`'s spans into plain text, for asserting on `compact_header_line`/`micro_line`
     /// output directly (pure, no tier-selection geometry involved — those are covered by `choose_tier`
     /// and the full-render tests elsewhere).
@@ -2298,6 +2410,7 @@ mod tests {
             Color::Cyan,
             80,
             Color::DarkGray,
+            true,
         ));
         assert!(
             text.contains("renews 27d"),
@@ -2318,6 +2431,7 @@ mod tests {
             Color::Cyan,
             30,
             Color::DarkGray,
+            true,
         ));
         assert!(
             text.chars().count() <= 30,
@@ -2350,6 +2464,7 @@ mod tests {
             Color::Cyan,
             80,
             Color::DarkGray,
+            true,
         ));
         assert!(
             text.contains("renews 27d ✓"),
@@ -2368,6 +2483,7 @@ mod tests {
             Color::Cyan,
             30,
             Color::DarkGray,
+            true,
         ));
         assert!(
             !text.contains('✓'),

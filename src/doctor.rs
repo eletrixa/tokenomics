@@ -82,7 +82,7 @@ use crate::ledger::{
 };
 use crate::providers::claude::ccusage::CcusageInvocation;
 use crate::providers::claude::overlay::{HttpUsageEndpoint, UsageEndpoint};
-use crate::providers::claude::{creds, ClaudeAdapter};
+use crate::providers::claude::{creds, identity, ClaudeAdapter};
 use crate::providers::codex::rate_limits::{AppServerClient, RateLimitsSource};
 use crate::providers::ProviderAdapter;
 use crate::runner::{CommandSpec, Exec, Runner};
@@ -141,10 +141,13 @@ pub async fn run_doctor(cfg: &Config) -> AppResult<()> {
 
     report_distinctness(&signatures);
     report_shared_projects(cfg);
+    report_identity_collisions(cfg);
     report_config_divergence(cfg);
     let today = now.to_zoned(TimeZone::system()).date();
     report_ledger(cfg, today);
-    report_api(cfg, today, now_ms);
+    // UTC, not the system zone: the TUI ages API-manual rows on the UTC date (spec 025), and the
+    // two must agree on "stale" in the hours after local midnight.
+    report_api(cfg, now.to_zoned(TimeZone::UTC).date(), now_ms);
     Ok(())
 }
 
@@ -983,6 +986,46 @@ fn shared_projects_groups(resolved: &[(String, PathBuf)]) -> Vec<Vec<String>> {
         by_real.entry(real).or_default().push(id.clone());
     }
     by_real.into_values().filter(|ids| ids.len() >= 2).collect()
+}
+
+/// Report whether any Claude accounts are logged into the SAME Anthropic account (same
+/// `accountUuid` in `<config_dir>/.claude.json`) — one quota rendered N times, i.e. N boxes with
+/// byte-identical limit bars. Read-only; only email + uuid are read, never credentials.
+fn report_identity_collisions(cfg: &Config) {
+    let resolved = identity::resolve_identities(&cfg.accounts);
+    let groups = identity::collision_groups(&resolved);
+    // An account whose `.claude.json` is missing/unreadable/stub was never compared — say so
+    // instead of letting it ride on a blanket "distinct ✓".
+    let unread: Vec<&str> = cfg
+        .accounts
+        .iter()
+        .filter(|a| a.active && a.provider == Provider::Claude)
+        .filter(|a| !resolved.iter().any(|(id, _)| id == &a.id))
+        .map(|a| a.id.as_str())
+        .collect();
+    if !unread.is_empty() {
+        println!(
+            "\naccount identity: NOT CHECKED for {} (no readable login in <config_dir>/.claude.json)",
+            unread.join(", ")
+        );
+    }
+    if groups.is_empty() {
+        if unread.is_empty() {
+            println!(
+                "\naccount identity: distinct ✓ (each config_dir holds its own Anthropic account)"
+            );
+        }
+        return;
+    }
+    println!(
+        "\naccount identity: SHARED ✗ — these are the SAME Anthropic account (one quota, shown twice):"
+    );
+    for (label, ids) in &groups {
+        println!("  {} → {label}", ids.join(", "));
+    }
+    println!(
+        "  re-login the duplicate dir into its own Anthropic account, or mark it `active = false`"
+    );
 }
 
 fn report_config_dir(account: &crate::domain::Account) {

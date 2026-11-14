@@ -82,8 +82,14 @@ fn main() -> ExitCode {
         Some("init") => cmd_init(),
         Some("validate") => cmd_validate(),
         Some("accounts") => cmd_accounts(),
-        Some("once") => cmd_once(args.iter().any(|a| a == "--json")),
-        Some("collector") => cmd_collector(args.iter().any(|a| a == "--once")),
+        Some("once") => match unknown_arg(&args[1..], &["--json"]) {
+            Some(bad) => bad_arg(bad),
+            None => cmd_once(args.iter().any(|a| a == "--json")),
+        },
+        Some("collector") => match unknown_arg(&args[1..], &["--once"]) {
+            Some(bad) => bad_arg(bad),
+            None => cmd_collector(args.iter().any(|a| a == "--once")),
+        },
         Some("doctor") => cmd_doctor(),
         Some(other) => {
             eprintln!("tok: unknown command '{other}' (try `tok --help`)");
@@ -91,6 +97,18 @@ fn main() -> ExitCode {
         }
         None => cmd_tui(),
     }
+}
+
+/// First argument not in `allowed` (a typo like `--onc` must not silently start the daemon).
+fn unknown_arg<'a>(args: &'a [String], allowed: &[&str]) -> Option<&'a str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|a| !allowed.contains(a))
+}
+
+fn bad_arg(arg: &str) -> ExitCode {
+    eprintln!("tok: unknown argument '{arg}' (try `tok --help`)");
+    ExitCode::from(2)
 }
 
 /// Starter `tokenomics.toml`, embedded from the repo-root example so the file `tok init` writes and
@@ -363,7 +381,7 @@ fn cmd_collector(once: bool) -> ExitCode {
     if once {
         collector_single_pass(&cfg, &runtime)
     } else {
-        collector_daemon(&cfg, &runtime)
+        collector_daemon(&cfg, runtime)
     }
 }
 
@@ -374,7 +392,7 @@ fn collector_single_pass(cfg: &Config, runtime: &tokio::runtime::Runtime) -> Exi
         Ok(path) => {
             println!(
                 "collector: wrote {} account(s) → {}",
-                records.len(),
+                records.iter().filter(|r| r.snapshot.is_some()).count(),
                 path.display()
             );
             ExitCode::SUCCESS
@@ -387,7 +405,7 @@ fn collector_single_pass(cfg: &Config, runtime: &tokio::runtime::Runtime) -> Exi
 }
 
 /// `tok collector`: run the 24/7 cadence loop until SIGINT/SIGTERM.
-fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode {
+fn collector_daemon(cfg: &Config, runtime: tokio::runtime::Runtime) -> ExitCode {
     let path = match paths::store_path() {
         Ok(path) => path,
         Err(e) => {
@@ -436,6 +454,8 @@ fn collector_daemon(cfg: &Config, runtime: &tokio::runtime::Runtime) -> ExitCode
         )
         .await
     });
+    // A wedged spawn_blocking D-Bus notification must not hang shutdown on SIGTERM.
+    runtime.shutdown_timeout(Duration::from_secs(2));
     match result {
         Ok(()) => {
             println!("collector: stopped");
@@ -580,6 +600,14 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_arg_flags_typos() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(unknown_arg(&a(&["--once"]), &["--once"]), None);
+        assert_eq!(unknown_arg(&a(&[]), &["--once"]), None);
+        assert_eq!(unknown_arg(&a(&["--onc"]), &["--once"]), Some("--onc"));
+    }
 
     fn account(id: &str, active: bool) -> Account {
         Account {

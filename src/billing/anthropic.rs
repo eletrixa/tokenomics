@@ -83,14 +83,16 @@ pub fn parse_cost_report(bytes: &[u8]) -> AppResult<CostPage> {
     let mut unusable: usize = 0; // USD results whose amount was missing/unparsable
     for bucket in response.data {
         for result in bucket.results {
-            // Out of scope: a non-USD (or currency-less) result is never summed and never counts as
-            // unusable — it is simply not this plane's currency (no cross-currency arithmetic).
-            let is_usd = result
-                .currency
-                .as_deref()
-                .is_some_and(|c| c.eq_ignore_ascii_case("USD"));
-            if !is_usd {
-                continue;
+            // Out of scope only when a currency is PRESENT and not USD (no cross-currency
+            // arithmetic). A missing currency is drift, not a foreign currency: in scope + unusable.
+            match result.currency.as_deref() {
+                Some(c) if !c.eq_ignore_ascii_case("USD") => continue,
+                Some(_) => {}
+                None => {
+                    in_scope += 1;
+                    unusable += 1;
+                    continue;
+                }
             }
             in_scope += 1;
             match result.amount.as_deref().and_then(parse_cents_decimal_micro) {
@@ -285,18 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_currency_is_skipped_not_counted_as_usd() {
+    fn missing_currency_is_unusable_and_errors_not_zero() {
         let body = br#"{"data":[{"results":[
             {"amount":"500"}
         ]}],"has_more":false}"#;
-        let page = parse_cost_report(body).expect("parses");
-        assert_eq!(
-            page,
-            CostPage {
-                micro: 0,
-                next_page: None
-            },
-            "no currency ⇒ not USD ⇒ skipped, not an unusable-USD result"
+        assert!(
+            parse_cost_report(body).is_err(),
+            "no currency ⇒ schema drift ⇒ unusable, never a confident $0.00"
         );
     }
 

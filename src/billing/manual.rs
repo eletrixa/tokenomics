@@ -143,14 +143,6 @@ fn as_of_text(v: &toml::Value) -> Option<String> {
     }
 }
 
-/// Parse a manual-row `figure` string into an `ApiFigureKind`. Depends on the pinned sibling
-/// contract exposing `parse(&str) -> Option<Self>` — the `as_str`/`parse` "like Provider" shape
-/// spec 024 §A pins for this enum, and the shape `ledger` uses for `SubStatus`. `None` ⇒ a per-row
-/// "bad figure" error (never silently coerced).
-fn parse_figure(s: &str) -> Option<ApiFigureKind> {
-    ApiFigureKind::parse(s)
-}
-
 /// Coerce a raw TOML amount value to exact cents. A decimal **string** (`amount = "1.015"`) is the
 /// exact lane — parsed digit-for-digit, half-even ([`crate::billing::parse_dollars_decimal_micro`]).
 /// A TOML **float** stays accepted (`amount = 40.12`) but rides f64 (`1.015` may land a cent off
@@ -215,7 +207,7 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
             });
             continue;
         };
-        let Some(figure) = parse_figure(&figure_str) else {
+        let Some(figure) = ApiFigureKind::parse(&figure_str) else {
             errors.push(RowError {
                 id: Some(id.clone()),
                 reason: format!("unknown figure '{figure_str}'"),

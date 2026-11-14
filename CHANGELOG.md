@@ -6,7 +6,52 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ## [Unreleased]
 
+### CHANGED
+
+- **The transcript scanner parses only appended bytes.** A live transcript that grew was re-read and
+  re-parsed from byte 0 every tick (447 MB per minute on a busy machine). It now resumes from the end of
+  the last complete line; a truncated file restarts, and an unopenable file is retried next tick. The
+  burn rate also reads 0 for a block spanning under a minute instead of a spike.
+
 ### FIXED
+
+- `[settings] ledger_path` now expands a leading `~` like `config_dir` does (the SETUP example no longer reads as a missing ledger).
+- One wrong-typed field in one ledger row (e.g. a quoted date) now drops only that row instead of every account's dates.
+- `tok collector --once` reports the number of accounts actually written, not the number collected.
+- `tok once` / `tok collector` reject unknown arguments (exit 2) instead of ignoring them, so a typo like `--onc` no longer starts the daemon.
+- **API billing no longer shows $0.00 when the cost API drops the `currency` field.** A result with
+  no currency is now unusable (the card degrades) instead of being skipped as "not USD"; only an
+  explicit non-USD currency is skipped.
+- **One bad byte in the Grok `unified.jsonl` no longer blanks the Grok usage and weekly gauge.** The
+  log is read lossily, so only the damaged line is lost.
+- **A bad z.ai weekly `nextResetTime` no longer drops the session limit.** The weekly reset renders
+  empty and the session limit survives.
+
+- **The 5h row no longer shows a grey clock bar when Anthropic reports no 5h figure.** The limits
+  overlay now answers with weekly limits only (`five_hour: null`). The row showed the local
+  time-elapsed clock in its place, identical on every account, and that clock could become the
+  account's headline number. With a fresh overlay and no session figure the row now reads
+  `n/a (no 5h limit reported)`. The clock remains the fallback when the
+  overlay is off or stale.
+
+- **A collect task that panics no longer freezes its account.** The account id stayed in the
+  in-flight set forever, so the account was never collected again while the heartbeat still looked
+  healthy. The set is now cleared on a task join error.
+- **A warn → crit escalation is no longer swallowed by the alert cooldown.** The 5-minute cooldown
+  suppressed the crit notification when it followed a warn on the same limit. An escalation now
+  always fires; a same-level re-crossing still waits for the cooldown.
+- **Overlay retry after a 429 no longer waits one interval too long** (900s instead of the computed
+  600s at the default cadence) — the same off-by-one the API billing lane had already fixed.
+- **A failed store read no longer shows another account's row** after a config hot-reload changed
+  the account order: the last-good row is found by title, not by position.
+- **COMPACT tier: a long title no longer pushes the severity cluster off the line.** The title is
+  cut instead (`(= label)` / `(inactive)` tags made it long enough to matter).
+- **`tok doctor` account identity:** an account whose `.claude.json` has no readable login is listed
+  as `NOT CHECKED` instead of riding on a blanket `distinct ✓`; inactive accounts are out of the
+  check (and of the TUI `(= label)` tag), so `active = false` on a duplicate clears the warning.
+- **`tok doctor` and the TUI now agree on a stale API-manual row** in the hours after local
+  midnight (both use the UTC date).
+- `check.sh` PII gate now also scans the root `*.md` files.
 
 - **The 5h gauge no longer reports the clock as usage.** When an account's overlay goes stale, the
   5h figure falls back to a locally derived proxy that measures *time elapsed in the window*, not
@@ -17,12 +62,25 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   it actually measures: `~76% elapsed`. A last-known authoritative value whose overlay went stale
   keeps its severity but gains the same `~` prefix. The `~` survives every width tier.
 
+- **A live Grok/Gemini/Codex account no longer shows "idle (no active block)".** Those providers'
+  snapshots carry `window: None` by construction (no block surface), which the status renderer read
+  as idle — so an account mid-inference was branded idle. The idle status now fires only for
+  Claude, the one provider with a real 5h block surface (ccusage).
+
 ### CHANGED
 
 - **Claude local usage is now scanned natively** (spec 026): `<config_dir>/projects/**/*.jsonl` is read in-process — streaming, 24h mtime lookback, per-file incremental cache, one scan per shared `projects/` tree per tick, scans serialised. Replaces the per-account `ccusage blocks --json` subprocess, which on an 11 GB tree cost 10.8 s / 1.2 GB **per account per tick** and OOM-killed the collector. `ccusage` is now opt-in via `[settings] ccusage_cmd`. Notional cost comes from a built-in pricing table (unknown models count tokens, contribute $0).
 - `tok doctor` prints the active Claude lane (`native transcript scanner` / `ccusage subprocess`) and only probes ccusage when that lane is selected.
 - Golden `tok once --json`: a Claude account without a `projects/` tree is idle (no `error` field) instead of a ccusage error.
 - Documented collector unit gains `MemoryHigh=768M` / `MemoryMax=1G`.
+
+- **A renewal 5 days out or less now escalates in the account header (spec 017 §D.1).** Inside that
+  cancel window the ledger clause gains a `⚠` marker (`· ⚠ renews in 3d (2026-08-14)`) and gets
+  louder each day: 5–4d yellow, 3–2d light red, 1d/today red and reversed, bold throughout, in both
+  the FULL and COMPACT tiers. Text and colour carry the signal independently, so `NO_COLOR` still
+  shows the marker. Renewals further out, past-`renews` (stale) rows and every cancelled state are
+  unchanged; the cancelled `ends` countdown deliberately does not escalate. Display only — alerts
+  still key off `utilization_pct` exclusively.
 
 - **Default local poll cadence raised from 10s to 60s.** A local tick re-reads every transcript
   under each account's `config_dir`, so cost scales with history size — with a multi-GB
@@ -64,6 +122,14 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   real subprocess, so effective heavy concurrency stays well under the cap.
 
 ### ADDED
+- **Same-Anthropic-account detection.** Two config dirs logged into one account (same
+  `oauthAccount.accountUuid` in `.claude.json`) share one quota, so their boxes show byte-identical
+  limit bars — which reads as a bug. `tok doctor` now prints an `account identity:` section
+  (`distinct ✓` / `SHARED ✗` with `eletrixa, rob7 → <account email>`), and the TUI tags every
+  duplicate's title right after the provider tag: `Rob7 [claude] (= Eletrixa)`. Resolved once at
+  TUI startup from each dir's `.claude.json` (non-secret; `.credentials.json` never read) — no
+  collector or store change. Grouping is by account uuid only, not org (two accounts in one org
+  still bill separately).
 - **`docs/multi-account.md` — a guide for running multiple Claude Max accounts in parallel without
   re-logging.** Covers the `CLAUDE_CONFIG_DIR` isolation model (one login per account dir, shared
   skills/agents/history via symlinks back to `~/.claude`), one-time per-account setup, a reference

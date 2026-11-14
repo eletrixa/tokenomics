@@ -10,7 +10,8 @@
 //! - `active_block`: ccusage's 5h session-block semantics over sorted events (pure).
 //! - `price_for`: static longest-prefix pricing table → notional USD (a proxy, never a bill).
 //! - `reduce_snapshot`: events + `now` → `UsageSnapshot` (pure).
-//! - `TranscriptScanner`: the stateful walker — mtime-pruned, per-file incremental cache, one scan per
+//! - `TranscriptScanner`: the stateful walker — mtime-pruned, per-file append-only cache (only bytes past the last complete line are
+//!   parsed), one scan per
 //!   `(canonical projects dir, now)` so N accounts symlinked to one tree cost one scan per tick.
 //!
 //! Design constraints:
@@ -20,7 +21,7 @@
 //! - Malformed lines / unreadable files are skipped, never errors; a missing tree is idle (`None`).
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -290,7 +291,8 @@ pub fn reduce_snapshot(
 ) -> Option<UsageSnapshot> {
     let block = active_block(&dedup_sorted(events), now)?;
     let span_min = (block.last.as_millisecond() - block.first.as_millisecond()) as f64 / 60_000.0;
-    let (tokens_per_minute, cost_per_hour) = if span_min > 0.0 {
+    // A sub-minute span makes tok/min a meaningless spike (two events 3 s apart ⇒ ~200k/min).
+    let (tokens_per_minute, cost_per_hour) = if span_min >= 1.0 {
         (
             block.total() as f64 / span_min,
             block.cost / span_min * 60.0,
@@ -320,11 +322,16 @@ pub fn reduce_snapshot(
 
 // ── scanner ─────────────────────────────────────────────────────────────────────────────────────
 
-/// Per-file parse cache: re-read only when `(mtime, len)` changes.
-#[derive(Debug)]
+/// Per-file parse cache: unchanged `(mtime, len)` ⇒ reuse; grown ⇒ parse only the appended complete
+/// lines; shrunk ⇒ parse again from zero.
+#[derive(Debug, Default)]
 struct FileEntry {
-    mtime: SystemTime,
+    mtime: Option<SystemTime>,
     len: u64,
+    /// Byte position just after the last complete (`\n`-terminated) line parsed.
+    offset: u64,
+    /// Complete lines consumed, so the `{path}#{index}` dedup fallback matches a full parse.
+    lines: usize,
     events: Vec<UsageEvent>,
 }
 
@@ -392,14 +399,19 @@ fn scan_tree(
     collect_jsonl_paths(root, cutoff, &mut paths);
     let mut fresh = HashMap::with_capacity(paths.len());
     for (path, mtime, len) in paths {
-        let entry = match files.remove(&path) {
-            Some(e) if e.mtime == mtime && e.len == len => e,
-            _ => FileEntry {
-                mtime,
-                len,
-                events: parse_file(&path),
-            },
-        };
+        // A shrunk (truncated or replaced) file restarts from zero.
+        let mut entry = files
+            .remove(&path)
+            .filter(|e| len >= e.offset)
+            .unwrap_or_default();
+        if entry.mtime != Some(mtime) || entry.len != len {
+            // Open failure ⇒ no entry, so the next tick retries instead of caching "empty".
+            if append_from_offset(&path, &mut entry).is_none() {
+                continue;
+            }
+            entry.mtime = Some(mtime);
+            entry.len = len;
+        }
         fresh.insert(path, entry);
     }
     *files = fresh;
@@ -409,17 +421,28 @@ fn scan_tree(
         .collect()
 }
 
-/// Stream one transcript into events; unreadable ⇒ empty (skipped, not an error).
-fn parse_file(path: &Path) -> Vec<UsageEvent> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
+/// Parse the complete lines past `entry.offset` into `entry`; a trailing line without `\n` (caught
+/// mid-write) is left for a later tick. `None` on open/seek/read failure (entry left untouched
+/// beyond lines already consumed).
+fn append_from_offset(path: &Path, entry: &mut FileEntry) -> Option<()> {
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(entry.offset)).ok()?;
+    let mut reader = BufReader::new(file);
     let tag = path.to_string_lossy();
-    BufReader::new(file)
-        .lines()
-        .enumerate()
-        .filter_map(|(i, line)| parse_line(&line.ok()?, &format!("{tag}#{i}")))
-        .collect()
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf).ok()? == 0 || buf.last() != Some(&b'\n') {
+            return Some(());
+        }
+        if let Ok(text) = std::str::from_utf8(&buf) {
+            entry
+                .events
+                .extend(parse_line(text, &format!("{tag}#{}", entry.lines)));
+        }
+        entry.offset += buf.len() as u64;
+        entry.lines += 1;
+    }
 }
 
 /// Recursively collect `(path, mtime, len)` for `*.jsonl` files under `dir` with mtime ≥ `cutoff`.
@@ -634,10 +657,13 @@ mod tests {
         let real = tmp.path().join("real/projects");
         let now = Timestamp::now();
         let at = (now - Duration::from_secs(60)).to_string();
-        write(&real.join("slug/s1.jsonl"), line(&at, "m1", 1).as_bytes());
+        write(
+            &real.join("slug/s1.jsonl"),
+            format!("{}\n", line(&at, "m1", 1)).as_bytes(),
+        );
         write(
             &real.join("slug/s1/subagents/a.jsonl"),
-            line(&at, "m2", 2).as_bytes(),
+            format!("{}\n", line(&at, "m2", 2)).as_bytes(),
         );
         let link = tmp.path().join("acct/projects");
         std::fs::create_dir_all(link.parent().expect("parent")).expect("mkdir");
@@ -666,7 +692,7 @@ mod tests {
         let at = (now - Duration::from_secs(60)).to_string();
         let live = root.join("s/live.jsonl");
         let stale = root.join("s/stale.jsonl");
-        write(&live, line(&at, "live", 1).as_bytes());
+        write(&live, format!("{}\n", line(&at, "live", 1)).as_bytes());
         write(&stale, line(&at, "stale", 1).as_bytes());
         let old = SystemTime::now() - LOOKBACK - Duration::from_secs(3600);
         std::fs::File::open(&stale)
@@ -683,7 +709,7 @@ mod tests {
             .append(true)
             .open(&live)
             .expect("append");
-        write!(f, "\n{}", line(&at, "live2", 1)).expect("write");
+        writeln!(f, "{}", line(&at, "live2", 1)).expect("write");
         let later = now + Duration::from_secs(1);
         let second = scanner
             .events(&root, later)
@@ -707,5 +733,80 @@ mod tests {
         let scanner = TranscriptScanner::new();
         let got = scanner.events(&root, now).await.expect("ok").expect("tree");
         assert!(got.is_empty());
+    }
+
+    /// Fresh-scan helper: events of `root` as sorted keys.
+    fn scan(root: &Path, files: &mut HashMap<PathBuf, FileEntry>) -> Vec<String> {
+        let mut keys: Vec<String> = scan_tree(root, SystemTime::UNIX_EPOCH, files)
+            .iter()
+            .map(|e| e.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn append(path: &Path, body: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("append");
+        f.write_all(body.as_bytes()).expect("write");
+    }
+
+    #[test]
+    fn an_appended_file_parses_only_the_tail_and_equals_a_full_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let p = root.join("s/a.jsonl");
+        let at = "2026-09-04T07:00:00Z";
+        write(&p, format!("{}\nnot json\n", line(at, "m1", 1)).as_bytes());
+        let mut files = HashMap::new();
+        assert_eq!(scan(&root, &mut files).len(), 1);
+        append(&p, &format!("{}\n", line(at, "m2", 2)));
+        let incremental = scan(&root, &mut files);
+        assert_eq!(incremental.len(), 2);
+        assert_eq!(incremental, scan(&root, &mut HashMap::new()));
+    }
+
+    #[test]
+    fn a_partial_last_line_waits_for_its_newline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let p = root.join("s/a.jsonl");
+        let at = "2026-09-04T07:00:00Z";
+        let full = line(at, "m1", 1);
+        write(&p, &full.as_bytes()[..20]);
+        let mut files = HashMap::new();
+        assert_eq!(scan(&root, &mut files).len(), 0);
+        append(&p, &format!("{}\n", &full[20..]));
+        assert_eq!(scan(&root, &mut files).len(), 1);
+    }
+
+    #[test]
+    fn a_truncated_file_is_parsed_again_from_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let p = root.join("s/a.jsonl");
+        let at = "2026-09-04T07:00:00Z";
+        write(
+            &p,
+            format!("{}\n{}\n", line(at, "m1", 1), line(at, "m2", 2)).as_bytes(),
+        );
+        let mut files = HashMap::new();
+        assert_eq!(scan(&root, &mut files).len(), 2);
+        write(&p, format!("{}\n", line(at, "n1", 3)).as_bytes());
+        assert_eq!(scan(&root, &mut files), scan(&root, &mut HashMap::new()));
+        assert_eq!(scan(&root, &mut files).len(), 1);
+    }
+
+    #[test]
+    fn burn_rate_is_zero_for_a_sub_minute_span() {
+        let events = [
+            event("a", "2026-09-04T07:00:00Z", "claude-sonnet-5", 600),
+            event("b", "2026-09-04T07:00:03Z", "claude-sonnet-5", 600),
+        ];
+        let snap = reduce_snapshot(&events, "acct", ts("2026-09-04T07:30:00Z")).expect("active");
+        let w = snap.window.expect("window");
+        assert!(w.tokens_per_minute.abs() < f64::EPSILON && w.cost_per_hour.abs() < f64::EPSILON);
     }
 }

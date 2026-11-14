@@ -27,7 +27,7 @@ their JSONL in-process; Claude is the only provider that shells out.
 | FR-7 | Snapshot parity | `UsageSnapshot` fields as today: four buckets, `total_tokens` = sum, `window{start,end,remaining_minutes,tokens_per_minute,cost_per_hour}`, `cost_notional` from the pricing table (FR-8). |
 | FR-8 | Notional cost | Static longest-prefix pricing table (per MTok: input, output, cache-write = 1.25×in, cache-read = 0.1×in unless listed). Unknown model ⇒ its tokens count, its cost contributes 0. Never a bill. |
 | FR-9 | Shared-dir memo | Scans are memoised per `(canonical projects dir, now)`: N accounts symlinked to one tree cost one scan per tick. `now` is the collector's per-tick timestamp. |
-| FR-10 | Incremental cache | Per-file `(mtime, len) → events` cache survives across ticks; an unchanged file is not re-read; a file gone from the walk is evicted. |
+| FR-10 | Incremental cache | Per-file cache survives across ticks: unchanged `(mtime, len)` ⇒ reused; a grown file is parsed incrementally from the byte offset after its last complete line (a trailing line without `\n` waits for a later tick); a shrunk file is re-parsed from zero; a file that fails to open is not cached (retried next tick); a file gone from the walk is evicted. |
 | FR-11 | Serialised heavy lane | All Claude scans go through one async mutex (`ponytail:` global lock; per-dir if it ever matters). Concurrent collects for the same dir wait, then hit the memo. |
 | FR-12 | Missing tree ⇒ idle | No `projects/` (fresh install) ⇒ `Ok(None)`, not an error. Symlinked subdirectories inside the tree are not followed (scan-bound discipline, as gemini). |
 

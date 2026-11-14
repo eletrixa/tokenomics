@@ -17,7 +17,7 @@
 //!   as 0; a page that carried ≥1 unreadable result AND summed no usd amount ⇒ `Err`. An empty page
 //!   (no buckets/results) is genuinely `Ok(0)`.
 //! - Non-usd results are excluded from the USD MTD sum by a deliberate currency filter — skipped,
-//!   not a read failure (an absent currency is treated as unknown ⇒ skipped); currency is matched
+//!   not a read failure (an absent currency is drift ⇒ unusable); currency is matched
 //!   case-insensitively and never converted, never summed across currencies.
 //! - Every modeled field is `Option` + `#[serde(default)]`; unknown fields are tolerated (no
 //!   `deny_unknown_fields`) so an API field-addition degrades to a skip, never a parse failure.
@@ -124,13 +124,15 @@ pub fn parse_costs(bytes: &[u8]) -> AppResult<CostPage> {
             };
 
             // Non-usd results are excluded from the USD MTD sum by a deliberate currency filter —
-            // skipped, not a read failure (an absent currency is treated as unknown ⇒ skipped).
-            let is_usd = amount
-                .currency
-                .as_deref()
-                .is_some_and(|c| c.eq_ignore_ascii_case("usd"));
-            if !is_usd {
-                continue;
+            // skipped, not a read failure. An ABSENT currency is drift, not a foreign currency:
+            // unusable, so the all-unusable guard below fires.
+            match amount.currency.as_deref() {
+                Some(c) if !c.eq_ignore_ascii_case("usd") => continue,
+                Some(_) => {}
+                None => {
+                    results_unusable += 1;
+                    continue;
+                }
             }
 
             let Some(value) = amount.value.as_ref() else {
@@ -251,6 +253,12 @@ mod tests {
             parse_costs(body).is_err(),
             "a page whose results are ALL unreadable must not fabricate a confident $0.00"
         );
+    }
+
+    #[test]
+    fn missing_currency_is_unusable_and_errors_not_zero() {
+        let body = br#"{"data":[{"results":[{"amount":{"value":5.0}}]}],"has_more":false}"#;
+        assert!(parse_costs(body).is_err());
     }
 
     #[test]

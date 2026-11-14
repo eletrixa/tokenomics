@@ -79,7 +79,8 @@ struct CurrentPeriod {
 /// missing pct (early-session fetch), malformed JSON, negative/non-finite pct, unparseable end —
 /// is skipped per-line, never failing the file (spec 022 §A).
 pub fn newest_billing_quota(bytes: &[u8]) -> Option<BillingQuota> {
-    let text = std::str::from_utf8(bytes).ok()?;
+    // Lossy: one bad byte costs only its own line, never the whole file.
+    let text = String::from_utf8_lossy(bytes);
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -153,6 +154,14 @@ mod tests {
         format!(
             r#"{{"ts":"{timestamp}","src":"shell","pid":1,"lvl":"info","msg":"billing: fetched credits config","ctx":{{"config":{{"creditUsagePercent":{percent},"currentPeriod":{{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-19T00:00:00+00:00","end":"{end}"}},"onDemandCap":{{"val":0}},"onDemandUsed":{{"val":0}},"prepaidBalance":{{"val":0}}}},"subscriptionTier":"SuperGrok Heavy"}}}}"#
         )
+    }
+
+    #[test]
+    fn invalid_utf8_byte_only_loses_its_own_line() {
+        let mut bytes = UNIFIED.to_vec();
+        bytes.extend_from_slice(b"{\"msg\":\"bad \xff byte\"}\n");
+        let quota = newest_billing_quota(&bytes).expect("good lines still yield a quota");
+        assert!((quota.percent - 12.5).abs() < f64::EPSILON);
     }
 
     // ── AC1 (spec 022 §A): newest-by-ts wins; skip rules ────────────────────────────────────────

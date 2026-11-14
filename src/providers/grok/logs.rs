@@ -78,9 +78,8 @@ const INFERENCE_MSG: &str = "shell.turn.inference_done";
 /// token count, skipping every other-`msg`, malformed, or all-zero line per-line (never failing the
 /// whole file). No dedup — each event is a distinct inference (spec 021 §B).
 pub fn parse_inference_events(bytes: &[u8]) -> Vec<InferenceEvent> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Vec::new();
-    };
+    // Lossy: one bad byte costs only its own line, never the whole file.
+    let text = String::from_utf8_lossy(bytes);
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -156,6 +155,13 @@ mod tests {
     }
 
     const UNIFIED: &[u8] = include_bytes!("../../../fixtures/grok_unified.jsonl");
+
+    #[test]
+    fn invalid_utf8_byte_only_loses_its_own_line() {
+        let mut bytes = UNIFIED.to_vec();
+        bytes.extend_from_slice(b"{\"msg\":\"bad \xff byte\"}\n");
+        assert_eq!(parse_inference_events(&bytes).len(), 2);
+    }
 
     // ── AC2 (spec 021 §B): parse keeps only real inference events ──────────────────────────────
 

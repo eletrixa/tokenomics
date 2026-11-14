@@ -152,6 +152,10 @@ impl Config {
         if let Some(path) = cfg.settings.api_manual_path.take() {
             cfg.settings.api_manual_path = Some(expand_tilde(&path, home.as_deref()));
         }
+        if let Some(path) = cfg.settings.ledger_path.take() {
+            let expanded = expand_tilde(Path::new(&path), home.as_deref());
+            cfg.settings.ledger_path = Some(expanded.to_string_lossy().into_owned());
+        }
         Ok(cfg)
     }
 
@@ -435,6 +439,19 @@ config_dir = \"/tmp\"
         assert_eq!(
             expand_tilde(Path::new("/abs/path"), Some(&home)),
             PathBuf::from("/abs/path")
+        );
+    }
+
+    #[test]
+    fn ledger_path_tilde_is_expanded() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let toml = format!("[settings]\nledger_path = \"~/subs.toml\"\n\n{ONE}");
+        let cfg = Config::parse(&toml).expect("parses");
+        assert_eq!(
+            cfg.settings.ledger_path.map(PathBuf::from),
+            Some(PathBuf::from(home).join("subs.toml"))
         );
     }
 

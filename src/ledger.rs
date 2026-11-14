@@ -124,14 +124,15 @@ pub enum LedgerProvenance {
 }
 
 /// Raw `[[subscription]]` shape for structural (whole-document) deserialization only — every field
-/// is loose/optional so a single bad row never fails the whole document; per-row semantic validation
+/// is loose/optional so a single bad row never fails the whole document (rows are first read as
+/// loose `toml::Value`s and converted one by one); per-row semantic validation
 /// (id present, status one of the two exact spellings, dates convertible) happens in `parse` after
 /// this succeeds. No `deny_unknown_fields`: unrecognized keys (`account`, `plan`, `price`, `notes`,
 /// `first_purchased`, …) are silently ignored by serde's default struct behaviour — never an error.
 #[derive(Debug, Deserialize, Default)]
 struct RawLedger {
     #[serde(default, rename = "subscription")]
-    subscription: Vec<RawSub>,
+    subscription: Vec<toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -173,7 +174,19 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
     let raw: RawLedger = toml::from_str(text).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
     let mut errors = Vec::new();
-    for row in raw.subscription {
+    for value in raw.subscription {
+        // Per-row typed conversion: one wrong-typed field (e.g. a quoted date) drops only that row.
+        // Re-serialized (not `Value::try_into`, which turns native datetimes into strings).
+        let row: RawSub = match toml::to_string(&value)
+            .map_err(|e| e.to_string())
+            .and_then(|t| toml::from_str(&t).map_err(|e| e.to_string()))
+        {
+            Ok(row) => row,
+            Err(reason) => {
+                errors.push(RowError { id: None, reason });
+                continue;
+            }
+        };
         let Some(id) = row.id else {
             errors.push(RowError {
                 id: None,
@@ -634,6 +647,18 @@ status = \"active\"
         // Not valid TOML at all — the whole-file failure path (`Ledger::poll` turns this into
         // keep-last-good + `Stale`, tested below via the stateful loader).
         assert!(parse("this is [[[ not toml at all").is_err());
+    }
+
+    #[test]
+    fn wrong_typed_date_degrades_only_its_row() {
+        let out = parse(
+            "[[subscription]]\nid = \"bad\"\nstatus = \"active\"\nrenews = \"2026-08-01\"\n\n\
+             [[subscription]]\nid = \"good\"\nstatus = \"active\"\nrenews = 2026-08-01\n",
+        )
+        .expect("file parses");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].id, "good");
+        assert_eq!(out.errors.len(), 1);
     }
 
     #[test]

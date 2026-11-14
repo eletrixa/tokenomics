@@ -110,6 +110,26 @@ Never a placeholder ("?", "n/a", "unknown") for missing data.
   `Off` renders nothing anywhere in the TUI (deliberate deviation from the plan's pre-mortem,
   recorded in the PRD: unconfigured is a valid permanent state; `doctor` owns the distinction).
 
+### D.1 Renewal-window urgency (amendment, 2026-07-28)
+
+An **active** row whose `renews` is `RENEW_SOON_DAYS = 5` days out or less is in the *cancel window*
+— the last stretch in which the user can still cancel before being charged. The clause then escalates,
+per day, on two independent channels so neither is load-bearing alone:
+
+- **Text** (survives `NO_COLOR`): every form gains a `⚠` marker right after the leading `·` —
+  `· ⚠ renews in 3d (2026-08-14)`, compact `· ⚠ renews 3d`. Same glyph the alert line already uses.
+- **Style** (`renew_urgency_style`, FULL + COMPACT alike): 5–4d yellow · 3–2d light red · 1d/today
+  red **and reversed**. Bold at every step, so the clause outweighs the account title it sits next
+  to; COMPACT's usual dim chrome styling is overridden for the window's duration.
+
+`SubView.renew_days` carries the exact day (`Some(0..=5)`) — computed once in the model with `today`
+injected, so `view.rs` still does zero date math. Out of the window, past-`renews` (stale) and every
+cancelled state are `None` and render byte-identical to the pre-amendment form. Cancelled rows'
+`ends` countdown deliberately does **not** escalate: there is nothing left to cancel.
+
+Still not an alert (the Non-goals entry below stands) — this is display styling only; `alerts.rs`
+keys off `utilization_pct` exclusively.
+
 ### E. CLI surfaces
 
 - `tok doctor` gains a ledger section: resolved path + provenance state ("not configured" when

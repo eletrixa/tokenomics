@@ -31,6 +31,8 @@ missing_errors_doc = "allow"        # error enums are self-describing in this cr
 missing_panics_doc = "allow"        # panics are limited to test code
 must_use_candidate = "allow"        # this is a bin crate, not a public library API
 doc_markdown = "allow"              # prose docs reference tool/format names (ccusage, TOML, JSON) freely
+double_must_use = "allow"           # clippy 1.99 fires it on `#[async_trait]`-generated fns (not our attribute)
+assert_is_empty = "allow"           # clippy 1.99 pedantic; `assert_eq!(x, [] as [T; 0])` reads worse in tests
 
 [profile.release]
 strip = true
@@ -51,7 +53,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] } # W4: local store (bun
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"                                    # W2: parse ccusage `blocks --json`
 thiserror = "2.0.18"
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "sync", "signal"] }
+tokio = { version = "1.48.0", features = ["rt", "macros", "process", "time", "io-util", "sync", "signal"] }
 toml = "1.1.2"
 
 [dev-dependencies]

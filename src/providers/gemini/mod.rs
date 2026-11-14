@@ -71,6 +71,7 @@ impl ProviderAdapter for GeminiAdapter {
 
             let events: Vec<_> = paths
                 .iter()
+                // shortcut: whole-file re-read each poll, fine for MB-sized session files; switch to an offset cache (see claude/transcripts.rs) if a session file reaches tens of MB.
                 .filter_map(|p| std::fs::read(p).ok())
                 .flat_map(|bytes| parse_chat_events(&bytes))
                 .collect();

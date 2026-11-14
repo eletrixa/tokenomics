@@ -13,10 +13,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 echo "▶ cargo test"
 cargo test
 
-echo "▶ PII gate (email addresses over plans/ specs/ src/ docs/ tests/ fixtures/)"
+echo "▶ PII gate (email addresses over plans/ specs/ src/ docs/ tests/ fixtures/ + root *.md)"
 ALLOWLIST=".pii-allowlist"
 EMAIL_RE='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-matches="$(grep -rnoE "$EMAIL_RE" plans/ specs/ src/ docs/ tests/ fixtures/ 2>/dev/null || true)"
+matches="$(grep -rnoE "$EMAIL_RE" plans/ specs/ src/ docs/ tests/ fixtures/ ./*.md 2>/dev/null || true)"
 pii_fail=0
 if [ -n "$matches" ]; then
   while IFS= read -r hit; do

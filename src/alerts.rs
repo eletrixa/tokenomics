@@ -57,7 +57,7 @@ type AlertKey = (String, LimitKind, Option<String>);
 #[derive(Debug)]
 pub struct AlertTracker {
     cooldown: Duration,
-    last_fired: HashMap<AlertKey, Instant>,
+    last_fired: HashMap<AlertKey, (Severity, Instant)>,
 }
 
 impl AlertTracker {
@@ -83,9 +83,12 @@ impl AlertTracker {
         let ready = self
             .last_fired
             .get(&key)
-            .is_none_or(|last| now.duration_since(*last) >= self.cooldown);
+            // An escalation (warn → crit) is new information, never a flap: it beats the cooldown.
+            .is_none_or(|(last_sev, last)| {
+                rank(severity) > rank(*last_sev) || now.duration_since(*last) >= self.cooldown
+            });
         if ready {
-            self.last_fired.insert(key, now);
+            self.last_fired.insert(key, (severity, now));
             Some(severity)
         } else {
             None
@@ -183,6 +186,16 @@ mod tests {
                 t0 + Duration::from_secs(201)
             ),
             Some(Severity::Warn)
+        );
+        // An escalation inside the cooldown still fires — the more urgent alert must not be lost.
+        assert_eq!(
+            tracker.on_transition(
+                key(),
+                Severity::Warn,
+                Severity::Crit,
+                t0 + Duration::from_secs(210)
+            ),
+            Some(Severity::Crit)
         );
         // A non-crossing never fires.
         assert_eq!(

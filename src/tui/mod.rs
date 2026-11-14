@@ -35,6 +35,7 @@ pub mod keys;
 pub mod model;
 pub mod view;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -54,6 +55,7 @@ use crate::error::{AppError, AppResult};
 use crate::ledger::{
     self, find as ledger_find, FileLedgerSource, Ledger, LedgerProvenance, Subscription,
 };
+use crate::providers::claude::identity;
 use crate::store::{ApiBillingRow, Store};
 
 use model::{
@@ -79,6 +81,12 @@ pub async fn run(cfg: &Config, store_path: &Path) -> AppResult<()> {
     // The store stays read-only; only the config file is re-read, via the same seam as the collector.
     let mut cfg = cfg.clone();
     let config_source = FileConfigSource::new();
+
+    // Dirs logged into the SAME Anthropic account (one quota rendered twice) get a title tag.
+    // Resolved once at startup from each dir's `.claude.json` — no collector/store involvement.
+    // ponytail: startup-only; a re-login mid-session needs a TUI restart to re-tag — move the read
+    // into `apply_tui_reload` if that ever bites.
+    let shared_quota = identity::duplicate_of(&identity::resolve_identities(&cfg.accounts));
 
     // The ledger plane (spec 017 §B) resolves its path once at startup, unlike the config file — a
     // foreign-repo file whose location isn't expected to move mid-session (accounts/thresholds DO
@@ -110,6 +118,7 @@ pub async fn run(cfg: &Config, store_path: &Path) -> AppResult<()> {
         ledger_source: ledger_source.as_mut(),
         api_manual: &mut api_manual,
         api_manual_source: api_manual_source.as_mut(),
+        shared_quota: &shared_quota,
     };
     let result = event_loop(
         &mut terminal,
@@ -132,6 +141,7 @@ struct Planes<'a> {
     ledger_source: Option<&'a mut FileLedgerSource>,
     api_manual: &'a mut ApiManual,
     api_manual_source: Option<&'a mut FileApiManualSource>,
+    shared_quota: &'a HashMap<String, String>,
 }
 
 /// Poll the ledger source (spec 017 §B) — a no-op when the plane is unconfigured (`source` is
@@ -176,6 +186,7 @@ async fn event_loop<S: ConfigSource>(
         mut ledger_source,
         api_manual,
         mut api_manual_source,
+        shared_quota,
     } = planes;
 
     let mut events = EventStream::new();
@@ -184,22 +195,21 @@ async fn event_loop<S: ConfigSource>(
     // backlogged ticks (spec 011 §F).
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    refresh(app, cfg, reader, ledger, api_manual);
+    refresh(app, cfg, reader, ledger, api_manual, shared_quota);
     loop {
         terminal
             .draw(|f| view::render(f, app))
             .map_err(|e| AppError::Terminal(format!("draw failed: {e}")))?;
 
         tokio::select! {
-            maybe = events.next() => match maybe {
-                Some(Ok(Event::Key(key))) => {
+            // Any other event (a resize included) only needs the redraw the loop does anyway.
+            maybe = events.next() => {
+                if let Some(Ok(Event::Key(key))) = maybe {
                     if let Some(action) = keys::map(key) {
                         app.update(Msg::Key(action));
                     }
                 }
-                Some(Ok(Event::Resize(_, _))) => app.update(Msg::Resize),
-                _ => {}
-            },
+            }
             _ = tick.tick() => {
                 // Hot-reload BEFORE the store read, so an added/(re)activated account or a changed
                 // threshold reaches this tick's board (spec 015 §A2); the ledger polls the same tick
@@ -209,14 +219,14 @@ async fn event_loop<S: ConfigSource>(
                 poll_ledger(ledger, ledger_source.as_deref_mut());
                 poll_api_manual(api_manual, api_manual_source.as_deref_mut());
                 app.update(Msg::Tick);
-                refresh(app, cfg, reader, ledger, api_manual);
+                refresh(app, cfg, reader, ledger, api_manual, shared_quota);
             }
             _ = tokio::signal::ctrl_c() => app.should_quit = true,
         }
 
         if app.reload_requested {
             app.reload_requested = false;
-            refresh(app, cfg, reader, ledger, api_manual);
+            refresh(app, cfg, reader, ledger, api_manual, shared_quota);
         }
         if app.should_quit {
             break;
@@ -230,7 +240,14 @@ async fn event_loop<S: ConfigSource>(
 /// one place the store's live `api_billing` rows are read (spec 025 §B): a failed read degrades to
 /// an empty vec — the same silent-degrade the aggregate-burn read above it already uses — rather
 /// than losing the whole tick's board over one query.
-fn refresh(app: &mut App, cfg: &Config, reader: &Store, ledger: &Ledger, api_manual: &ApiManual) {
+fn refresh(
+    app: &mut App,
+    cfg: &Config,
+    reader: &Store,
+    ledger: &Ledger,
+    api_manual: &ApiManual,
+    shared_quota: &HashMap<String, String>,
+) {
     let api_live = reader.latest_api_billing().unwrap_or_default();
     let rows = read_rows(
         cfg,
@@ -245,6 +262,7 @@ fn refresh(app: &mut App, cfg: &Config, reader: &Store, ledger: &Ledger, api_man
             api_live: &api_live,
             manual_rows: api_manual.rows(),
             manual_provenance: api_manual.provenance(),
+            shared_quota,
         },
     );
     app.update(Msg::Data(Box::new(rows)));
@@ -260,6 +278,16 @@ struct PlanesRead<'a> {
     api_live: &'a [ApiBillingRow],
     manual_rows: &'a [ApiManualRow],
     manual_provenance: ApiManualProvenance,
+    /// `account id → first-configured id` for accounts that are the same Anthropic account.
+    shared_quota: &'a HashMap<String, String>,
+}
+
+/// Insert ` (= <label>)` right after the `[provider]` tag: `"Rob7 [claude] (= Eletrixa) · renews…"`.
+/// Placed there, not at the end, so a truncated ledger clause can't hide it; `short_name` splits at
+/// `" ["`, so the fleet header / worst-offender banner never see it. Text-only ⇒ survives `NO_COLOR`.
+fn tag_shared_quota(title: &mut String, label: &str) {
+    let at = title.find(']').map_or(title.len(), |i| i + 1);
+    title.insert_str(at, &format!(" (= {label})"));
 }
 
 /// Read the latest per-account rows plus the fleet-wide aggregate burn series from the store.
@@ -286,6 +314,7 @@ fn read_rows(
         api_live,
         manual_rows,
         manual_provenance,
+        shared_quota,
     } = planes;
     let now = Timestamp::now();
     // "Today" for the ledger's day-count math (spec 017 §D: "calendar-day differences in local
@@ -308,9 +337,17 @@ fn read_rows(
         .iter()
         .filter(|a| ledger_find(ledger_rows, &a.id).is_some())
         .count();
-    for (idx, account) in visible.into_iter().enumerate() {
+    for account in visible {
         match read_account_row(reader, account, use_color, now, ledger_rows, today) {
-            Ok((row, usage)) => {
+            Ok((mut row, usage)) => {
+                if let Some(first) = shared_quota.get(&account.id) {
+                    let label = cfg
+                        .accounts
+                        .iter()
+                        .find(|a| &a.id == first)
+                        .map_or(first.as_str(), |a| a.label.as_str());
+                    tag_shared_quota(&mut row.title, label);
+                }
                 rows.push(row);
                 // An inactive account's usage never feeds the fleet reduction (shared tokens/cost/
                 // burn, worst provenance, oldest refresh) even when peeked at — display-only (§C).
@@ -321,7 +358,8 @@ fn read_rows(
             Err(e) => {
                 rows.push(
                     previous
-                        .get(idx)
+                        .iter()
+                        .find(|r| r.title.starts_with(&model::account_title(account)))
                         .cloned()
                         .unwrap_or_else(|| error_view(account, use_color, &e.to_string())),
                 );
@@ -515,6 +553,7 @@ mod tests {
                 api_live: &[],
                 manual_rows: &[],
                 manual_provenance: ApiManualProvenance::Off,
+                shared_quota: &HashMap::new(),
             },
         );
         assert_eq!(before.rows.len(), 1, "only 'a' before the reload");
@@ -533,6 +572,7 @@ mod tests {
                 api_live: &[],
                 manual_rows: &[],
                 manual_provenance: ApiManualProvenance::Off,
+                shared_quota: &HashMap::new(),
             },
         );
         assert_eq!(after.rows.len(), 2, "the swapped-in 'b' reaches the board");
@@ -609,6 +649,7 @@ mod tests {
                 api_live: &[],
                 manual_rows: &[],
                 manual_provenance: ApiManualProvenance::Off,
+                shared_quota: &HashMap::new(),
             },
         );
         assert_eq!(hidden.rows.len(), 1, "only the active account is visible");
@@ -631,6 +672,7 @@ mod tests {
                 api_live: &[],
                 manual_rows: &[],
                 manual_provenance: ApiManualProvenance::Off,
+                shared_quota: &HashMap::new(),
             },
         );
         assert_eq!(shown.rows.len(), 2, "both accounts now visible");

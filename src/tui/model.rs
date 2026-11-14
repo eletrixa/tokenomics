@@ -14,13 +14,15 @@
 //! Key responsibilities:
 //! - `App`: selection, help/quit/show-inactive/show-api flags, colour policy, and the precomputed
 //!   `AccountView` rows.
-//! - `update(Msg)`: fold Key / Data (store) / Tick / Resize; selection clamps to the row count.
+//! - `update(Msg)`: fold Key / Data (store) / Tick; selection clamps to the row count.
 //! - `build_account_view`: pure store-data → display-ready row (so `view` only lays out); it now
 //!   also does the exact-id ledger join (`ledger::find`) and calls `build_sub_view`, independent of
 //!   `Account.active` (spec 017 §C/§D).
+//!   It also drops the derived 5h clock when a fresh overlay reports no session (spec 002).
 //! - `build_sub_view`: pure ledger-row + `today` → `SubView` (spec 017 §D clause text), now also
 //!   folding in the verified-pill suffixes (`pill_suffixes`, spec 018 §B/§C) — suppressed on the
-//!   stale-`renews` and derived-`ended` states.
+//!   stale-`renews` and derived-`ended` states — and the renewal cancel window's `⚠` marker +
+//!   `renew_days` day count (spec 017 §D.1).
 //! - `build_api_view`: pure API billing plane → dense per-`[[api]]` rows (figures + provenance
 //!   notes + empty-row states, live-beats-manual merge) — spec 025 §B.
 //!
@@ -174,7 +176,20 @@ pub struct SubView {
     /// The bare pill suffix (` ✓`, no date), present in `full_no_pill_date`/`full_no_start`/
     /// `full_no_date` when verified-current.
     pub pill_bare: Option<String>,
+    /// Days until an **active** row's `renews`, present only inside the cancel window
+    /// (`0..=RENEW_SOON_DAYS`, spec 017 §D.1) — the view escalates the clause's colour per day from
+    /// it. `None` everywhere else (further out, past-`renews` stale, cancelled, no row): the clause
+    /// then styles exactly as before. The clause text itself already carries a `⚠` marker in this
+    /// window, so the urgency survives `NO_COLOR`.
+    pub renew_days: Option<i32>,
 }
+
+/// The 5h row's text when a fresh overlay reports weekly limits but no session figure.
+pub const SESSION_UNREPORTED: &str = "n/a (no 5h limit reported)";
+
+/// An active row's renewal is flagged **soon** at this many days out or less — the window in which
+/// the user still has a realistic chance to cancel before being charged (spec 017 §D.1).
+pub const RENEW_SOON_DAYS: i32 = 5;
 
 /// Whole calendar days from `from` to `to` (positive when `to` is in the future) — pure date math,
 /// no wall-clock/timezone involved beyond the injected `civil::Date`s themselves. `Date - Date`
@@ -244,16 +259,21 @@ fn build_active_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubVie
             compact: Some("· renews ?".to_string()),
             pill_full: None,
             pill_bare: None,
+            renew_days: None,
         };
     }
     let (pill_full, pill_bare) = pill_suffixes(sub, today);
-    let renews_clause = format!("· renews {} ({date})", day_phrase_full(days));
-    let renews_clause_no_date = format!("· renews {}", day_phrase_full(days));
+    // Inside the cancel window the clause carries a `⚠` marker (spec 017 §D.1) so the escalation is
+    // legible without colour; `renew_days` drives the per-day colour ramp in `view.rs`.
+    let renew_days = (days <= RENEW_SOON_DAYS).then_some(days);
+    let warn = if renew_days.is_some() { "⚠ " } else { "" };
+    let renews_clause = format!("· {warn}renews {} ({date})", day_phrase_full(days));
+    let renews_clause_no_date = format!("· {warn}renews {}", day_phrase_full(days));
     let base_full = sub.purchased.map_or_else(
         || renews_clause.clone(),
         |purchased| format!("· period {purchased} → {renews_clause}"),
     );
-    let compact_base = format!("· renews {}", day_phrase_compact(days));
+    let compact_base = format!("· {warn}renews {}", day_phrase_compact(days));
     SubView {
         full: Some(append_opt(&base_full, pill_full.as_deref())),
         full_no_pill_date: Some(append_opt(&base_full, pill_bare.as_deref())),
@@ -262,6 +282,7 @@ fn build_active_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubVie
         compact: Some(append_opt(&compact_base, pill_bare.as_deref())),
         pill_full,
         pill_bare,
+        renew_days,
     }
 }
 
@@ -284,6 +305,7 @@ fn build_cancelled_sub_view(sub: &Subscription, today: jiff::civil::Date) -> Sub
             compact: Some(narrow),
             pill_full,
             pill_bare,
+            renew_days: None,
         };
     };
     let days = days_between(today, paid_through);
@@ -298,6 +320,7 @@ fn build_cancelled_sub_view(sub: &Subscription, today: jiff::civil::Date) -> Sub
             compact: Some("· ended".to_string()),
             pill_full: None,
             pill_bare: None,
+            renew_days: None,
         };
     }
     let (pill_full, pill_bare) = pill_suffixes(sub, today);
@@ -313,6 +336,7 @@ fn build_cancelled_sub_view(sub: &Subscription, today: jiff::civil::Date) -> Sub
         compact: Some(append_opt(&compact_base, pill_bare.as_deref())),
         pill_full,
         pill_bare,
+        renew_days: None,
     }
 }
 
@@ -530,8 +554,6 @@ pub enum Msg {
     Data(Box<Dashboard>),
     /// A periodic tick (clears the transient message).
     Tick,
-    /// The terminal was resized (redraw happens naturally).
-    Resize,
 }
 
 /// The dashboard state.
@@ -611,7 +633,6 @@ impl App {
                 self.clamp_selection();
             }
             Msg::Tick => self.message = None,
-            Msg::Resize => {}
         }
     }
 
@@ -797,8 +818,20 @@ pub fn build_account_view(
 
     // Every gauge carries its OWN reset countdown (like Claude's /usage) — session, weekly-all, and
     // the per-model scoped weekly — so each line reads consistently: <pct> <sev> · resets <when>.
+    // A fresh overlay that carries weekly limits but NO session entry means the server reports no
+    // 5h figure (`five_hour: null`). The derived clock is then not a fallback for a failed overlay —
+    // it would be a grey bar standing in for a number that does not exist, and could even become
+    // the headline. Say so in text instead (spec 002, amended 2026-11-14).
     let session_limit = limits.iter().find(|l| l.kind == LimitKind::Session);
-    let session = session_limit.map(|limit| gauge_from_limit(limit, None, now, use_color));
+    // True only when a derived clock is actually dropped — a provider with no session surface at
+    // all (Grok, a weekly-only Codex plan) has nothing to drop and keeps its own status.
+    let session_unreported = session_limit.is_some_and(|l| l.source == Provenance::Derived)
+        && limits
+            .iter()
+            .any(|l| l.kind != LimitKind::Session && l.source == Provenance::Authoritative);
+    let session = session_limit
+        .filter(|_| !session_unreported)
+        .map(|limit| gauge_from_limit(limit, None, now, use_color));
 
     let weekly = limits
         .iter()
@@ -834,7 +867,13 @@ pub fn build_account_view(
     } else {
         match snapshot {
             None => Some("no data yet".to_string()),
-            Some(s) if s.window.is_none() => Some("idle (no active block)".to_string()),
+            // Only Claude has a block surface (ccusage 5h blocks); every other provider's
+            // snapshots carry `window: None` by construction, so `window.is_none()` means
+            // "idle" for Claude alone — anywhere else it would brand live usage as idle.
+            Some(s) if s.window.is_none() && account.provider == Provider::Claude => {
+                Some("idle (no active block)".to_string())
+            }
+            Some(_) if session_unreported => Some(SESSION_UNREPORTED.to_string()),
             Some(_) => None,
         }
     };
@@ -902,7 +941,7 @@ pub fn build_account_view(
 /// Panel title, e.g. `"Personal [claude]"` — or `"Personal [claude] (inactive)"` when the account is
 /// unsubscribed/paused. The tag lives in the title text (not just colour) so it survives `NO_COLOR`
 /// and appears everywhere the title does (FULL/COMPACT/MICRO all render this same field).
-fn account_title(account: &Account) -> String {
+pub(super) fn account_title(account: &Account) -> String {
     let tag = if account.active { "" } else { " (inactive)" };
     format!("{} [{}]{tag}", account.label, account.provider)
 }
@@ -2045,6 +2084,109 @@ mod tests {
         );
     }
 
+    // A grok snapshot NEVER carries a window (no session surface, spec 021) — the claude-only
+    // "idle (no active block)" status must not fire on it, or a mid-inference grok reads as idle.
+    #[test]
+    fn a_grok_snapshot_with_live_usage_never_claims_idle_no_active_block() {
+        let now: Timestamp = "2026-07-20T10:00:00Z".parse().unwrap();
+        let snapshot = UsageSnapshot {
+            account_id: "grok-main".to_string(),
+            provider: Provider::Grok,
+            collected_at: now,
+            input: 182_480,
+            output: 4_517,
+            cache_read: 178_304,
+            cache_creation: 0,
+            total_tokens: 186_997,
+            cost_notional: None,
+            window: None, // by construction — grok has no block surface
+        };
+        let data = AccountData {
+            snapshot: Some(&snapshot),
+            limits: &[],
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::date(2026, 7, 20),
+        };
+        let row = build_account_view(&grok_account(), data, now, true);
+        assert_eq!(
+            row.status, None,
+            "a window-less provider's live snapshot must not render as idle"
+        );
+    }
+
+    // Spec 002 (amended 2026-11-14): `/api/oauth/usage` now answers `five_hour: null` with no
+    // `session` entry. A fresh authoritative weekly next to a derived session means the server
+    // reports no 5h figure — the clock must not stand in for it, nor become the headline.
+    #[test]
+    fn a_fresh_overlay_without_a_session_replaces_the_clock_with_text() {
+        let now: Timestamp = "2026-07-04T10:00:00Z".parse().unwrap();
+        let limit = |kind, pct, source| Limit {
+            account_id: "personal".to_string(),
+            provider: Provider::Claude,
+            kind,
+            scope: None,
+            utilization_pct: pct,
+            resets_at: "2026-07-04T12:00:00Z".to_string(),
+            severity: Severity::Ok,
+            source,
+        };
+        let snapshot = UsageSnapshot {
+            account_id: "personal".to_string(),
+            provider: Provider::Claude,
+            collected_at: now,
+            input: 1,
+            output: 1,
+            cache_read: 1,
+            cache_creation: 1,
+            total_tokens: 4,
+            cost_notional: None,
+            window: Some(crate::domain::Window {
+                start: "2026-07-04T07:00:00Z".parse().unwrap(),
+                end: "2026-07-04T12:00:00Z".parse().unwrap(),
+                remaining_minutes: None,
+                tokens_per_minute: 0.0,
+                cost_per_hour: 0.0,
+            }),
+        };
+        let build = |limits: &[Limit]| {
+            let data = AccountData {
+                snapshot: Some(&snapshot),
+                limits,
+                token_status: None,
+                overlay_failing_since: None,
+                overlay_ms: None,
+                ledger_rows: &[],
+                today: jiff::civil::Date::default(),
+            };
+            build_account_view(&account(), data, now, true)
+        };
+
+        let clock = limit(LimitKind::Session, 60.0, Provenance::Derived);
+        let row = build(&[
+            clock.clone(),
+            limit(LimitKind::WeeklyAll, 5.0, Provenance::Authoritative),
+        ]);
+        assert!(row.session.is_none(), "no clock bar under a fresh overlay");
+        assert_eq!(row.status.as_deref(), Some(SESSION_UNREPORTED));
+        let headline = row.headline.expect("weekly headline");
+        assert_eq!(headline.pct, "5%", "the 60% clock is not the headline");
+
+        // No derived session to drop (Grok, a weekly-only Codex plan) ⇒ no Anthropic text.
+        let row = build(&[limit(LimitKind::WeeklyAll, 5.0, Provenance::Authoritative)]);
+        assert_eq!(row.status, None);
+
+        // A stale overlay (weekly demoted to Estimate) keeps the clock fallback, as before.
+        let row = build(&[
+            clock,
+            limit(LimitKind::WeeklyAll, 5.0, Provenance::Estimate),
+        ]);
+        assert!(row.session.is_some(), "stale overlay still degrades to it");
+        assert_eq!(row.status, None);
+    }
+
     #[test]
     fn a_grok_weekly_quota_row_renders_the_gauge_through_the_shared_machinery() {
         let now: Timestamp = "2026-07-20T10:00:00Z".parse().unwrap();
@@ -2683,8 +2825,53 @@ mod tests {
         sub.renews = Some(jiff::civil::date(2026, 8, 14));
         let today = jiff::civil::date(2026, 8, 14); // renews is today
         let view = build_sub_view(Some(&sub), today);
-        assert_eq!(view.full.as_deref(), Some("· renews today (2026-08-14)"));
-        assert_eq!(view.compact.as_deref(), Some("· renews today"));
+        // Renewing today is inside the cancel window, so the clause also carries the `⚠` marker
+        // (spec 017 §D.1).
+        assert_eq!(view.full.as_deref(), Some("· ⚠ renews today (2026-08-14)"));
+        assert_eq!(view.compact.as_deref(), Some("· ⚠ renews today"));
+    }
+
+    #[test]
+    fn renewal_inside_the_cancel_window_is_marked_and_day_counted() {
+        // Spec 017 §D.1: at `RENEW_SOON_DAYS` and closer, every form carries `⚠` and `renew_days`
+        // reports the exact day so the view can escalate colour per day.
+        let renews = jiff::civil::date(2026, 8, 14);
+        for days in 0..=RENEW_SOON_DAYS {
+            let mut sub = ledger_sub(SubStatus::Active);
+            sub.purchased = Some(jiff::civil::date(2026, 7, 14));
+            sub.renews = Some(renews);
+            let today = renews
+                .checked_sub(jiff::Span::new().days(days))
+                .expect("in-range test date");
+            let view = build_sub_view(Some(&sub), today);
+            assert_eq!(view.renew_days, Some(days), "{days}d out");
+            for form in [
+                &view.full,
+                &view.full_no_pill_date,
+                &view.full_no_start,
+                &view.full_no_date,
+                &view.compact,
+            ] {
+                let text = form.as_deref().unwrap_or_default();
+                assert!(
+                    text.contains('⚠'),
+                    "{days}d out, every form warns: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn renewal_outside_the_cancel_window_is_unmarked() {
+        let renews = jiff::civil::date(2026, 8, 14);
+        let mut sub = ledger_sub(SubStatus::Active);
+        sub.renews = Some(renews);
+        let today = renews
+            .checked_sub(jiff::Span::new().days(RENEW_SOON_DAYS + 1))
+            .expect("in-range test date");
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(view.renew_days, None, "one day outside the window");
+        assert_eq!(view.full.as_deref(), Some("· renews in 6d (2026-08-14)"));
     }
 
     #[test]

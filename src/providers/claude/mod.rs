@@ -19,6 +19,7 @@
 
 pub mod ccusage;
 pub mod creds;
+pub mod identity;
 pub mod overlay;
 pub mod transcripts;
 
@@ -189,7 +190,8 @@ mod tests {
         std::fs::write(
             &file,
             format!(
-                r#"{{"type":"assistant","timestamp":"{at}","requestId":"r1","message":{{"id":"m1","model":"claude-opus-5","usage":{{"input_tokens":3,"output_tokens":4}}}}}}"#
+                r#"{{"type":"assistant","timestamp":"{at}","requestId":"r1","message":{{"id":"m1","model":"claude-opus-5","usage":{{"input_tokens":3,"output_tokens":4}}}}}}
+"#
             ),
         )
         .unwrap();

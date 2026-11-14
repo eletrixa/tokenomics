@@ -111,16 +111,11 @@ pub fn parse_quota_response(
                 limits.push(build(LimitKind::Session, pct, String::new()));
             }
             (Some(u), Some(n)) if (u, n) == WEEKLY_UNIT_NUMBER => {
-                let resets_at = match entry.next_reset_time {
-                    Some(ms) => Timestamp::from_millisecond(ms)
-                        .map_err(|_| {
-                            AppError::Overlay(
-                                "zai quota carried an out-of-range nextResetTime".to_string(),
-                            )
-                        })?
-                        .to_string(),
-                    None => String::new(),
-                };
+                // Missing or out-of-range reset degrades to "" — never drops the session limit.
+                let resets_at = entry
+                    .next_reset_time
+                    .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+                    .map_or_else(String::new, |t| t.to_string());
                 limits.push(build(LimitKind::WeeklyAll, pct, resets_at));
             }
             _ => {} // an unrecognized unit/number pair on a TOKENS_LIMIT entry — skipped
@@ -315,6 +310,19 @@ mod tests {
             {"type":"TOKENS_LIMIT","unit":6,"number":1,"nextResetTime":1784713715974}
         ]}}"#;
         assert!(parse_quota_response(body, "zai-lite", 75.0, 90.0).is_err());
+    }
+
+    #[test]
+    fn out_of_range_weekly_reset_keeps_the_session_limit() {
+        let body = br#"{"data":{"limits":[
+            {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":10},
+            {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":20,"nextResetTime":9223372036854775807}
+        ]}}"#;
+        let limits = parse_quota_response(body, "zai-lite", 75.0, 90.0).expect("degrades");
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].kind, LimitKind::Session);
+        assert_eq!(limits[1].kind, LimitKind::WeeklyAll);
+        assert_eq!(limits[1].resets_at, "");
     }
 
     #[test]

@@ -437,7 +437,14 @@ where
                     Ok(outcome) => apply_outcome(
                         &cfg, &store, outcome, &mut inflight, &mut latest_gen, &mut alerts,
                     ),
-                    Err(join_err) => eprintln!("collector: task join error: {join_err}"),
+                    Err(join_err) => {
+                        eprintln!("collector: task join error: {join_err}");
+                        // A panicked collect never reaches `apply_outcome`, and a `JoinError`
+                        // names no account — so its id would sit in `inflight` forever and the
+                        // account would never be collected again. Clear the set: the worst case
+                        // is one duplicate collect, whose older result the generation guard drops.
+                        inflight.clear();
+                    }
                 }
             }
             _ = overlay.tick() => {
@@ -609,7 +616,9 @@ impl OverlayState {
             OVERLAY_BACKOFF_CAP_SECS,
         );
         self.backoff_secs.insert(account_id.to_string(), next);
-        let ticks = next.div_ceil(base).max(1);
+        // One fewer: the tick that harvested this failure already spent one interval (see
+        // `BillingState::note_throttled`).
+        let ticks = next.div_ceil(base).saturating_sub(1).max(1);
         self.cooldown_ticks.insert(
             account_id.to_string(),
             u32::try_from(ticks).unwrap_or(u32::MAX),

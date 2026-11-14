@@ -59,6 +59,14 @@ fallback is NOT needed for v1** (keep it as a documented future option only).
   readings only. Surfaces mark the proxy instead: the TUI prefixes a non-authoritative percent with
   `~` and replaces the severity word with `elapsed` (`~76% elapsed`), so the `Derived` badge is no
   longer the *only* thing separating a clock from real usage — the row itself says which it is.
+- **No clock under a fresh overlay that reports no session (amended 2026-11-14):** observed on
+  2026-11-14, `/api/oauth/usage` answers `five_hour: null` and a `limits[]` with only `weekly_all` /
+  `weekly_scoped` for every account. The overlay succeeded; it has no 5h figure. The TUI row
+  (`build_account_view`) therefore drops a `Derived` session whenever the same account carries an
+  `Authoritative` non-session limit, and the 5h line reads
+  `n/a (no 5h limit reported)`. The clock stays the fallback for an
+  overlay-off account and for a stale overlay (weekly demoted to `Estimate`). An authoritative
+  session, if the endpoint sends one again, wins as before. Store and `tok once` are unchanged.
 - **Early `tok once` (human + `--json`):** the minimal `once` command (spec 009) landed here so the
   collector core is reachable from `main` (keeps the strict-lints build free of dead code) and gives
   immediate end-to-end value. `--json` serializes `UsageSnapshot` + derived `Limit`. The `doctor`

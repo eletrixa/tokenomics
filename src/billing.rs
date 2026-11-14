@@ -63,21 +63,6 @@ impl ApiProvider {
             Self::Xai => "xai",
         }
     }
-
-    /// Parse the stable identifier back into an `ApiProvider` (e.g. when reading a stored row).
-    // Config deserialization goes through serde; retained for `as_str` symmetry with the sibling
-    // enums (`Provider`, `LimitKind`) and any future store round-trip.
-    #[allow(dead_code)]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "anthropic" => Some(Self::Anthropic),
-            "openai" => Some(Self::OpenAi),
-            "gemini" => Some(Self::Gemini),
-            "moonshot" => Some(Self::Moonshot),
-            "xai" => Some(Self::Xai),
-            _ => None,
-        }
-    }
 }
 
 impl std::fmt::Display for ApiProvider {
@@ -354,40 +339,12 @@ mod tests {
     // ---- ApiProvider ----
 
     #[test]
-    fn api_provider_as_str_and_parse_round_trip_all_variants() {
-        for original in [
-            ApiProvider::Anthropic,
-            ApiProvider::OpenAi,
-            ApiProvider::Gemini,
-            ApiProvider::Moonshot,
-            ApiProvider::Xai,
-        ] {
-            assert_eq!(ApiProvider::parse(original.as_str()), Some(original));
-        }
-    }
-
-    #[test]
-    fn api_provider_openai_is_the_string_openai() {
-        // OpenAi lowercased = "openai" (NOT "open_ai"); the config string round-trips.
-        assert_eq!(ApiProvider::OpenAi.as_str(), "openai");
-        assert_eq!(ApiProvider::parse("openai"), Some(ApiProvider::OpenAi));
-    }
-
-    #[test]
     fn api_provider_strings_match_the_contract() {
         assert_eq!(ApiProvider::Anthropic.as_str(), "anthropic");
         assert_eq!(ApiProvider::OpenAi.as_str(), "openai");
         assert_eq!(ApiProvider::Gemini.as_str(), "gemini");
         assert_eq!(ApiProvider::Moonshot.as_str(), "moonshot");
         assert_eq!(ApiProvider::Xai.as_str(), "xai");
-    }
-
-    #[test]
-    fn api_provider_parse_rejects_unknown_and_wrong_case() {
-        assert_eq!(ApiProvider::parse("claude"), None); // subscription provider, not api
-        assert_eq!(ApiProvider::parse(""), None);
-        assert_eq!(ApiProvider::parse("OpenAI"), None); // case-sensitive
-        assert_eq!(ApiProvider::parse("open_ai"), None);
     }
 
     #[test]
