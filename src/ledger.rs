@@ -77,6 +77,10 @@ pub struct Subscription {
     pub purchased: Option<Date>,
     /// Current-period end.
     pub renews: Option<Date>,
+    /// The wall-clock time of `renews`, when the ledger wrote a datetime — shown verbatim.
+    // shortcut: a written UTC offset is ignored (the time shows as typed); convert to local time
+    // if a ledger ever carries offsets from a different zone.
+    pub renews_time: Option<jiff::civil::Time>,
     /// When a cancellation was recorded.
     pub cancelled_on: Option<Date>,
     /// Access lapses after this date — only meaningful when `status` is `Cancelled`.
@@ -222,6 +226,15 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
                 continue;
             }
         };
+        let renews_time = row.renews.as_ref().and_then(|dt| dt.time).and_then(|t| {
+            jiff::civil::Time::new(
+                i8::try_from(t.hour).ok()?,
+                i8::try_from(t.minute).ok()?,
+                0,
+                0,
+            )
+            .ok()
+        });
         let renews = match degrade("renews", row.renews) {
             Ok(d) => d,
             Err(e) => {
@@ -255,6 +268,7 @@ pub fn parse(text: &str) -> Result<ParseOutcome, String> {
             status,
             purchased,
             renews,
+            renews_time,
             cancelled_on,
             paid_through,
             verified,
@@ -538,6 +552,7 @@ first_purchased = 2025-01-01
             status: SubStatus::Active,
             purchased: None,
             renews: None,
+            renews_time: None,
             cancelled_on: None,
             paid_through: None,
             verified: None,
@@ -547,6 +562,7 @@ first_purchased = 2025-01-01
             status,
             purchased,
             renews,
+            renews_time,
             cancelled_on,
             paid_through,
             verified,
@@ -556,6 +572,7 @@ first_purchased = 2025-01-01
             status,
             purchased,
             renews,
+            renews_time,
             cancelled_on,
             paid_through,
             verified,
@@ -820,6 +837,22 @@ status = \"cancelled\"
         );
     }
 
+    #[test]
+    fn a_renews_datetime_keeps_its_date_and_its_written_time() {
+        let out = parse(
+            "[[subscription]]\nid = \"a\"\nstatus = \"active\"\nrenews = 2026-11-15T14:30:00\n\n\
+             [[subscription]]\nid = \"b\"\nstatus = \"active\"\nrenews = 2026-11-15\n",
+        )
+        .expect("parses");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.rows[0].renews, Some(jiff::civil::date(2026, 11, 15)));
+        assert_eq!(
+            out.rows[0].renews_time,
+            Some(jiff::civil::time(14, 30, 0, 0))
+        );
+        assert_eq!(out.rows[1].renews_time, None, "a bare date carries no time");
+    }
+
     // ── AC3: exact-match join only ──────────────────────────────────────────────────────────────
 
     fn sub(id: &str) -> Subscription {
@@ -828,6 +861,7 @@ status = \"cancelled\"
             status: SubStatus::Active,
             purchased: None,
             renews: None,
+            renews_time: None,
             cancelled_on: None,
             paid_through: None,
             verified: None,
@@ -923,6 +957,7 @@ status = \"active\"
             status: SubStatus::Active,
             purchased,
             renews: None,
+            renews_time: None,
             cancelled_on: None,
             paid_through: None,
             verified,

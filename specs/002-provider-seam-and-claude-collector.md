@@ -78,3 +78,12 @@ fallback is NOT needed for v1** (keep it as a documented future option only).
 ## Acceptance Criteria (rollup)
 FR-1..FR-7 + NFR + gate resolved; parse/reduce/derive table tests + `collect` env test green;
 `tok once` proven against a real account (npx ccusage under `CLAUDE_CONFIG_DIR`); `check.sh` green.
+
+## Amendment 2026-11-15 — Claude has no 5h limit
+
+Anthropic removed the 5h limit. The TUI ignores every Claude `Session` limit (stored, derived or
+authoritative) for the gauge, the headline and the row severity, and emits no 5h status text
+(`idle (no active block)` and `n/a (no 5h limit reported)` are removed). A row draws its top line
+only when it has a session gauge or a status note; otherwise the FULL panel and the COMPACT block
+are one row shorter. The collector still derives and stores the Claude session clock (unused by
+the TUI) — [NEEDS CLARIFICATION] remove it there, and from `once --json` and alerts, or keep it.

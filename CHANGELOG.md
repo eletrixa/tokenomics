@@ -6,7 +6,26 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
 
 ## [Unreleased]
 
+### ADDED
+
+- **Renewal time on the renewal day.** A ledger `renews` written as a datetime
+  (`renews = 2026-11-15T14:30:00`) renders `renews today 14:30`; a bare date is unchanged.
+
 ### CHANGED
+
+- **New look for the dashboard.** Solid block bars (`█` fill, `▌` half cell, `░` track) with a
+  green→amber→red gradient by position; rounded panels, a thick border on the selected one; the
+  account name in its accent colour; a bold figure with a dim reset tail; a solid brand pill. The
+  character grid stays identical under `NO_COLOR`.
+- **Weekly pace mark.** A tick on each weekly bar marks the time elapsed in the 7-day window: fill
+  left of it is under pace, fill past it burns faster than the week runs.
+- **Grok weekly hint names its source.** `n/a (open /usage in grok)` — Grok Build logs the quota
+  line only when its `/usage` modal opens.
+
+- **Claude rows no longer draw a 5h line.** Anthropic removed the 5h limit, so the session gauge,
+  the derived clock, `idle (no active block)` and `n/a (no 5h limit reported)` are gone for Claude;
+  the panel is one row shorter. A row draws its top line only for a session gauge (Codex, z.ai,
+  Kimi) or a status note (`no data yet`, a stale token, a window-less provider's usage).
 
 - **The transcript scanner parses only appended bytes.** A live transcript that grew was re-read and
   re-parsed from byte 0 every tick (447 MB per minute on a busy machine). It now resumes from the end of
@@ -14,6 +33,11 @@ Agents maintain the `[Unreleased]` section as work lands; **only the user cuts a
   burn rate also reads 0 for a block spanning under a minute instead of a spike.
 
 ### FIXED
+
+- **A row with usage but no 5h limit shows its tokens, not `collecting…`.** Grok (and any
+  non-Claude provider that reports no session limit) now reads `<tokens> tok in 5h · <age>`.
+- **A lapsed Grok weekly quota no longer reads `waiting for reset` forever.** Only a new billing log
+  line can replace it, so the row falls back to the weekly hint.
 
 - `[settings] ledger_path` now expands a leading `~` like `config_dir` does (the SETUP example no longer reads as a missing ledger).
 - One wrong-typed field in one ledger row (e.g. a quoted date) now drops only that row instead of every account's dates.

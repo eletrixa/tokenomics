@@ -1293,6 +1293,7 @@ mod tests {
             status,
             purchased: None,
             renews: None,
+            renews_time: None,
             cancelled_on: None,
             paid_through: None,
             verified: None,

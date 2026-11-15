@@ -100,3 +100,18 @@ On a machine whose only Grok product is a SuperGrok Heavy subscription (no credi
 5. TUI model: grok with a stored `WeeklyAll` row renders the gauge (not the hint); grok with no row
    shows `"n/a (awaiting grok billing log)"`; gemini hint unchanged. (D)
 6. Doctor: live / expired / absent billing-line states each render their §D report line. (D)
+
+## Amendment 2026-11-15
+
+- The weekly hint is now `"n/a (open /usage in grok)"` (was `"n/a (awaiting grok billing log)"`).
+  Verified 2026-11-15 on Grok Build 1.0.77: the `billing: fetched credits config` line is written
+  only when the `/usage` modal opens (not at startup), and `unified.jsonl` is head-truncated at
+  about 5 MB, so the line lives for minutes under heavy use.
+- A stored grok weekly row whose period lapsed is dropped in the TUI (the hint shows), not
+  rendered as `waiting for reset`: no reset arrives without a new billing line.
+- The 5h row of a provider with a snapshot but no session limit reads
+  `<tokens> tok in 5h · <age>` in place of the `collecting…` placeholder.
+- [NEEDS CLARIFICATION] The truncated log makes the 5h token sum an undercount under heavy use;
+  a durable source (`~/.grok/sessions/*/events.jsonl`) is not yet evaluated.
+- Weekly gauges carry a pace mark (elapsed fraction of an assumed 7-day window, from `resets_at`).
+  The billing line also carries `currentPeriod.start`; it is not read yet.

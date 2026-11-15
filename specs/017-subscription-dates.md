@@ -79,6 +79,8 @@ All date math is pure with injected `now`, computed once in `build_account_view`
 on `AccountView`; `view.rs` renders tier-selected strings only and stays free of date logic.
 Dates render as their ISO ledger form (`2026-08-14`), never reformatted or rolled. Day counts are
 calendar-day differences in local time; a zero-day difference renders `today` in place of `in 0d`.
+`renews` may be a TOML datetime (`2026-11-15T14:30:00`): the time is kept as `renews_time` and
+rendered verbatim (`renews today 14:30`) on the renewal day only; a written offset is ignored.
 
 Per-state clause (FULL tier, appended to the header title after the existing `{label} [{provider}]`):
 

@@ -80,6 +80,9 @@ pub struct GaugeView {
     /// `Estimate` is a last-known authoritative value whose overlay went stale. Both carry the `~`
     /// prefix, so a proxy can never be mistaken for the account's real usage.
     pub source: Provenance,
+    /// Fraction of a WEEKLY window already elapsed (0‥1) — drawn as the pace mark on the bar, so
+    /// fill left of the mark reads "under pace". `None` for a session gauge or an unknown reset.
+    pub pace: Option<f64>,
 }
 
 impl GaugeView {
@@ -184,9 +187,6 @@ pub struct SubView {
     pub renew_days: Option<i32>,
 }
 
-/// The 5h row's text when a fresh overlay reports weekly limits but no session figure.
-pub const SESSION_UNREPORTED: &str = "n/a (no 5h limit reported)";
-
 /// An active row's renewal is flagged **soon** at this many days out or less — the window in which
 /// the user still has a realistic chance to cancel before being charged (spec 017 §D.1).
 pub const RENEW_SOON_DAYS: i32 = 5;
@@ -267,13 +267,18 @@ fn build_active_sub_view(sub: &Subscription, today: jiff::civil::Date) -> SubVie
     // legible without colour; `renew_days` drives the per-day colour ramp in `view.rs`.
     let renew_days = (days <= RENEW_SOON_DAYS).then_some(days);
     let warn = if renew_days.is_some() { "⚠ " } else { "" };
-    let renews_clause = format!("· {warn}renews {} ({date})", day_phrase_full(days));
-    let renews_clause_no_date = format!("· {warn}renews {}", day_phrase_full(days));
+    // On the renewal day the hour matters; the ledger's time is shown verbatim when it has one.
+    let at = match sub.renews_time {
+        Some(t) if days == 0 => format!(" {:02}:{:02}", t.hour(), t.minute()),
+        _ => String::new(),
+    };
+    let renews_clause = format!("· {warn}renews {}{at} ({date})", day_phrase_full(days));
+    let renews_clause_no_date = format!("· {warn}renews {}{at}", day_phrase_full(days));
     let base_full = sub.purchased.map_or_else(
         || renews_clause.clone(),
         |purchased| format!("· period {purchased} → {renews_clause}"),
     );
-    let compact_base = format!("· {warn}renews {}", day_phrase_compact(days));
+    let compact_base = format!("· {warn}renews {}{at}", day_phrase_compact(days));
     SubView {
         full: Some(append_opt(&base_full, pill_full.as_deref())),
         full_no_pill_date: Some(append_opt(&base_full, pill_bare.as_deref())),
@@ -449,7 +454,8 @@ pub struct AccountView {
     /// The single most-utilized gauge across session/weekly/scoped — the scariest number. Drives the
     /// one-line MICRO tier and the worst-offender banner so a glance always lands on the real risk.
     pub headline: Option<GaugeView>,
-    /// A status note shown when there is no active session (e.g. `"idle"`, `"no data yet"`).
+    /// The top line's text when there is no session gauge (`"no data yet"`, a token note, or a
+    /// window-less provider's usage). `None` with no session gauge ⇒ the view draws no top line.
     pub status: Option<String>,
     /// The row's overall severity (drives the alert banner).
     pub severity: Severity,
@@ -818,24 +824,20 @@ pub fn build_account_view(
 
     // Every gauge carries its OWN reset countdown (like Claude's /usage) — session, weekly-all, and
     // the per-model scoped weekly — so each line reads consistently: <pct> <sev> · resets <when>.
-    // A fresh overlay that carries weekly limits but NO session entry means the server reports no
-    // 5h figure (`five_hour: null`). The derived clock is then not a fallback for a failed overlay —
-    // it would be a grey bar standing in for a number that does not exist, and could even become
-    // the headline. Say so in text instead (spec 002, amended 2026-11-14).
-    let session_limit = limits.iter().find(|l| l.kind == LimitKind::Session);
-    // True only when a derived clock is actually dropped — a provider with no session surface at
-    // all (Grok, a weekly-only Codex plan) has nothing to drop and keeps its own status.
-    let session_unreported = session_limit.is_some_and(|l| l.source == Provenance::Derived)
-        && limits
-            .iter()
-            .any(|l| l.kind != LimitKind::Session && l.source == Provenance::Authoritative);
-    let session = session_limit
-        .filter(|_| !session_unreported)
+    // Anthropic removed the 5h limit (2026-11): a Claude row has no session gauge at all, whatever
+    // an old stored row or a derived clock says. Other providers keep theirs.
+    let is_claude = account.provider == Provider::Claude;
+    let session = limits
+        .iter()
+        .find(|l| l.kind == LimitKind::Session && !is_claude)
         .map(|limit| gauge_from_limit(limit, None, now, use_color));
 
     let weekly = limits
         .iter()
         .find(|l| l.kind == LimitKind::WeeklyAll)
+        // Grok's quota row comes only from a logged billing line; a lapsed one is replaced by a new
+        // line or by nothing, so "waiting for reset" would promise data that may never arrive.
+        .filter(|l| account.provider != Provider::Grok || !reset_expired(&l.resets_at, now))
         .map(|limit| gauge_from_limit(limit, None, now, use_color));
     let weekly_scoped = limits
         .iter()
@@ -867,13 +869,13 @@ pub fn build_account_view(
     } else {
         match snapshot {
             None => Some("no data yet".to_string()),
-            // Only Claude has a block surface (ccusage 5h blocks); every other provider's
-            // snapshots carry `window: None` by construction, so `window.is_none()` means
-            // "idle" for Claude alone — anywhere else it would brand live usage as idle.
-            Some(s) if s.window.is_none() && account.provider == Provider::Claude => {
-                Some("idle (no active block)".to_string())
-            }
-            Some(_) if session_unreported => Some(SESSION_UNREPORTED.to_string()),
+            // Usage with no 5h limit (Grok, Gemini, a weekly-only plan): show the usage itself and
+            // its age. Claude's usage is shared across accounts and lives on the fleet header.
+            Some(s) if session.is_none() && !is_claude => Some(format!(
+                "{} tok in 5h · {}",
+                format_tokens(s.total_tokens),
+                format_ago(s.collected_at.as_millisecond(), now)
+            )),
             Some(_) => None,
         }
     };
@@ -882,6 +884,7 @@ pub fn build_account_view(
     // (the window reset) and must stop alarming the moment the countdown crosses zero (spec 012 §A).
     let severity = limits
         .iter()
+        .filter(|l| !(is_claude && l.kind == LimitKind::Session))
         .filter(|l| !reset_expired(&l.resets_at, now))
         .map(|l| l.severity)
         .max()
@@ -908,7 +911,7 @@ pub fn build_account_view(
     let weekly_hint = if account.provider == Provider::Gemini {
         "n/a (no limits surface)".to_string()
     } else if account.provider == Provider::Grok {
-        "n/a (awaiting grok billing log)".to_string()
+        "n/a (open /usage in grok)".to_string()
     } else if !account.limits_overlay {
         "n/a (enable overlay)".to_string()
     } else if token_status == Some(TokenStatus::Stale) {
@@ -999,6 +1002,7 @@ fn gauge_from_limit(
             color: resolve_color(use_color, Color::DarkGray),
             expired: true,
             source: limit.source,
+            pace: None,
         };
     }
     GaugeView {
@@ -1019,7 +1023,23 @@ fn gauge_from_limit(
         },
         expired: false,
         source: limit.source,
+        pace: weekly_pace(limit, now),
     }
+}
+
+/// Elapsed fraction of a weekly limit's window, from its reset time. `None` when the limit is not
+/// weekly or its reset does not parse.
+// shortcut: assumes a 7-day window (true for Claude, Codex and Grok weeklies); read the period
+// start from the provider if one ever reports a different length.
+#[allow(clippy::cast_precision_loss)] // seconds in a week ≪ 2^52
+fn weekly_pace(limit: &Limit, now: Timestamp) -> Option<f64> {
+    const WEEK_SECS: f64 = 7.0 * 24.0 * 3600.0;
+    if limit.kind == LimitKind::Session {
+        return None;
+    }
+    let reset: Timestamp = limit.resets_at.parse().ok()?;
+    let remaining = (reset.as_second() - now.as_second()) as f64;
+    Some((1.0 - remaining / WEEK_SECS).clamp(0.0, 1.0))
 }
 
 /// Extract one account's shared usage facts from its store reads (pure) — the numeric inputs the
@@ -1697,6 +1717,14 @@ mod tests {
         }
     }
 
+    /// A provider that still reports a session (5h) limit — Claude rows never draw one.
+    fn codex_account() -> Account {
+        Account {
+            provider: Provider::Codex,
+            ..account()
+        }
+    }
+
     #[test]
     fn build_view_from_snapshot_and_limit() {
         let snapshot = UsageSnapshot {
@@ -1733,9 +1761,9 @@ mod tests {
             ledger_rows: &[],
             today: jiff::civil::Date::default(),
         };
-        let row = build_account_view(&account(), data, now, true);
+        let row = build_account_view(&codex_account(), data, now, true);
 
-        assert_eq!(row.title, "Personal [claude]");
+        assert_eq!(row.title, "Personal [codex]");
         let session = row.session.expect("session gauge");
         assert!((session.ratio - 0.76).abs() < 1e-9);
         // The composed 5h label carries its own reset countdown — and marks itself a proxy: `~`
@@ -1746,7 +1774,10 @@ mod tests {
         assert_eq!(session.reset_short(), Some("1h 11m"));
         // With only a session limit, the headline is that session.
         assert_eq!(row.headline.expect("headline").label(), session.label());
-        assert_eq!(row.status.as_deref(), Some("idle (no active block)"));
+        assert_eq!(
+            row.status, None,
+            "a drawn session gauge needs no status text"
+        );
         // A clock never escalates the row: time passing is not a quota warning.
         assert_eq!(row.severity, Severity::Ok);
         // The shared token/cost/provenance figures now come off `account_usage` (fleet line), not the
@@ -2079,7 +2110,7 @@ mod tests {
         let row = build_account_view(&grok_account(), data, now, true);
         assert!(row.weekly.is_none());
         assert_eq!(
-            row.weekly_hint, "n/a (awaiting grok billing log)",
+            row.weekly_hint, "n/a (open /usage in grok)",
             "grok's missing weekly must name its local source, never the (ignored) overlay"
         );
     }
@@ -2112,16 +2143,45 @@ mod tests {
         };
         let row = build_account_view(&grok_account(), data, now, true);
         assert_eq!(
-            row.status, None,
-            "a window-less provider's live snapshot must not render as idle"
+            row.status.as_deref(),
+            Some("186.9K tok in 5h · just now"),
+            "a window-less provider's live snapshot shows its usage — never idle, never collecting…"
         );
+    }
+
+    // A lapsed grok quota row is not a pending reset: only a new billing line can replace it.
+    #[test]
+    fn an_expired_grok_weekly_row_falls_back_to_the_hint() {
+        let now: Timestamp = "2026-11-15T07:00:00Z".parse().unwrap();
+        let old = Limit {
+            account_id: "grok-main".to_string(),
+            provider: Provider::Grok,
+            kind: LimitKind::WeeklyAll,
+            scope: None,
+            utilization_pct: 3.0,
+            resets_at: "2026-07-26T08:27:45+00:00".to_string(),
+            severity: Severity::Ok,
+            source: Provenance::Estimate,
+        };
+        let data = AccountData {
+            snapshot: None,
+            limits: &[old],
+            token_status: None,
+            overlay_failing_since: None,
+            overlay_ms: None,
+            ledger_rows: &[],
+            today: jiff::civil::date(2026, 11, 15),
+        };
+        let row = build_account_view(&grok_account(), data, now, true);
+        assert!(row.weekly.is_none());
+        assert_eq!(row.weekly_hint, "n/a (open /usage in grok)");
     }
 
     // Spec 002 (amended 2026-11-14): `/api/oauth/usage` now answers `five_hour: null` with no
     // `session` entry. A fresh authoritative weekly next to a derived session means the server
     // reports no 5h figure — the clock must not stand in for it, nor become the headline.
     #[test]
-    fn a_fresh_overlay_without_a_session_replaces_the_clock_with_text() {
+    fn a_claude_row_never_carries_a_session_gauge_or_5h_text() {
         let now: Timestamp = "2026-07-04T10:00:00Z".parse().unwrap();
         let limit = |kind, pct, source| Limit {
             account_id: "personal".to_string(),
@@ -2164,27 +2224,18 @@ mod tests {
             build_account_view(&account(), data, now, true)
         };
 
-        let clock = limit(LimitKind::Session, 60.0, Provenance::Derived);
-        let row = build(&[
-            clock.clone(),
-            limit(LimitKind::WeeklyAll, 5.0, Provenance::Authoritative),
-        ]);
-        assert!(row.session.is_none(), "no clock bar under a fresh overlay");
-        assert_eq!(row.status.as_deref(), Some(SESSION_UNREPORTED));
-        let headline = row.headline.expect("weekly headline");
-        assert_eq!(headline.pct, "5%", "the 60% clock is not the headline");
-
-        // No derived session to drop (Grok, a weekly-only Codex plan) ⇒ no Anthropic text.
-        let row = build(&[limit(LimitKind::WeeklyAll, 5.0, Provenance::Authoritative)]);
-        assert_eq!(row.status, None);
-
-        // A stale overlay (weekly demoted to Estimate) keeps the clock fallback, as before.
-        let row = build(&[
-            clock,
-            limit(LimitKind::WeeklyAll, 5.0, Provenance::Estimate),
-        ]);
-        assert!(row.session.is_some(), "stale overlay still degrades to it");
-        assert_eq!(row.status, None);
+        // Anthropic removed the 5h limit: no session gauge and no top-line text for a Claude row,
+        // whatever the stored limits say — fresh overlay, stale overlay, or a bare derived clock.
+        for weekly_source in [Provenance::Authoritative, Provenance::Estimate] {
+            let row = build(&[
+                limit(LimitKind::Session, 60.0, Provenance::Derived),
+                limit(LimitKind::WeeklyAll, 5.0, weekly_source),
+            ]);
+            assert!(row.session.is_none(), "a claude row has no 5h gauge");
+            assert_eq!(row.status, None, "and no 5h text: the line is not drawn");
+            let headline = row.headline.expect("weekly headline");
+            assert_eq!(headline.pct, "5%", "the 60% clock is not the headline");
+        }
     }
 
     #[test]
@@ -2260,7 +2311,7 @@ mod tests {
         // and every gauge/accent colour is flattened to dim grey — but its numbers stay accurate.
         let inactive = Account {
             active: false,
-            ..account()
+            ..codex_account()
         };
         let limit = Limit {
             account_id: "personal".to_string(),
@@ -2276,7 +2327,7 @@ mod tests {
         let limits = [limit];
         let row = build_account_view(&inactive, data_from(&limits), now, true);
 
-        assert_eq!(row.title, "Personal [claude] (inactive)");
+        assert_eq!(row.title, "Personal [codex] (inactive)");
         assert!(row.inactive);
         assert_eq!(row.accent, Color::DarkGray);
         let session = row.session.expect("session gauge");
@@ -2289,7 +2340,7 @@ mod tests {
 
         // NO_COLOR: the tag stays (it's structural, in the title text) even though colour collapses.
         let mono = build_account_view(&inactive, data_from(&limits), now, false);
-        assert_eq!(mono.title, "Personal [claude] (inactive)");
+        assert_eq!(mono.title, "Personal [codex] (inactive)");
         assert_eq!(mono.accent, Color::Reset);
     }
 
@@ -2422,7 +2473,7 @@ mod tests {
             authoritative(LimitKind::WeeklyAll, None, 78.0, Severity::Warn),
             authoritative(LimitKind::WeeklyScoped, Some("Fable"), 92.0, Severity::Crit),
         ];
-        let row = build_account_view(&account(), data_from(&limits), now, true);
+        let row = build_account_view(&codex_account(), data_from(&limits), now, true);
 
         // Every gauge carries its own reset — session, weekly-all, and the scoped weekly alike.
         assert!(row
@@ -2473,13 +2524,13 @@ mod tests {
         expired.resets_at = "2026-07-07T09:00:00Z".to_string();
         // The session fixture resets 2026-07-10 — still live, so its warn drives the row.
         let live = authoritative(LimitKind::Session, None, 80.0, Severity::Warn);
-        let row = build_account_view(&account(), data_from(&[live, expired]), now, true);
+        let row = build_account_view(&codex_account(), data_from(&[live, expired]), now, true);
         assert_eq!(row.severity, Severity::Warn);
 
         let mut scoped =
             authoritative(LimitKind::WeeklyScoped, Some("Fable"), 99.0, Severity::Crit);
         scoped.resets_at = "2026-07-07T09:00:00Z".to_string();
-        let row = build_account_view(&account(), data_from(&[scoped]), now, true);
+        let row = build_account_view(&codex_account(), data_from(&[scoped]), now, true);
         assert_eq!(
             row.weekly_scoped.expect("scoped").label(),
             "Fable waiting for reset"
@@ -2754,6 +2805,7 @@ mod tests {
             status,
             purchased: None,
             renews: None,
+            renews_time: None,
             cancelled_on: None,
             paid_through: None,
             verified: None,
@@ -2829,6 +2881,15 @@ mod tests {
         // (spec 017 §D.1).
         assert_eq!(view.full.as_deref(), Some("· ⚠ renews today (2026-08-14)"));
         assert_eq!(view.compact.as_deref(), Some("· ⚠ renews today"));
+
+        // A ledger that knows the renewal hour shows it — on the renewal day only.
+        sub.renews_time = Some(jiff::civil::time(14, 30, 0, 0));
+        let view = build_sub_view(Some(&sub), today);
+        assert_eq!(
+            view.full.as_deref(),
+            Some("· ⚠ renews today 14:30 (2026-08-14)")
+        );
+        assert_eq!(view.compact.as_deref(), Some("· ⚠ renews today 14:30"));
     }
 
     #[test]

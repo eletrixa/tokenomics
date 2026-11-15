@@ -17,8 +17,8 @@
 //! Design constraints:
 //! - `render` takes `&App` only; every value it needs is precomputed on `App` (no I/O, no compute).
 //! - Colour is already resolved on the rows; the view applies it and never depends on colour for
-//!   meaning — severity is a glyph+word pair, bars distinguish fill by CHARACTER (`█`/`▏…▉` vs `░`),
-//!   and selection is structural (double border / thick spine), so `NO_COLOR` loses nothing.
+//!   meaning — severity is a glyph+word pair, bars distinguish fill by CHARACTER (`█`/`▌` vs `░`),
+//!   and selection is structural (thick border / thick spine), so `NO_COLOR` loses nothing.
 //! - One invariant row grammar (marker · severity glyph · proportional bar · percent · verbatim
 //!   reset) is held across FULL / COMPACT / MICRO so the eye never re-learns where to look. As the
 //!   terminal shrinks we DROP to a denser tier rather than squeeze a bordered panel to empty.
@@ -38,12 +38,12 @@ use super::model::{
     GaugeView, SubView,
 };
 
-/// Bordered panel height: border (2) + 2 inner lines (5h · weekly). Token/cost/burn moved to the
+/// Bordered panel height: border (2) + 2 inner lines (top line · weekly); see `has_top_line`. Token/cost/burn moved to the
 /// fleet header line, so the panel no longer carries a per-account meta row.
 const PANEL_HEIGHT: u16 = 4;
 /// A scoped-weekly gauge, when present, adds one inner line.
 const PANEL_HEIGHT_SCOPED: u16 = 5;
-/// Rows a COMPACT account occupies (header · 5h · weekly).
+/// Rows a COMPACT account occupies (header · top line · weekly); see `has_top_line`.
 const COMPACT_ROWS: u16 = 3;
 /// Smallest legible proportional bar.
 const MIN_BAR: u16 = 6;
@@ -52,8 +52,6 @@ const MIN_BAR: u16 = 6;
 const RIGHT_ZONE_FULL: u16 = 36;
 /// Fixed width of the percent column in the MICRO tier (fits `"100%"`).
 const PCT_W: usize = 4;
-/// Sub-cell eighth blocks, 1/8‥7/8, for smooth bar ends (full cell is `█`).
-const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 
 /// The responsive density tier. `Ord` runs least→most dense so `a.min(b)` picks the more compact of
 /// the vertical and horizontal verdicts (the safe choice — it always fits).
@@ -69,19 +67,37 @@ enum Tier {
 
 /// Height of one account's FULL panel — one taller when it carries a scoped-weekly gauge.
 fn full_panel_height(row: &AccountView) -> u16 {
-    if row.weekly_scoped.is_some() {
+    let base = if row.weekly_scoped.is_some() {
         PANEL_HEIGHT_SCOPED
     } else {
         PANEL_HEIGHT
-    }
+    };
+    base - u16::from(!has_top_line(row))
+}
+
+/// Whether the row draws the line above its weekly gauge: a session (5h) gauge, or a status note.
+/// A provider with no 5h limit and nothing to say (Claude since 2026-11) has no such line.
+fn has_top_line(row: &AccountView) -> bool {
+    row.session.is_some() || row.status.is_some()
+}
+
+/// Height of one account's COMPACT block: header + weekly, plus the top line when it has one.
+fn compact_height(row: &AccountView) -> u16 {
+    COMPACT_ROWS - u16::from(!has_top_line(row))
+}
+
+/// The top line: the 5h gauge, or the status note aligned under the gauge column.
+fn top_line(app: &App, row: &AccountView, bar_w: u16, tight: bool) -> Line<'static> {
+    let prefix = if row.session.is_some() { "5h" } else { "  " };
+    let status = row.status.as_deref().unwrap_or_default();
+    gauge_line(app, prefix, row.session.as_ref(), status, bar_w, tight)
 }
 
 /// Pick the tier that fits `area`: the richest tier whose height fits, capped by width. Taking the
 /// less-dense of the two verdicts guarantees the result fits both dimensions.
 fn choose_tier(area: Rect, rows: &[AccountView]) -> Tier {
     let full_needed: u16 = rows.iter().map(full_panel_height).sum();
-    let n = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-    let compact_needed = n.saturating_mul(COMPACT_ROWS);
+    let compact_needed: u16 = rows.iter().map(compact_height).sum();
     let by_height = if full_needed <= area.height {
         Tier::Full
     } else if compact_needed <= area.height {
@@ -198,12 +214,15 @@ fn render_body(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn render_title(f: &mut Frame<'_>, app: &App, area: Rect, fold_badge: bool) {
     let dim = Style::new().fg(resolve_color(app.use_color, Color::DarkGray));
-    let mut spans = vec![Span::styled(
-        "TOKENOMICS",
+    // The brand is a solid pill in colour, plain bold text under NO_COLOR — the same ten cells
+    // either way, so the character grid never depends on colour.
+    let brand_style = if app.use_color {
+        Style::new().fg(Color::Black).bg(Color::Cyan)
+    } else {
         Style::new()
-            .fg(resolve_color(app.use_color, Color::Cyan))
-            .add_modifier(Modifier::BOLD),
-    )];
+    };
+    let brand = Span::styled("TOKENOMICS", brand_style.add_modifier(Modifier::BOLD));
+    let mut spans = vec![brand];
     let n = app.account_count;
     let sub = if area.width >= 100 {
         format!("  ·  {n} account(s)  ·  cost is notional (usage proxy, not a bill)")
@@ -357,23 +376,27 @@ fn render_full_panel(f: &mut Frame<'_>, app: &App, row: &AccountView, area: Rect
     } else {
         resolve_color(app.use_color, Color::DarkGray)
     };
-    // Selection is structural (survives NO_COLOR): a double-line border swaps every border glyph,
+    // Selection is structural (survives NO_COLOR): a thick border swaps every border glyph,
     // inner verticals included, plus a `▶ ` caret in the title.
     let border_set = if selected {
-        symbols::border::DOUBLE
+        symbols::border::THICK
     } else {
-        symbols::border::PLAIN
+        symbols::border::ROUNDED
     };
     let marker = if selected { "▶ " } else { "" };
     // The border's own title-text budget: `area.width` minus the two corner cells (ratatui's
     // `Block::titles_area` reserves exactly one column per side) — see `full_title_spans`.
-    let title_spans = full_title_spans(
+    let mut title_spans = full_title_spans(
         &row.title,
         marker,
         &row.sub,
         area.width.saturating_sub(2),
         app.use_color,
     );
+    // The account name wears its own accent colour, so each account is findable at a glance.
+    if let Some(name) = title_spans.first_mut() {
+        name.style = name.style.fg(row.accent);
+    }
     let block = Block::bordered()
         .border_set(border_set)
         .border_style(Style::new().fg(accent))
@@ -382,25 +405,17 @@ fn render_full_panel(f: &mut Frame<'_>, app: &App, row: &AccountView, area: Rect
     f.render_widget(block, area);
 
     let has_scoped = row.weekly_scoped.is_some();
-    let line_count = if has_scoped { 3 } else { 2 };
+    let top = usize::from(has_top_line(row));
+    let line_count = top + if has_scoped { 2 } else { 1 };
     if usize::from(inner.height) < line_count || inner.width == 0 {
         return; // too squeezed to lay out every line; the border alone reads
     }
     let lines = Layout::vertical(vec![Constraint::Length(1); line_count]).split(inner);
     let bar_w = inner.width.saturating_sub(4 + RIGHT_ZONE_FULL).max(MIN_BAR);
 
-    let status = row.status.as_deref().unwrap_or("collecting…");
-    f.render_widget(
-        Paragraph::new(gauge_line(
-            app,
-            "5h",
-            row.session.as_ref(),
-            status,
-            bar_w,
-            false,
-        )),
-        lines[0],
-    );
+    if top == 1 {
+        f.render_widget(Paragraph::new(top_line(app, row, bar_w, false)), lines[0]);
+    }
     f.render_widget(
         Paragraph::new(gauge_line(
             app,
@@ -410,7 +425,7 @@ fn render_full_panel(f: &mut Frame<'_>, app: &App, row: &AccountView, area: Rect
             bar_w,
             false,
         )),
-        lines[1],
+        lines[top],
     );
     if has_scoped {
         f.render_widget(
@@ -422,7 +437,7 @@ fn render_full_panel(f: &mut Frame<'_>, app: &App, row: &AccountView, area: Rect
                 bar_w,
                 false,
             )),
-            lines[2],
+            lines[top + 1],
         );
     }
 }
@@ -470,7 +485,9 @@ fn render_fleet(f: &mut Frame<'_>, app: &App, area: Rect) {
         fleet.cost_short.clone()
     };
     // Ordered most→least important; each carries its own colour (the provenance badge stays coloured).
-    let mut segments: Vec<(String, Style)> = vec![(fleet.tokens.clone(), dim), (cost, dim)];
+    // The token total is the line's headline figure, so it alone is bright.
+    let bright = Style::new().add_modifier(Modifier::BOLD);
+    let mut segments: Vec<(String, Style)> = vec![(fleet.tokens.clone(), bright), (cost, dim)];
     if let Some(rate) = &fleet.burn_rate {
         segments.push((rate.clone(), dim));
     }
@@ -722,9 +739,18 @@ fn gauge_line(
             let label = if tight { tight_label(g) } else { g.label() };
             let mut spans = Vec::with_capacity(4);
             spans.push(Span::raw(format!("{prefix} ")));
-            spans.extend(bar_spans(g.ratio, bar_w, g.color, app.use_color));
+            spans.extend(bar_spans(g.ratio, bar_w, g.color, app.use_color, g.pace));
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(label, Style::new().fg(g.color)));
+            // The figure pops (bold, severity colour); the reset tail recedes to dim chrome.
+            let figure = Style::new().fg(g.color).add_modifier(Modifier::BOLD);
+            match label.split_once(" · ") {
+                Some((head, tail)) => {
+                    let dim = resolve_color(app.use_color, Color::DarkGray);
+                    spans.push(Span::styled(head.to_string(), figure));
+                    spans.push(Span::styled(format!(" · {tail}"), Style::new().fg(dim)));
+                }
+                None => spans.push(Span::styled(label, figure)),
+            }
             Line::from(spans)
         }
         None => Line::from(Span::styled(
@@ -865,10 +891,11 @@ fn render_compact(f: &mut Frame<'_>, app: &App, area: Rect) {
     if n == 0 {
         return;
     }
-    let want_spacer = spacer_fits(n, usize::from(area.height), usize::from(COMPACT_ROWS));
+    let used: u16 = app.rows.iter().map(compact_height).sum();
+    let want_spacer = usize::from(used) + n - 1 <= usize::from(area.height);
     let mut constraints = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        constraints.push(Constraint::Length(COMPACT_ROWS));
+    for (i, row) in app.rows.iter().enumerate() {
+        constraints.push(Constraint::Length(compact_height(row)));
         if want_spacer && i + 1 < n {
             constraints.push(Constraint::Length(1));
         }
@@ -914,7 +941,8 @@ fn render_compact_block(
     };
     let spine_ch = if selected { "▊" } else { "▏" };
     let spine = || Span::styled(spine_ch, Style::new().fg(spine_color));
-    let sub = Layout::vertical([Constraint::Length(1); 3]).split(area);
+    let top = usize::from(has_top_line(row));
+    let sub = Layout::vertical(vec![Constraint::Length(1); top + 2]).split(area);
 
     f.render_widget(
         Paragraph::new(compact_header_line(
@@ -928,10 +956,11 @@ fn render_compact_block(
         )),
         sub[0],
     );
-    let status = row.status.as_deref().unwrap_or("collecting…");
-    let mut g5 = gauge_line(app, "5h", row.session.as_ref(), status, bar_w, tight);
-    g5.spans.insert(0, spine());
-    f.render_widget(Paragraph::new(g5), sub[1]);
+    if top == 1 {
+        let mut g5 = top_line(app, row, bar_w, tight);
+        g5.spans.insert(0, spine());
+        f.render_widget(Paragraph::new(g5), sub[1]);
+    }
     let mut gw = gauge_line(
         app,
         "wk",
@@ -941,7 +970,7 @@ fn render_compact_block(
         tight,
     );
     gw.spans.insert(0, spine());
-    f.render_widget(Paragraph::new(gw), sub[2]);
+    f.render_widget(Paragraph::new(gw), sub[top + 1]);
 }
 
 fn compact_header_line(
@@ -1146,7 +1175,7 @@ fn micro_line(
     if budget > usize::from(MIN_BAR) {
         let bar_w = u16::try_from(budget - 1).unwrap_or(u16::MAX);
         spans.push(Span::raw(" "));
-        spans.extend(bar_spans(ratio, bar_w, color, app.use_color));
+        spans.extend(bar_spans(ratio, bar_w, color, app.use_color, None));
     }
     if reserve_reset {
         spans.push(Span::raw(" "));
@@ -1240,44 +1269,110 @@ fn center(selected: usize, count: usize, n: usize) -> usize {
 
 // ── Shared helpers ───────────────────────────────────────────────────────────────────────────────
 
-/// Build the coloured spans for a proportional bar: `█`/eighth-block fill in `filled_color` over a
-/// `░` track in dim. Sub-cell precision keeps a 6-cell bar able to separate 76% from 93%.
-fn bar_spans(ratio: f64, width: u16, filled_color: Color, use_color: bool) -> Vec<Span<'static>> {
+/// Bar glyphs: a full block for fill, its left half for the boundary cell, a light shade for
+/// the track. Fill and track differ by CHARACTER, so the bar reads without colour.
+const FILL: char = '█';
+const HALF: char = '▌';
+const TRACK: char = '░';
+/// The weekly pace mark (time elapsed in the window) — a vertical tick through the fill / the track.
+const PACE_ON_FILL: char = '┃';
+const PACE_ON_TRACK: char = '│';
+
+/// A proportional bar as styled spans. A severity-coloured gauge gets a green→amber→red gradient by
+/// cell POSITION (a 30% bar is all green; a 95% bar shows the whole ramp); a dim gauge (derived /
+/// inactive / expired) and `NO_COLOR` stay flat. `pace` (0‥1) overlays the weekly pace mark.
+fn bar_spans(
+    ratio: f64,
+    width: u16,
+    filled_color: Color,
+    use_color: bool,
+    pace: Option<f64>,
+) -> Vec<Span<'static>> {
     let (filled, empty) = bar_parts(ratio, width);
-    let mut spans = Vec::with_capacity(2);
-    if !filled.is_empty() {
-        spans.push(Span::styled(filled, Style::new().fg(filled_color)));
-    }
-    if !empty.is_empty() {
-        spans.push(Span::styled(
-            empty,
-            Style::new().fg(resolve_color(use_color, Color::DarkGray)),
-        ));
-    }
-    spans
+    let filled_cells = filled.chars().count();
+    let cells = usize::from(width);
+    let gradient = matches!(filled_color, Color::Green | Color::Yellow | Color::Red);
+    let track = Style::new().fg(resolve_color(use_color, Color::DarkGray));
+    let pace_at = pace.map(|p| cell_at(p, cells));
+    filled
+        .chars()
+        .chain(empty.chars())
+        .enumerate()
+        .map(|(i, ch)| {
+            let is_fill = i < filled_cells;
+            if pace_at == Some(i) {
+                let mark = if is_fill { PACE_ON_FILL } else { PACE_ON_TRACK };
+                let style = Style::new()
+                    .fg(resolve_color(use_color, Color::White))
+                    .add_modifier(Modifier::BOLD);
+                return Span::styled(mark.to_string(), style);
+            }
+            let style = if !is_fill {
+                track
+            } else if gradient {
+                Style::new().fg(ramp(i, cells))
+            } else {
+                Style::new().fg(filled_color)
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
 }
 
-/// Split a bar of `width` cells into (filled, empty) strings for `ratio` (0‥1), with an eighth-block
-/// boundary cell. `filled + empty` is always exactly `width` cells wide.
-// cast: `eighths` is a clamped, non-negative value bounded by width*8 (≪ u32::MAX) — no loss.
+/// The cell index that fraction `p` (0‥1) of a `cells`-wide bar falls in.
+// cast: `p` is clamped to 0‥1 and `cells` is a u16 width — the product fits usize with no loss.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn cell_at(p: f64, cells: usize) -> usize {
+    ((p.clamp(0.0, 1.0) * cells as f64) as usize).min(cells.saturating_sub(1))
+}
+
+/// The gradient colour of cell `i` in a `cells`-wide bar: green → amber → orange → red.
+// shortcut: 24-bit colour, no fallback; add a COLORTERM check if a 256-colour terminal matters.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn ramp(cell: usize, cells: usize) -> Color {
+    const STOPS: [(f64, [f64; 3]); 4] = [
+        (0.0, [64.0, 201.0, 140.0]),
+        (0.55, [240.0, 200.0, 40.0]),
+        (0.82, [255.0, 138.0, 60.0]),
+        (1.0, [240.0, 70.0, 70.0]),
+    ];
+    let pos = (cell as f64 + 0.5) / cells.max(1) as f64;
+    let hi = STOPS
+        .iter()
+        .position(|(at, _)| pos <= *at)
+        .unwrap_or(3)
+        .max(1);
+    let ((lo_at, from), (hi_at, to)) = (STOPS[hi - 1], STOPS[hi]);
+    let blend = (pos - lo_at) / (hi_at - lo_at);
+    let mix = |k: usize| (from[k] + (to[k] - from[k]) * blend).round() as u8;
+    Color::Rgb(mix(0), mix(1), mix(2))
+}
+
+/// Split a bar of `width` cells into (filled, empty) strings for `ratio` (0‥1), with a half-cell
+/// boundary. `filled + empty` is always exactly `width` cells wide.
+// cast: `halves` is a clamped, non-negative value bounded by width*2 (≪ u32::MAX) — no loss.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn bar_parts(ratio: f64, width: u16) -> (String, String) {
     if width == 0 {
         return (String::new(), String::new());
     }
     let cells = usize::from(width);
-    let eighths = (ratio.clamp(0.0, 1.0) * f64::from(width) * 8.0).round() as u32;
-    let mut full = usize::try_from(eighths / 8).unwrap_or(cells).min(cells);
-    let mut rem = (eighths % 8) as usize;
-    if full == cells {
-        rem = 0;
-    }
-    let mut filled = "█".repeat(full);
-    if rem > 0 {
-        filled.push(EIGHTHS[rem - 1]);
+    let halves = (ratio.clamp(0.0, 1.0) * f64::from(width) * 2.0).round() as u32;
+    let mut full = usize::try_from(halves / 2).unwrap_or(cells).min(cells);
+    let mut filled = FILL.to_string().repeat(full);
+    if halves % 2 == 1 && full < cells {
+        filled.push(HALF);
         full += 1;
     }
-    (filled, "░".repeat(cells - full))
+    (filled, TRACK.to_string().repeat(cells - full))
 }
 
 /// The account label without its `[provider]` suffix, for tight tiers (`"Personal [claude]"` →
@@ -1350,6 +1445,8 @@ fn render_help(f: &mut Frame<'_>, area: Rect) {
         ),
         Line::from("the 5h clock (overlay stale), \"~76% warn\" is the last authoritative value."),
         Line::from("An inactive account, when shown, is dimmed and tagged \"(inactive)\"."),
+        Line::from("The tick on a weekly bar marks the time elapsed in the week: fill left of it"),
+        Line::from("is under pace, fill past it burns faster than the week runs."),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -1387,6 +1484,7 @@ mod tests {
             color: severity_color(severity),
             expired: false,
             source: Provenance::Authoritative,
+            pace: None,
         }
     }
 
@@ -1631,6 +1729,45 @@ mod tests {
         buffer_text(term.backend().buffer())
     }
 
+    /// The bar is exactly `width` cells, runs green → red by position, carries the pace mark on the
+    /// right cell, and has no colour at all under `NO_COLOR`.
+    #[test]
+    fn bar_gradient_and_pace_mark() {
+        let spans = bar_spans(0.5, 10, Color::Green, true, Some(0.75));
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "█████░░│░░", "half filled, pace mark in cell 7");
+        assert!(
+            matches!(ramp(0, 10), Color::Rgb(r, g, _) if g > r),
+            "starts green"
+        );
+        assert!(
+            matches!(ramp(9, 10), Color::Rgb(r, g, _) if r > g),
+            "ends red"
+        );
+        let on_fill = bar_spans(1.0, 10, Color::Red, true, Some(0.2));
+        assert_eq!(on_fill[2].content, "┃", "the mark crosses the fill");
+        let mono = bar_spans(0.5, 10, Color::Reset, false, None);
+        assert!(mono.iter().all(|s| s.style.fg == Some(Color::Reset)));
+    }
+
+    /// A row with no session gauge and no status (a Claude row: the 5h limit is gone) draws no top
+    /// line at all — one row shorter in FULL and COMPACT, and no stray `5h` / `collecting…`.
+    #[test]
+    fn a_row_without_a_session_gauge_or_status_draws_no_top_line() {
+        let mut bare = row("Personal [claude]", 40.0, Severity::Ok);
+        bare.weekly = bare.session.take();
+        assert_eq!(full_panel_height(&bare), PANEL_HEIGHT - 1);
+        assert_eq!(compact_height(&bare), COMPACT_ROWS - 1);
+        let mut app = App::new(2, true);
+        app.rows = vec![bare];
+        for (w, h) in [(100, 30), (60, 30)] {
+            let text = draw(&app, w, h);
+            assert!(text.contains("wk "), "weekly gauge stays:\n{text}");
+            assert!(!text.contains("5h"), "no 5h line:\n{text}");
+            assert!(!text.contains("collecting"), "no placeholder:\n{text}");
+        }
+    }
+
     /// Every rendered line must fit the terminal width exactly — no overflow, no wrap.
     fn assert_no_overflow(text: &str, w: usize) {
         for line in text.lines() {
@@ -1659,10 +1796,10 @@ mod tests {
             text.contains("burn · all accts"),
             "aggregate burn bar:\n{text}"
         );
-        assert!(text.contains('█'), "eighth-block bar fill:\n{text}");
+        assert!(text.contains('█'), "bar fill:\n{text}");
         // Selected (Primary) gets a double-line border; unselected stay single.
         assert!(
-            text.contains('╔') && text.contains('┌'),
+            text.contains('┏') && text.contains('╭'),
             "selection border:\n{text}"
         );
         assert!(
@@ -1733,7 +1870,7 @@ mod tests {
     #[test]
     fn compact_tier_is_borderless_with_spine() {
         let text = draw(&board(), 80, 16);
-        assert!(!text.contains('┌'), "no box borders in compact:\n{text}");
+        assert!(!text.contains('╭'), "no box borders in compact:\n{text}");
         assert!(
             text.contains('▏') || text.contains('▊'),
             "accent spine:\n{text}"
@@ -1750,7 +1887,7 @@ mod tests {
     #[test]
     fn micro_tier_is_one_line_per_account() {
         let text = draw(&board(), 58, 9);
-        assert!(!text.contains('┌'), "no borders in micro:\n{text}");
+        assert!(!text.contains('╭'), "no borders in micro:\n{text}");
         // Each account collapses to a single dense line carrying glyph + pct.
         assert!(text.contains("Personal"), "name:\n{text}");
         assert!(text.contains("93%"), "crit pct:\n{text}");

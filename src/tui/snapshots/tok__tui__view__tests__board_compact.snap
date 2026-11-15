@@ -1,6 +1,5 @@
 ---
 source: src/tui/view.rs
-assertion_line: 1770
 expression: "draw(&board(), 80, 16)"
 ---
 TOKENOMICS  ·  3 acct  ·  cost notional (proxy, not a bill)                     
@@ -8,7 +7,7 @@ TOKENOMICS  ·  3 acct  ·  cost notional (proxy, not a bill)
 280.54M · $335.95 (notional) · 271.20M/h · usage 8s ago · derived               
 burn · all accts ▁▂▁▄▃▆▅█                                                       
 ▏  Personal [claude]                                                    ● 42% ok
-▏5h ███████████████████▍░░░░░░░░░░░░░░░░░░░░░░░░░░ 42% ok · resets in 1h 11m    
+▏5h ███████████████████▌░░░░░░░░░░░░░░░░░░░░░░░░░░ 42% ok · resets in 1h 11m    
 ▏wk n/a (enable overlay)                                                        
                                                                                 
 ▊▶ Primary [claude]                                                   ▲ 76% warn
@@ -16,6 +15,6 @@ burn · all accts ▁▂▁▄▃▆▅█
 ▊wk n/a (enable overlay)                                                        
                                                                                 
 ▏  Research [claude]                                                  ✖ 93% crit
-▏5h ██████████████████████████████████████████▊░░░ 93% crit · resets in 1h 11m  
+▏5h ███████████████████████████████████████████░░░ 93% crit · resets in 1h 11m  
 ▏wk n/a (enable overlay)                                                        
 ↑↓ move  ·  r refresh  ·  o api  ·  i inactive  ·  ? help  ·  q quit

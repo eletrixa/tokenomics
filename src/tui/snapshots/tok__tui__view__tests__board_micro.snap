@@ -1,14 +1,13 @@
 ---
 source: src/tui/view.rs
-assertion_line: 1775
 expression: "draw(&board(), 58, 9)"
 ---
 TOKENOMICS  ·  3 acct  ·  $ = notional  ·  ▲2 over warn   
 280.54M · $335n · 271.20M/h · usage 8s ago · drv          
 burn · all accts ▁▂▁▄▃▆▅█                                 
-▏  Personal ● ok    42% ███████████▍░░░░░░░░░░░░░░░ 1h 11m
+▏  Personal ● ok    42% ███████████▌░░░░░░░░░░░░░░░ 1h 11m
                                                           
 ▊▶ Primary  ▲ warn  76% ████████████████████▌░░░░░░ 1h 11m
                                                           
-▏  Research ✖ crit  93% █████████████████████████▏░ 1h 11m
+▏  Research ✖ crit  93% █████████████████████████░░ 1h 11m
 ↑↓ move  ·  o api  ·  i inactive  ·  ? help  ·  q quit
